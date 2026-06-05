@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.uv-cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Test + dev artifacts not needed inside the runtime image
+tests/
+
+# Local dev files
+.env
+.env.local
+*.log
+.DS_Store

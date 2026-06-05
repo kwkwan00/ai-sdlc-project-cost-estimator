@@ -1,0 +1,14 @@
+Alembic async migrations for the estimator backend.
+
+Common commands (run from backend/):
+
+  uv run alembic upgrade head
+  uv run alembic downgrade -1
+  uv run alembic revision -m "describe change"            # blank template
+  uv run alembic revision --autogenerate -m "describe"    # diff vs ORM metadata
+  uv run alembic current
+  uv run alembic history
+
+env.py reads the DSN from the app's `config.get_settings().resolved_postgres_dsn`,
+so the same alembic invocations work whether you're on the host or inside the
+estimator-backend container.

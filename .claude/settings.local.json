@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose *)",
+      "Bash(rm -rf data/neo4j/data/* data/neo4j/data/.* data/neo4j/logs/*)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(chmod +x /Users/kquon/ai-sdlc-project-cost-estimator/data/postgres-init/01-create-langfuse-db.sh)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"docker compose ls\")",
+      "Bash(curl -sS -o /tmp/lf-health.json -w \"HTTP %{http_code} in %{time_total}s\\\\n\" http://localhost:3100/api/public/health)",
+      "Read(//tmp/**)",
+      "Bash(curl -sSI http://localhost:3100/)",
+      "Bash(curl -sS -o /dev/null -w \"Langfuse worker:8123 \\(clickhouse\\) HTTP %{http_code}\\\\n\" http://localhost:8123/ping)",
+      "Bash(curl -sS -o /tmp/minio-health.txt -w \"MinIO :9020 health HTTP %{http_code}\\\\n\" http://localhost:9020/minio/health/live)",
+      "Bash(docker exec sdlc-langfuse-web *)",
+      "Bash(curl -sS http://localhost:3100/api/public/health)",
+      "Bash(docker exec *)"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "executeautomation-playwright-server",
+    "memory",
+    "fetch",
+    "context7",
+    "filesystem"
+  ]
+}
