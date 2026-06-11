@@ -44,6 +44,13 @@ def _calibration_for_phase(state: EstimationState, phase_value: str) -> list[dic
 def build_twin_user_prompt(
     state: EstimationState, pass_num: int, *, phase_value: str | None = None
 ) -> str:
+    cal_rows = len(_calibration_for_phase(state, phase_value)) if phase_value else 0
+    logger.debug(
+        "build_twin_user_prompt phase=%s pass=%s calibration_rows=%d",
+        phase_value,
+        pass_num,
+        cal_rows,
+    )
     parsed = state.get("parsed_context", {})
     stage2 = state.get("stage2")
     stage3 = state.get("stage3") or Stage3Maturity()

@@ -89,6 +89,10 @@ async def save_estimate_history(
     """
     async with session_scope() as session:
         if session is None:
+            logger.debug(
+                "postgres disabled; skipping history persistence for estimate %s",
+                envelope.estimate_id,
+            )
             return
         try:
             industry = stage2.industry if stage2 else None
@@ -137,6 +141,11 @@ async def save_estimate_history(
                     for p in phases
                 ]
                 session.add_all([PhaseHistory(**r) for r in rows])
+            logger.info(
+                "postgres: persisted history for estimate %s (%d phase row(s))",
+                envelope.estimate_id,
+                len(phases),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("save_estimate_history failed (%s); rolling back", exc)
             raise
@@ -158,6 +167,9 @@ async def refresh_calibration_for_phase(phase_value: str) -> int:
     """
     async with session_scope() as session:
         if session is None:
+            logger.debug(
+                "postgres disabled; skipping calibration refresh for phase %s", phase_value
+            )
             return 0
 
         # Per-dimension aggregates.
@@ -227,6 +239,11 @@ async def refresh_calibration_for_phase(phase_value: str) -> int:
             )
             written += 1
 
+        logger.info(
+            "postgres: refreshed calibration for phase %s (%d aggregate row(s))",
+            phase_value,
+            written,
+        )
         return written
 
 
@@ -249,12 +266,16 @@ async def get_calibration(
     """
     async with session_scope() as session:
         if session is None:
+            logger.debug(
+                "postgres disabled; returning no calibration for phase %s", phase_value
+            )
             return []
         result = await session.execute(
             select(CalibrationAggregate).where(CalibrationAggregate.phase == phase_value)
         )
         rows = result.scalars().all()
         if not rows:
+            logger.debug("no calibration aggregates stored for phase %s", phase_value)
             return []
 
         ind = (industry or "").strip()
@@ -270,6 +291,9 @@ async def get_calibration(
             return (specificity, r.sample_count)
 
         ranked = sorted(rows, key=score, reverse=True)[:limit]
+        logger.debug(
+            "calibration lookup for phase %s returned %d row(s)", phase_value, len(ranked)
+        )
         return [
             {
                 "phase": r.phase,

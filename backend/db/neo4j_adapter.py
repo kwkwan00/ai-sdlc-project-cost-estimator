@@ -66,6 +66,10 @@ def save_estimate_envelope(envelope: dict[str, Any]) -> None:
     """
     driver = get_driver()
     if driver is None:
+        logger.debug(
+            "neo4j: skipping save for estimate %s (driver unavailable / NEO4J_PASSWORD unset)",
+            envelope.get("estimate_id"),
+        )
         return
 
     cypher = """
@@ -85,6 +89,7 @@ def save_estimate_envelope(envelope: dict[str, Any]) -> None:
       MERGE (e)-[:INCLUDES_PHASE]->(p)
     """
     settings = get_settings()
+    phases = envelope.get("phases", [])
     with driver.session(database=settings.neo4j_database) as session:
         session.run(
             cypher,
@@ -93,8 +98,13 @@ def save_estimate_envelope(envelope: dict[str, Any]) -> None:
             status=envelope.get("status", "unknown"),
             updated_at=datetime.utcnow().isoformat(),
             raw_input=envelope.get("raw_input", "")[:5000],
-            phases=envelope.get("phases", []),
+            phases=phases,
         )
+    logger.info(
+        "neo4j: saved estimate %s (%d phase node(s))",
+        envelope["estimate_id"],
+        len(phases),
+    )
 
 
 def make_checkpointer() -> Any:

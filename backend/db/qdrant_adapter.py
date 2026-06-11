@@ -21,6 +21,7 @@ def get_client() -> QdrantClient | None:
         return _client
 
     settings = get_settings()
+    logger.debug("Qdrant client init + collection bootstrap at %s", settings.qdrant_url)
     try:
         from qdrant_client import QdrantClient
 

@@ -53,7 +53,9 @@ function Stage1Inner() {
       saveDraft({
         raw_input: values.raw_input,
         project_name: values.project_name,
-        stage2: prefill.stage2,
+        // Prefill is roster-free, and we no longer seed placeholder roles — the
+        // roster starts empty and is populated by the AG-UI proposal on Stage 2.
+        stage2: { ...prefill.stage2, roster: { roles: [] } },
         stage2_prefilled: true,
         prefill_ambiguity: prefill.ambiguity_score,
         prefill_summary: prefill.summary,

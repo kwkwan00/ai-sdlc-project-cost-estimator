@@ -38,6 +38,17 @@ def graph(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("orchestrator.nodes.parse_input.parse_input", fake_parse)
     monkeypatch.setattr("orchestrator.graph.parse_input", fake_parse)
 
+    # Force every twin onto its deterministic stub path. The twins wrap
+    # call_structured in try/except -> stub_phase_estimate, so disabling the LLM
+    # client makes the graph run offline with stable stub numbers. Without this
+    # the test would make six live, non-deterministic twin calls whenever
+    # ANTHROPIC_API_KEY happens to be set, breaking the stub-based assertions
+    # below (e.g. manual_only > ai_assisted).
+    def _no_llm_client():
+        raise RuntimeError("LLM disabled for graph wiring test")
+
+    monkeypatch.setattr("orchestrator.llm._get_client", _no_llm_client)
+
     from orchestrator.graph import build_graph
 
     return build_graph(with_checkpointer=True)

@@ -38,10 +38,12 @@ from models.project_schema import (
     Stage3Maturity,
 )
 from observability.langfuse_wrapper import shutdown as langfuse_shutdown
+from observability.logging_config import configure_logging
 from orchestrator.graph import build_graph
 from prefill import DraftPrefillRequest, Stage2Prefill, prefill_stage2_from_raw
+from roster_agui import roster_agui_endpoint
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -117,6 +119,7 @@ async def _run_pass1(estimate_id: str, initial_state: dict[str, Any]) -> None:
     try:
         env.status = EstimateStatus.PASS_1_RUNNING
         await _emit(estimate_id, "status", {"status": env.status.value})
+        logger.info("estimate %s: pass 1 running", estimate_id)
 
         result = await _graph.ainvoke(initial_state, config=_config_for(estimate_id))
         _refresh_envelope_from_state(estimate_id, result)
@@ -129,11 +132,17 @@ async def _run_pass1(estimate_id: str, initial_state: dict[str, Any]) -> None:
                 "questions",
                 {"questions": [q.model_dump() for q in env.clarifying_questions]},
             )
+            logger.info(
+                "estimate %s: pass 1 paused, awaiting %d clarifying answer(s)",
+                estimate_id,
+                len(env.clarifying_questions),
+            )
         else:
             # No interrupt — graph completed straight through.
             env.final_estimate = result.get("final_estimate")
             env.status = EstimateStatus.COMPLETED
             await _emit(estimate_id, "status", {"status": env.status.value})
+            logger.info("estimate %s: completed (no clarifying interrupt)", estimate_id)
     except Exception as exc:  # noqa: BLE001
         env.status = EstimateStatus.FAILED
         env.error = str(exc)
@@ -155,6 +164,7 @@ async def _resume_pass2(estimate_id: str, answers: dict[str, str]) -> None:
     try:
         env.status = EstimateStatus.PASS_2_RUNNING
         await _emit(estimate_id, "status", {"status": env.status.value})
+        logger.info("estimate %s: pass 2 running (resumed with answers)", estimate_id)
 
         result = await _graph.ainvoke(
             Command(resume={"answers": answers}),
@@ -174,6 +184,7 @@ async def _resume_pass2(estimate_id: str, answers: dict[str, str]) -> None:
             "final",
             env.final_estimate.model_dump() if env.final_estimate else {},
         )
+        logger.info("estimate %s: completed (pass 2 synthesized)", estimate_id)
     except Exception as exc:  # noqa: BLE001
         env.status = EstimateStatus.FAILED
         env.error = str(exc)
@@ -229,6 +240,15 @@ async def _persist(
                 "qa_testing",
             ):
                 await refresh_calibration_for_phase(phase_value)
+            logger.info(
+                "estimate %s: history persisted + calibration refreshed", env.estimate_id
+            )
+        else:
+            logger.debug(
+                "estimate %s: history persisted (status=%s)",
+                env.estimate_id,
+                env.status.value,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Postgres history write failed (%s); continuing", exc)
 
@@ -244,6 +264,13 @@ async def prefill_stage2(req: DraftPrefillRequest) -> Stage2Prefill:
     surfaces an API-key or network error to the user.
     """
     return await prefill_stage2_from_raw(req.raw_input)
+
+
+# AG-UI agent-run endpoint for the team-roster proposal (Option B). The frontend
+# fires this from Stage 2 (after prefill) and applies the streamed STATE_SNAPSHOT
+# roster to the form. Registered via add_api_route so the handler's RunAgentInput
+# body + Request signature drives FastAPI parsing.
+app.add_api_route("/estimates/draft/roster/agui", roster_agui_endpoint, methods=["POST"])
 
 
 @app.post("/estimates", response_model=EstimateEnvelope)
@@ -266,6 +293,11 @@ async def create_estimate(req: CreateEstimateRequest) -> EstimateEnvelope:
         "stage3": req.stage3,
         "parsed_context": {},
     }
+    logger.info(
+        "estimate %s created (project=%r); starting pass 1 in background",
+        estimate_id,
+        env.project_name,
+    )
     asyncio.create_task(_run_pass1(estimate_id, initial_state))
     return env
 
@@ -285,6 +317,11 @@ async def submit_answers(estimate_id: str, body: AnswerSubmission) -> EstimateEn
         raise HTTPException(404, "Estimate not found")
     if env.status != EstimateStatus.AWAITING_ANSWERS:
         raise HTTPException(409, f"Estimate is in status {env.status.value}, not awaiting answers")
+    logger.info(
+        "estimate %s: received %d answer(s), resuming pass 2",
+        estimate_id,
+        len(body.answers),
+    )
     asyncio.create_task(_resume_pass2(estimate_id, body.answers))
     return env
 

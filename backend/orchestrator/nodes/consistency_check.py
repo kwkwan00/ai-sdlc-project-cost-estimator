@@ -6,9 +6,13 @@ selective re-estimation. That's a Phase 4 feature.
 
 from __future__ import annotations
 
+import logging
+
 from models.estimation_state import EstimationState
 from models.twin_outputs import Phase, PhaseEstimate
 from observability.langfuse_wrapper import traced
+
+logger = logging.getLogger(__name__)
 
 
 def _capers_jones_qa_ratio_warning(pass2: list[PhaseEstimate]) -> str | None:
@@ -37,4 +41,7 @@ async def consistency_check(state: EstimationState) -> dict:
     # Stash warnings on parsed_context so synthesize can pick them up.
     parsed = dict(state.get("parsed_context", {}))
     parsed["consistency_warnings"] = warnings
+    logger.info(
+        "consistency_check complete: %d phase(s), %d warning(s)", len(pass2), len(warnings)
+    )
     return {"parsed_context": parsed}

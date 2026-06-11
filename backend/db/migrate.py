@@ -44,6 +44,7 @@ def upgrade_to_head() -> bool:
         cfg = Config(str(_ALEMBIC_INI))
         cfg.set_main_option("script_location", str(_BACKEND_DIR / "alembic"))
         cfg.set_main_option("sqlalchemy.url", settings.resolved_postgres_dsn)
+        logger.info("Running Alembic upgrade head")
         command.upgrade(cfg, "head")
         logger.info("Alembic upgrade head completed")
         return True

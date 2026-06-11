@@ -89,6 +89,7 @@ async def session_scope() -> AsyncIterator[AsyncSession | None]:
     """
     maker = get_sessionmaker()
     if maker is None:
+        logger.debug("Postgres disabled; session_scope yielding None (persistence skipped)")
         yield None
         return
     session = maker()

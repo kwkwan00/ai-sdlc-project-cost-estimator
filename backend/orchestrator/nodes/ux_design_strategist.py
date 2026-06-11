@@ -115,7 +115,14 @@ async def _run_ux(state: EstimationState, pass_num: int) -> PhaseEstimate:
             response_model=UXSCPInputs,
             tool_name="submit_scp_assessment",
         )
-        return build_phase_estimate(inputs, maturity_level=maturity, roster=roster)
+        est = build_phase_estimate(inputs, maturity_level=maturity, roster=roster)
+        logger.info(
+            "ux_design twin done: pass=%s ai_ml=%.0fh manual_ml=%.0fh",
+            pass_num,
+            est.ai_assisted_hours.most_likely,
+            est.manual_only_hours.most_likely,
+        )
+        return est
     except Exception as exc:  # noqa: BLE001
         logger.warning("UX twin failed (%s); returning stub", exc)
         return stub_phase_estimate(Phase.UX_DESIGN, "ux_design_strategist", "SCP", 230, 260, roster)

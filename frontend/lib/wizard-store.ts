@@ -28,6 +28,9 @@ interface WizardSession {
   /** One-paragraph summary the LLM produced from the raw input. Optional;
    *  surfaced as a small echo on Stage 2 so the user can sanity-check. */
   prefill_summary?: string;
+  /** Set once the AG-UI roster agent has proposed (or attempted) a team on
+   *  Stage 2, so revisiting the page doesn't re-trigger the run. */
+  roster_proposed?: boolean;
 }
 
 export function loadSession(id: string): WizardSession | null {

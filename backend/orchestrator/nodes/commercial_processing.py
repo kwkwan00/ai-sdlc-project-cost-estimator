@@ -11,10 +11,14 @@ emits one entry per roster role) fall through at $0/h.
 
 from __future__ import annotations
 
+import logging
+
 from models.estimation_state import EstimationState
 from models.project_schema import RoleRoster
 from models.twin_outputs import PhaseEstimate, RoleHours
 from observability.langfuse_wrapper import traced
+
+logger = logging.getLogger(__name__)
 
 
 def _phase_cost(phase: PhaseEstimate, rate_by_role: dict[str, float], ai: bool) -> float:
@@ -40,4 +44,10 @@ async def commercial_processing(state: EstimationState) -> dict:
     parsed["total_cost_manual_only_usd"] = total_manual_cost
     parsed["rates"] = rate_by_role
     parsed["roster"] = [r.model_dump() for r in roster.roles]
+    logger.info(
+        "commercial_processing complete: %d role(s) priced; cost ai_assisted=$%.0f manual_only=$%.0f",
+        len(rate_by_role),
+        total_ai_cost,
+        total_manual_cost,
+    )
     return {"parsed_context": parsed}

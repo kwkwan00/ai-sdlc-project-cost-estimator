@@ -99,15 +99,26 @@ async def parse_input(state: EstimationState) -> dict:
     existing = state.get("parsed_context") or {}
     if existing:
         calibration = await _load_calibration(state)
+        logger.debug("parse_input: pre-populated context; %d calibration row(s) loaded", len(calibration))
         return {"parsed_context": existing, "calibration_examples": calibration}
 
     parsed = await extract_context_from_raw(state["raw_input"])
     parsed_dict = parsed.model_dump()
+    logger.info(
+        "parse_input complete: industry=%r project_type=%r screens=%d integrations=%d regulatory=%d ambiguity=%.2f",
+        parsed.industry_hint,
+        parsed.project_type_hint,
+        parsed.screen_count_estimate,
+        len(parsed.integration_mentions),
+        len(parsed.regulatory_mentions),
+        parsed.ambiguity_score,
+    )
 
     # Calibration runs after parse so Stage-2-less requests still benefit from
     # the LLM-extracted industry / project_type hints.
     state_after = {**state, "parsed_context": parsed_dict}
     calibration = await _load_calibration(state_after)  # type: ignore[arg-type]
+    logger.debug("parse_input: %d calibration row(s) loaded", len(calibration))
     return {"parsed_context": parsed_dict, "calibration_examples": calibration}
 
 

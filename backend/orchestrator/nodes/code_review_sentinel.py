@@ -120,7 +120,14 @@ async def _run_review(state: EstimationState, pass_num: int) -> PhaseEstimate:
             response_model=CodeReviewInputs,
             tool_name="submit_fagan_assessment",
         )
-        return build_phase_estimate(inputs, maturity_level=maturity, roster=roster)
+        est = build_phase_estimate(inputs, maturity_level=maturity, roster=roster)
+        logger.info(
+            "code_review twin done: pass=%s ai_ml=%.0fh manual_ml=%.0fh",
+            pass_num,
+            est.ai_assisted_hours.most_likely,
+            est.manual_only_hours.most_likely,
+        )
+        return est
     except Exception as exc:  # noqa: BLE001
         logger.warning("Code review twin failed (%s); returning stub", exc)
         return stub_phase_estimate(

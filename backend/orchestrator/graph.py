@@ -16,6 +16,8 @@ Topology:
 
 from __future__ import annotations
 
+import logging
+
 from langgraph.graph import END, START, StateGraph
 
 from db.neo4j_adapter import make_checkpointer
@@ -36,6 +38,8 @@ from orchestrator.nodes.parse_input import parse_input
 from orchestrator.nodes.qa_testing_strategist import qa_testing_pass1, qa_testing_pass2
 from orchestrator.nodes.synthesize_estimate import synthesize_estimate
 from orchestrator.nodes.ux_design_strategist import ux_design_pass1, ux_design_pass2
+
+logger = logging.getLogger(__name__)
 
 _PASS1_TWINS = [
     ("discovery_p1", discovery_analyst_pass1),
@@ -95,5 +99,14 @@ def build_graph(*, with_checkpointer: bool = True):
     g.add_edge("synthesize_estimate", END)
 
     if with_checkpointer:
-        return g.compile(checkpointer=make_checkpointer())
-    return g.compile()
+        checkpointer = make_checkpointer()
+        compiled = g.compile(checkpointer=checkpointer)
+        logger.info(
+            "orchestrator graph compiled (with_checkpointer=%s, checkpointer=%s)",
+            True,
+            type(checkpointer).__name__,
+        )
+        return compiled
+    compiled = g.compile()
+    logger.info("orchestrator graph compiled (with_checkpointer=%s)", False)
+    return compiled

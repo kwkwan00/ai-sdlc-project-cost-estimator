@@ -10,11 +10,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import uuid
 
 from langgraph.types import Command
 
 from models.project_schema import Stage2Context, Stage3Maturity
+
+logger = logging.getLogger(__name__)
 
 HEALTHCARE_FIXTURE = """
 We need to build a HIPAA-compliant patient portal for a regional clinic. Patients
@@ -32,6 +35,7 @@ async def main(*, use_llm: bool = True) -> None:
     from orchestrator.graph import build_graph
 
     estimate_id = str(uuid.uuid4())
+    logger.info("smoke run starting: estimate_id=%s use_llm=%s", estimate_id, use_llm)
     config = {"configurable": {"thread_id": estimate_id}}
 
     initial_state = {
@@ -67,6 +71,7 @@ async def main(*, use_llm: bool = True) -> None:
         print("!! No final estimate")
         return
 
+    logger.info("smoke run complete: estimate_id=%s final estimate produced", estimate_id)
     print("\n=== FINAL ESTIMATE ===")
     print(f"AI-assisted hours: {fe.total_ai_assisted_hours.pert_mean:.0f} (PERT)")
     print(f"Manual-only hours: {fe.total_manual_only_hours.pert_mean:.0f} (PERT)")

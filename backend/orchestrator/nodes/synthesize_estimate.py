@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 from models.estimation_state import EstimationState
@@ -13,6 +14,8 @@ from models.twin_outputs import (
     RoleHeadcount,
 )
 from observability.langfuse_wrapper import traced
+
+logger = logging.getLogger(__name__)
 
 # Effective work hours per person per week (40 - meetings / context switching).
 WORK_HOURS_PER_WEEK = 32
@@ -115,5 +118,12 @@ async def synthesize_estimate(state: EstimationState) -> dict:
         weekly_burn_rate_usd=weekly_burn,
         total_cost_ai_assisted_usd=parsed.get("total_cost_ai_assisted_usd", 0.0),
         total_cost_manual_only_usd=parsed.get("total_cost_manual_only_usd", 0.0),
+    )
+    logger.info(
+        "synthesize_estimate complete: ai_assisted=%.0fh manual_only=%.0fh (PERT) across %d phase(s); %d role(s) in headcount",
+        ai_range.pert_mean,
+        manual_range.pert_mean,
+        len(pass2),
+        len(headcount_rows),
     )
     return {"final_estimate": final}

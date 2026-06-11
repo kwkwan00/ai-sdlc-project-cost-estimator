@@ -8,6 +8,10 @@ import type { CustomRoleInput, RoleCategory, RoleSeniority } from "@/lib/schemas
 interface Props {
   value: CustomRoleInput[];
   onChange: (next: CustomRoleInput[]) => void;
+  /** Lock every control — used while the AG-UI roster agent is proposing a
+   *  tailored team, so the user doesn't edit a roster that's about to be
+   *  replaced. Re-enabled once the proposal lands (or the run fails). */
+  disabled?: boolean;
 }
 
 const CATEGORY_OPTIONS: { value: RoleCategory; label: string }[] = [
@@ -159,7 +163,7 @@ export function removeRow(roles: CustomRoleInput[], index: number): CustomRoleIn
   return redistributed;
 }
 
-export function RoleRosterEditor({ value, onChange }: Props) {
+export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
   const headingId = useId();
   const total = value.reduce((acc, r) => acc + r.percentage, 0);
   const sumValid = total === 100;
@@ -178,7 +182,8 @@ export function RoleRosterEditor({ value, onChange }: Props) {
         <button
           type="button"
           onClick={() => onChange(addRow(value))}
-          className="btn-secondary text-xs"
+          disabled={disabled}
+          className="btn-secondary text-xs disabled:opacity-50 disabled:cursor-not-allowed"
         >
           + Add role
         </button>
@@ -204,8 +209,9 @@ export function RoleRosterEditor({ value, onChange }: Props) {
                 <FieldHint text="Free-form description of the role: responsibilities, scope, seniority context, anything that helps interpret the line. Up to 500 characters. Travels into every PhaseEstimate's role_hours and the Stage 5 staffing card." />
               </label>
               <textarea
-                className="input mt-1 min-h-[5rem] resize-y leading-snug"
+                className="input mt-1 min-h-[5rem] resize-y leading-snug disabled:opacity-60"
                 value={row.description}
+                disabled={disabled}
                 onChange={(e) =>
                   updateRow(idx, { description: e.target.value })
                 }
@@ -224,8 +230,9 @@ export function RoleRosterEditor({ value, onChange }: Props) {
                   <FieldHint text="Functional category drives phase-specific role biases — e.g. Discovery is senior-biased, UX prefers product / ui_ux, Deployment prefers engineering / devops / data. Tag as 'Other' to opt out of overrides." />
                 </label>
                 <select
-                  className="select mt-1"
+                  className="select mt-1 disabled:opacity-60"
                   value={row.category}
+                  disabled={disabled}
                   onChange={(e) =>
                     updateRow(idx, { category: e.target.value as RoleCategory })
                   }
@@ -243,8 +250,9 @@ export function RoleRosterEditor({ value, onChange }: Props) {
                   <FieldHint text="Senior vs Junior triggers caps in Discovery (juniors ≤ 25%) and Code Review (juniors ≤ 15%), with excess pushed to a same-category senior. Use 'Mid' or 'Other' to skip the cap." />
                 </label>
                 <select
-                  className="select mt-1"
+                  className="select mt-1 disabled:opacity-60"
                   value={row.seniority}
+                  disabled={disabled}
                   onChange={(e) =>
                     updateRow(idx, { seniority: e.target.value as RoleSeniority })
                   }
@@ -264,8 +272,9 @@ export function RoleRosterEditor({ value, onChange }: Props) {
                 <input
                   type="number"
                   min={0}
-                  className="input mt-1"
+                  className="input mt-1 disabled:opacity-60"
                   value={row.rate_per_hour}
+                  disabled={disabled}
                   onChange={(e) =>
                     updateRow(idx, {
                       rate_per_hour: Number.isFinite(Number(e.target.value))
@@ -286,8 +295,9 @@ export function RoleRosterEditor({ value, onChange }: Props) {
                   max={100}
                   step={1}
                   inputMode="numeric"
-                  className="input mt-1"
+                  className="input mt-1 disabled:opacity-60"
                   value={row.percentage}
+                  disabled={disabled}
                   onChange={(e) =>
                     // While typing, only update this row; the other rows snap
                     // back onBlur so the user can finish a multi-digit value
@@ -304,7 +314,7 @@ export function RoleRosterEditor({ value, onChange }: Props) {
                 <button
                   type="button"
                   onClick={() => onChange(removeRow(value, idx))}
-                  disabled={value.length <= 1}
+                  disabled={disabled || value.length <= 1}
                   className="btn-secondary text-xs w-full flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed mt-5"
                   aria-label={`Remove ${row.description || "role"}`}
                   title={

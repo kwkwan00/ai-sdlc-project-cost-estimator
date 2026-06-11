@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from models.estimation_state import EstimationState
 from models.twin_outputs import ClarifyingQuestion, Gap, Phase
 from observability.langfuse_wrapper import traced
+
+logger = logging.getLogger(__name__)
 
 _MAX_QUESTIONS = 10
 _MIN_QUESTIONS = 0  # zero is OK if every twin had no gaps
@@ -48,4 +51,10 @@ async def merge_pass1(state: EstimationState) -> dict:
                 impact_hours=gap.impact_hours,
             )
         )
+    logger.info(
+        "merge_pass1 complete: %d phase estimate(s), %d unique gap(s) -> %d clarifying question(s)",
+        len(pass1),
+        len(grouped),
+        len(questions),
+    )
     return {"clarifying_questions": questions}

@@ -26,8 +26,12 @@ the missing mass across remaining roles.
 
 from __future__ import annotations
 
+import logging
+
 from models.project_schema import CustomRole, RoleRoster
 from models.twin_outputs import Phase, RoleCategory, RoleHours, RoleSeniority
+
+logger = logging.getLogger(__name__)
 
 TECH_CATEGORIES = {RoleCategory.ENGINEERING, RoleCategory.DEVOPS, RoleCategory.DATA}
 PRODUCT_DESIGN_CATEGORIES = {RoleCategory.PRODUCT, RoleCategory.UI_UX}
@@ -56,6 +60,12 @@ def _push_junior_excess_to_senior(
             continue
         excess = current - cap
         p[r.role_id] = cap
+        logger.debug(
+            "role_attribution: capped junior role %r from %.2f to %.2f (cap)",
+            r.role_id,
+            current,
+            cap,
+        )
         # Prefer a same-category senior so the discipline stays consistent.
         same_cat_senior = next(
             (s for s in seniors if s.category == r.category), None

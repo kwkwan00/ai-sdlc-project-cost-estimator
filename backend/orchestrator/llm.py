@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, TypeVar
 
 from anthropic import AsyncAnthropic
@@ -23,6 +24,29 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 _client: AsyncAnthropic | None = None
+
+# Model families that REMOVED sampling parameters (temperature / top_p / top_k):
+# Fable 5 and the Opus 4.6/4.7/4.8 + Sonnet 4.6 generation return HTTP 400 if any
+# are sent. Sending temperature to one of these is what made every structured
+# call silently fall back to stub output. Legacy models (Opus ≤4.5, Sonnet ≤4.5,
+# Haiku 4.5, 3.x) still accept temperature, so we keep passing it there for
+# determinism. Matched as substrings against the configured model id.
+_NO_SAMPLING_PARAM_MODELS = (
+    "fable-5",
+    "opus-4-6",
+    "opus-4-7",
+    "opus-4-8",
+    "sonnet-4-6",
+)
+
+
+def _model_accepts_sampling_params(model: str) -> bool:
+    """True when the model honors temperature/top_p/top_k (legacy families).
+
+    Defaults to True for unrecognized ids so we don't silently drop determinism
+    on older models; the frontier families that 400 are explicitly listed.
+    """
+    return not any(tag in model for tag in _NO_SAMPLING_PARAM_MODELS)
 
 
 def _get_client() -> AsyncAnthropic:
@@ -57,10 +81,17 @@ async def call_structured(
     max_tokens: int = 4096,
     temperature: float = 0.0,
     extra_user_blocks: list[dict[str, Any]] | None = None,
+    effort: str | None = None,
 ) -> T:
     """Call Claude and return a parsed instance of `response_model`.
 
     Forces tool-use so we get a JSON object matching the model's schema.
+
+    `effort` ("low" | "medium" | "high" | "max") is an optional speed/quality
+    lever sent as `output_config.effort`. Left None for every existing caller so
+    behavior is unchanged; opt in (e.g. the roster agent uses "low") to trade a
+    little depth for latency. Only supported on the newer families (Sonnet 4.6,
+    Opus 4.6+, Fable 5) — the create call retries once without it if rejected.
     """
     settings = get_settings()
     client = _get_client()
@@ -71,14 +102,62 @@ async def call_structured(
     if extra_user_blocks:
         user_blocks.extend(extra_user_blocks)
 
-    response = await client.messages.create(
-        model=use_model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        system=system,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": tool_name},
-        messages=[{"role": "user", "content": user_blocks}],
+    create_kwargs: dict[str, Any] = {
+        "model": use_model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "tools": [tool],
+        "tool_choice": {"type": "tool", "name": tool_name},
+        "messages": [{"role": "user", "content": user_blocks}],
+    }
+    # Only send temperature to models that still accept it. The frontier families
+    # (Fable 5, Opus 4.6+, Sonnet 4.6) 400 on any sampling parameter; passing
+    # temperature there is what silently broke structured output for prefill and
+    # all six twins.
+    if _model_accepts_sampling_params(use_model):
+        create_kwargs["temperature"] = temperature
+
+    # `output_config.effort` is GA on the current SDK/models, but degrade safely:
+    # if a model/endpoint/older SDK rejects it (API 400 or unknown-kwarg
+    # TypeError), retry once without it rather than failing the whole call.
+    if effort is not None:
+        create_kwargs["output_config"] = {"effort": effort}
+
+    logger.debug(
+        "llm call → model=%s tool=%s max_tokens=%s effort=%s response_model=%s",
+        use_model,
+        tool_name,
+        max_tokens,
+        effort or "default",
+        response_model.__name__,
+    )
+
+    started = time.perf_counter()
+    try:
+        response = await client.messages.create(**create_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        if "output_config" in create_kwargs:
+            logger.warning(
+                "messages.create rejected output_config (%s); retrying without it", exc
+            )
+            create_kwargs.pop("output_config", None)
+            response = await client.messages.create(**create_kwargs)
+        else:
+            raise
+
+    # Every LLM / forced-tool call is logged at INFO with cost + latency so the
+    # operational narrative shows model usage without needing Langfuse enabled.
+    usage = getattr(response, "usage", None)
+    logger.info(
+        "llm call ✓ model=%s tool=%s latency=%dms stop=%s "
+        "tokens(in/out/cache_read)=%s/%s/%s",
+        use_model,
+        tool_name,
+        int((time.perf_counter() - started) * 1000),
+        response.stop_reason,
+        getattr(usage, "input_tokens", None),
+        getattr(usage, "output_tokens", None),
+        getattr(usage, "cache_read_input_tokens", None),
     )
 
     for block in response.content:

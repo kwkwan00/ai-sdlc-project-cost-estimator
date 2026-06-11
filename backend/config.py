@@ -15,6 +15,15 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field(default="claude-opus-4-5-20250929", alias="ANTHROPIC_MODEL")
+    # Per-agent model overrides for the two lightweight pre-submission agents.
+    # These are independent of ANTHROPIC_MODEL (which the six estimation twins
+    # use) so the prefill/roster helpers don't inherit the heavyweight Opus model.
+    anthropic_model_prefill: str = Field(
+        default="claude-haiku-4-5", alias="ANTHROPIC_MODEL_PREFILL"
+    )
+    anthropic_model_roster: str = Field(
+        default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_ROSTER"
+    )
 
     neo4j_uri: str = Field(default="bolt://localhost:7687", alias="NEO4J_URI")
     neo4j_user: str = Field(default="neo4j", alias="NEO4J_USER")
@@ -43,6 +52,10 @@ class Settings(BaseSettings):
     backend_host: str = Field(default="0.0.0.0", alias="BACKEND_HOST")
     backend_port: int = Field(default=8000, alias="BACKEND_PORT")
     cors_origins: str = Field(default="http://localhost:3000", alias="BACKEND_CORS_ORIGINS")
+
+    # Root log level for the backend (DEBUG | INFO | WARNING | ERROR). Applied by
+    # observability.logging_config.configure_logging() at startup.
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     @property
     def cors_origin_list(self) -> list[str]:

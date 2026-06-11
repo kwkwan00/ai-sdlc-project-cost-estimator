@@ -8,7 +8,10 @@ import type {
 import type { EstimateEnvelope } from "./types";
 
 export interface Stage2Prefill {
-  stage2: Stage2Input;
+  // Roster-free: the prefill endpoint no longer returns a team roster. The
+  // roster is proposed asynchronously by the AG-UI roster agent on Stage 2, and
+  // the frontend supplies its own DEFAULT_ROSTER until that snapshot lands.
+  stage2: Omit<Stage2Input, "roster">;
   summary: string;
   ambiguity_score: number;
 }

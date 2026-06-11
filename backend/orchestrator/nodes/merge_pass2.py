@@ -5,12 +5,17 @@ a single deterministic predecessor.
 
 from __future__ import annotations
 
+import logging
+
 from models.estimation_state import EstimationState
 from observability.langfuse_wrapper import traced
+
+logger = logging.getLogger(__name__)
 
 
 @traced(name="merge_pass2")
 async def merge_pass2(state: EstimationState) -> dict:
     # No-op; the reducer has already aggregated.
-    _ = state.get("pass2_estimates", [])
+    pass2 = state.get("pass2_estimates", [])
+    logger.info("merge_pass2 complete: %d pass-2 phase estimate(s) merged", len(pass2))
     return {}

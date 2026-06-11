@@ -1,14 +1,15 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 
 import { FieldHint } from "@/components/FieldHint";
 import { RoleRosterEditor } from "@/components/RoleRosterEditor";
+import { RosterRationaleModal } from "@/components/RosterRationaleModal";
 import { StageProgress } from "@/components/StageProgress";
+import { proposeRoster, type RosterPlanItem } from "@/lib/roster-agui";
 import {
-  DEFAULT_ROSTER,
   INDUSTRY_OPTIONS,
   REGULATORY_OPTIONS,
   type CustomRoleInput,
@@ -31,7 +32,11 @@ const DEFAULTS: Stage2Input = {
   engagement_model: "tm",
   target_timeline_weeks: undefined,
   regulatory_requirements: [],
-  roster: { roles: DEFAULT_ROSTER },
+  // Start with NO roster entries. The team is proposed asynchronously by the
+  // AG-UI roster agent on Stage 2; nothing is shown until that run completes
+  // (or the user adds roles / proposes manually). Avoids flashing placeholder
+  // defaults that get immediately replaced.
+  roster: { roles: [] },
 };
 
 /** Detect whether the LLM actually contributed values, vs. returning a roster
@@ -56,6 +61,15 @@ export default function Stage2DraftPage() {
   const [prefill, setPrefill] = useState<PrefillState | null>(null);
   const [prefillEffective, setPrefillEffective] = useState(true);
   const [dismissedPrefill, setDismissedPrefill] = useState(false);
+  // AG-UI roster agent (Option B): proposes a tailored team after prefill.
+  const [rosterLoading, setRosterLoading] = useState(false);
+  const [rosterModal, setRosterModal] = useState<{
+    rationale: string;
+    projectPlan: RosterPlanItem[];
+  } | null>(null);
+  const [rosterError, setRosterError] = useState<string | null>(null);
+  const rosterStartedRef = useRef(false); // auto-run start-once guard
+  const mountedRef = useRef(true); // re-set true on strict-mode remount
 
   useEffect(() => {
     const draft = loadDraft();
@@ -85,6 +99,78 @@ export default function Stage2DraftPage() {
     }
   }, [reset]);
 
+  // Run the AG-UI roster agent and apply its proposed team. Used both by the
+  // auto-run effect (after prefill) and the manual "Propose team" / retry button.
+  const runRosterProposal = useCallback(async () => {
+    const draft = loadDraft();
+    if (!draft?.stage2 || !draft.raw_input) return;
+    const stage2 = draft.stage2;
+    const rawInput = draft.raw_input;
+    setRosterError(null);
+    setRosterLoading(true);
+    try {
+      const result = await proposeRoster({ stage2, rawInput });
+      if (!mountedRef.current) return;
+      setValue("roster", { roles: result.roster });
+      const latest = loadDraft();
+      if (latest) {
+        saveDraft({
+          ...latest,
+          stage2: { ...(latest.stage2 ?? stage2), roster: { roles: result.roster } },
+          // Persist the success marker ONLY here so a failed run can retry on the
+          // next visit instead of poisoning the draft into showing defaults forever.
+          roster_proposed: true,
+        });
+      }
+      if (result.rationale || result.projectPlan.length > 0) {
+        setRosterModal({
+          rationale: result.rationale,
+          projectPlan: result.projectPlan,
+        });
+      }
+    } catch (e) {
+      // Failed (no API key, RUN_ERROR, network, unreachable backend) — keep the
+      // default roster, surface the reason, and leave roster_proposed UNSET so
+      // the auto-run retries next visit and the button can retry now.
+      if (mountedRef.current) {
+        setRosterError((e as Error)?.message || "Couldn't propose a team.");
+      }
+    } finally {
+      if (mountedRef.current) setRosterLoading(false);
+    }
+  }, [setValue]);
+
+  // Auto-fire the proposal once, after prefill, to propose a tailored team. The
+  // roster editor stays locked (disabled) until the proposal lands or fails.
+  useEffect(() => {
+    mountedRef.current = true;
+    if (!rosterStartedRef.current) {
+      const draft = loadDraft();
+      const shouldRun = Boolean(
+        draft?.stage2_prefilled &&
+          !draft.roster_proposed &&
+          draft.stage2 &&
+          draft.raw_input
+      );
+      if (shouldRun) {
+        rosterStartedRef.current = true;
+        console.debug("[roster-agui] auto-running proposal on Stage 2 mount");
+        void runRosterProposal();
+      } else if (draft?.stage2_prefilled) {
+        // Came from prefill but auto-run was gated out — log why (helps explain
+        // a roster that "doesn't populate", e.g. already proposed on a revisit).
+        console.debug("[roster-agui] auto-run skipped", {
+          roster_proposed: draft.roster_proposed,
+          has_stage2: Boolean(draft.stage2),
+          has_raw_input: Boolean(draft.raw_input),
+        });
+      }
+    }
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [runRosterProposal]);
+
   const dismissPrefillBanner = () => {
     setDismissedPrefill(true);
     // Clear the prefill markers from the draft so revisiting Stage 2 doesn't
@@ -101,7 +187,7 @@ export default function Stage2DraftPage() {
   };
 
   const regs = watch("regulatory_requirements") || [];
-  const roster = watch("roster")?.roles ?? DEFAULT_ROSTER;
+  const roster = watch("roster")?.roles ?? [];
 
   const setRoster = (next: CustomRoleInput[]) => {
     setValue("roster", { roles: next });
@@ -292,7 +378,57 @@ export default function Stage2DraftPage() {
           </div>
         </div>
 
-        <RoleRosterEditor value={roster} onChange={setRoster} />
+        <div className="space-y-2">
+          {rosterLoading ? (
+            <div
+              className="flex items-center gap-2 rounded-md border border-brand-200 bg-brand-50 p-2 text-xs text-brand-800"
+              role="status"
+              aria-live="polite"
+            >
+              <svg
+                className="h-4 w-4 animate-spin shrink-0"
+                xmlns="http://www.w3.org/2000/svg"
+                fill="none"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                />
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
+                />
+              </svg>
+              Proposing a tailored team from your project description…
+            </div>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => void runRosterProposal()}
+                className="btn-secondary text-xs inline-flex items-center gap-1"
+              >
+                ✨ {rosterError ? "Retry proposing team" : "Propose team from description"}
+              </button>
+              {rosterError && (
+                <p className="text-xs text-amber-700" role="status" aria-live="polite">
+                  Couldn&apos;t propose a tailored team automatically ({rosterError}).
+                  Retry above, or add roles manually below.
+                </p>
+              )}
+              {/* Editor renders only once the run completes — no entries are shown
+                  while the AG-UI proposal is in flight. */}
+              <RoleRosterEditor value={roster} onChange={setRoster} />
+            </>
+          )}
+        </div>
 
         <div className="flex items-center justify-between pt-2">
           <button
@@ -304,10 +440,12 @@ export default function Stage2DraftPage() {
           </button>
           <button
             type="submit"
-            disabled={!rosterValid}
+            disabled={!rosterValid || rosterLoading}
             className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
             title={
-              !rosterValid
+              rosterLoading
+                ? "Proposing a tailored team — one moment…"
+                : !rosterValid
                 ? "Roster must have at least one role and percentages summing to 100"
                 : undefined
             }
@@ -316,6 +454,13 @@ export default function Stage2DraftPage() {
           </button>
         </div>
       </form>
+
+      <RosterRationaleModal
+        open={!!rosterModal}
+        rationale={rosterModal?.rationale ?? ""}
+        projectPlan={rosterModal?.projectPlan ?? []}
+        onClose={() => setRosterModal(null)}
+      />
     </div>
   );
 }
