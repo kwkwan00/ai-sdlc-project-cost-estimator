@@ -250,6 +250,7 @@ def test_prefill_endpoint_returns_stage2_when_agent_succeeds(
             ],
             summary="Greenfield fintech onboarding portal",
             ambiguity_score=0.3,
+            ai_tooling_description="Claude Code for development, CodeRabbit for review",
         )
 
     monkeypatch.setattr("prefill.run_prefill_agent", fake_agent)
@@ -266,6 +267,8 @@ def test_prefill_endpoint_returns_stage2_when_agent_succeeds(
     assert body["stage2"]["regulatory_requirements"] == ["SOC 2", "PCI-DSS"]
     assert body["summary"] == "Greenfield fintech onboarding portal"
     assert body["ambiguity_score"] == pytest.approx(0.3)
+    # AI tools named in the description flow through for Stage 3 pre-fill.
+    assert body["ai_tooling_description"] == "Claude Code for development, CodeRabbit for review"
     # Prefill is fully roster-free — the roster is proposed separately via the
     # AG-UI roster agent on Stage 2 (see tests/test_roster_agui.py).
     assert "roster" not in body["stage2"]
@@ -294,6 +297,7 @@ def test_prefill_endpoint_returns_defaults_when_agent_fails(
     assert body["stage2"]["integration_count"] == 0
     assert body["stage2"]["regulatory_requirements"] == []
     assert body["ambiguity_score"] == pytest.approx(0.7)
+    assert body["ai_tooling_description"] == ""  # nothing to pre-fill on fallback
 
 
 async def test_run_prefill_agent_pins_haiku_model(monkeypatch: pytest.MonkeyPatch) -> None:

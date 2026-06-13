@@ -39,15 +39,13 @@ async def commercial_processing(state: EstimationState) -> dict:
     total_ai_cost = sum(_phase_cost(p, rate_by_role, ai=True) for p in pass2)
     total_manual_cost = sum(_phase_cost(p, rate_by_role, ai=False) for p in pass2)
 
-    parsed = dict(state.get("parsed_context", {}))
-    parsed["total_cost_ai_assisted_usd"] = total_ai_cost
-    parsed["total_cost_manual_only_usd"] = total_manual_cost
-    parsed["rates"] = rate_by_role
-    parsed["roster"] = [r.model_dump() for r in roster.roles]
     logger.info(
         "commercial_processing complete: %d role(s) priced; cost ai_assisted=$%.0f manual_only=$%.0f",
         len(rate_by_role),
         total_ai_cost,
         total_manual_cost,
     )
-    return {"parsed_context": parsed}
+    return {
+        "total_cost_ai_assisted_usd": total_ai_cost,
+        "total_cost_manual_only_usd": total_manual_cost,
+    }

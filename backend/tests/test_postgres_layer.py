@@ -31,15 +31,18 @@ from db.orm_models import Base, CalibrationAggregate, PhaseHistory
 from db.repositories import (
     get_calibration,
     get_calibration_for_all_phases,
+    get_estimate_envelope,
+    list_estimate_history,
     refresh_calibration_for_phase,
     save_estimate_history,
 )
 from models.project_schema import (
+    CodebaseContext,
     EstimateEnvelope,
     EstimateStatus,
     ProjectType,
     Stage2Context,
-    Stage3Maturity,
+    Stage3Context,
 )
 from models.twin_outputs import (
     DualScenarioEstimate,
@@ -156,7 +159,7 @@ def _make_envelope(
 async def test_save_estimate_history_writes_envelope_and_phases(in_memory_db) -> None:
     env = _make_envelope()
     stage2 = Stage2Context(industry="fintech", project_type=ProjectType.GREENFIELD)
-    stage3 = Stage3Maturity()
+    stage3 = Stage3Context()
 
     await save_estimate_history(env, stage2=stage2, stage3=stage3)
 
@@ -184,7 +187,38 @@ async def test_save_estimate_history_writes_envelope_and_phases(in_memory_db) ->
         for p in phases:
             assert p.industry == "fintech"
             assert p.project_type == "greenfield"
-            assert p.maturity_level == 1  # Stage3Maturity default
+            assert p.maturity_level == 0  # Stage3Context default greenfield → codebase code 0
+
+
+@pytest.mark.asyncio
+async def test_history_list_and_envelope_roundtrip(in_memory_db) -> None:
+    env = _make_envelope()
+    await save_estimate_history(env, stage2=None, stage3=None)
+
+    # The list surfaces a summary row.
+    items = await list_estimate_history()
+    assert len(items) == 1
+    item = items[0]
+    assert item["estimate_id"] == env.estimate_id
+    assert item["status"] == EstimateStatus.COMPLETED.value
+    assert item["total_ai_assisted_hours"] == pytest.approx(1300.0)
+    assert item["created_at"] is not None
+
+    # The stored envelope JSON round-trips back to a full EstimateEnvelope for redisplay.
+    data = await get_estimate_envelope(env.estimate_id)
+    assert data is not None
+    restored = EstimateEnvelope.model_validate(data)
+    assert restored.estimate_id == env.estimate_id
+    assert restored.final_estimate is not None
+    assert env.final_estimate is not None
+    assert len(restored.final_estimate.phases) == len(env.final_estimate.phases)
+
+
+@pytest.mark.asyncio
+async def test_history_helpers_empty_when_disabled() -> None:
+    postgres_adapter._reset_for_tests()
+    assert await list_estimate_history() == []
+    assert await get_estimate_envelope("anything") is None
 
 
 @pytest.mark.asyncio
@@ -231,6 +265,58 @@ async def test_save_estimate_history_noops_when_postgres_disabled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_save_estimate_history_degrades_on_query_error(in_memory_db) -> None:
+    """A transient query error inside the body must be swallowed, not re-raised
+    (never-raise persistence contract), AND must not leave a partial write.
+
+    The EstimateHistory upsert happens before the phase-replace; without a rollback in
+    the except, session_scope's clean-exit commit would persist the upsert without its
+    phase rows. The rollback must discard the whole transaction.
+    """
+    from sqlalchemy import text
+
+    # Drop the phase_history table so the wholesale phase replace raises *after* the
+    # EstimateHistory row has already been added to the session.
+    async with in_memory_db() as session:
+        await session.execute(text("DROP TABLE phase_history"))
+        await session.commit()
+
+    env = _make_envelope()
+    # Must complete cleanly despite the broken schema.
+    await save_estimate_history(env, stage2=None, stage3=None)
+
+    # No partial write: the rolled-back transaction must leave nothing committed.
+    assert await get_estimate_envelope(env.estimate_id) is None
+    assert await list_estimate_history() == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_calibration_degrades_on_query_error(in_memory_db) -> None:
+    """A query error during refresh must degrade to 0, not propagate."""
+    from sqlalchemy import text
+
+    async with in_memory_db() as session:
+        await session.execute(text("DROP TABLE phase_history"))
+        await session.commit()
+
+    written = await refresh_calibration_for_phase("discovery")
+    assert written == 0
+
+
+@pytest.mark.asyncio
+async def test_get_calibration_degrades_on_query_error(in_memory_db) -> None:
+    """A query error during read must degrade to [], not propagate."""
+    from sqlalchemy import text
+
+    async with in_memory_db() as session:
+        await session.execute(text("DROP TABLE calibration_aggregates"))
+        await session.commit()
+
+    rows = await get_calibration("development", industry="fintech")
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_refresh_calibration_aggregates_by_dimension(in_memory_db) -> None:
     # Seed three completed estimates with discovery phases at varying dimensions.
     envs = [
@@ -246,15 +332,15 @@ async def test_refresh_calibration_aggregates_by_dimension(in_memory_db) -> None
         Stage2Context(industry="healthcare", project_type=ProjectType.GREENFIELD),
     ]
     stages3 = [
-        Stage3Maturity(discovery_maturity=3),
-        Stage3Maturity(discovery_maturity=3),
-        Stage3Maturity(discovery_maturity=2),
+        Stage3Context(codebase_context=CodebaseContext.BROWNFIELD_LARGE_FAMILIAR),  # code 3
+        Stage3Context(codebase_context=CodebaseContext.BROWNFIELD_LARGE_FAMILIAR),  # code 3
+        Stage3Context(codebase_context=CodebaseContext.BROWNFIELD_SMALL),  # code 1
     ]
     for env, s2, s3 in zip(envs, stages2, stages3, strict=True):
         await save_estimate_history(env, stage2=s2, stage3=s3)
 
     written = await refresh_calibration_for_phase("discovery")
-    # 1 "any" rollup + 2 per-dimension groupings (fintech/greenfield/3, healthcare/greenfield/2).
+    # 1 "any" rollup + 2 per-dimension groupings (fintech/greenfield/3, healthcare/greenfield/1).
     assert written == 3
 
     async with in_memory_db() as session:
@@ -268,12 +354,12 @@ async def test_refresh_calibration_aggregates_by_dimension(in_memory_db) -> None
     by_key = {
         (r.industry, r.project_type, r.maturity_level): r for r in rows
     }
-    # "Any" rollup spans all three samples.
-    any_row = by_key[("", "", 0)]
+    # "Any" rollup spans all three samples (maturity_level=-1 sentinel).
+    any_row = by_key[("", "", -1)]
     assert any_row.sample_count == 3
     assert any_row.avg_ai_assisted_mid == pytest.approx((100 + 150 + 300) / 3)
     assert any_row.avg_manual_only_mid == pytest.approx((200 + 200 + 400) / 3)
-    # Fintech/greenfield/L3 averages over its two samples.
+    # Fintech/greenfield/codebase-code-3 averages over its two samples.
     fintech_row = by_key[("fintech", "greenfield", 3)]
     assert fintech_row.sample_count == 2
     assert fintech_row.avg_ai_assisted_mid == pytest.approx(125.0)
@@ -294,8 +380,8 @@ async def test_refresh_calibration_returns_zero_when_disabled() -> None:
 
 @pytest.mark.asyncio
 async def test_get_calibration_prefers_most_specific_match(in_memory_db) -> None:
-    # Seed two estimates in the same fintech/greenfield/L3 bucket and one in a
-    # different bucket so refresh_calibration produces multiple rows.
+    # Seed two estimates in the same fintech/greenfield/codebase-code-3 bucket and one
+    # in a different bucket so refresh_calibration produces multiple rows.
     for i in range(2):
         await save_estimate_history(
             _make_envelope(
@@ -303,7 +389,7 @@ async def test_get_calibration_prefers_most_specific_match(in_memory_db) -> None
                 phase_pairs=[(Phase.DEVELOPMENT, 100.0 + i * 10, 200.0)],
             ),
             stage2=Stage2Context(industry="fintech", project_type=ProjectType.GREENFIELD),
-            stage3=Stage3Maturity(development_maturity=3),
+            stage3=Stage3Context(codebase_context=CodebaseContext.BROWNFIELD_LARGE_FAMILIAR),
         )
     await save_estimate_history(
         _make_envelope(
@@ -311,12 +397,12 @@ async def test_get_calibration_prefers_most_specific_match(in_memory_db) -> None
             phase_pairs=[(Phase.DEVELOPMENT, 500.0, 600.0)],
         ),
         stage2=Stage2Context(industry="healthcare", project_type=ProjectType.ENHANCEMENT),
-        stage3=Stage3Maturity(development_maturity=2),
+        stage3=Stage3Context(codebase_context=CodebaseContext.BROWNFIELD_SMALL),  # code 1
     )
     await refresh_calibration_for_phase("development")
 
-    # Ask for fintech / greenfield / L3 — the matching specific row should rank
-    # ahead of the "any" rollup.
+    # Ask for fintech / greenfield / codebase-code-3 — the matching specific row should
+    # rank ahead of the "any" rollup.
     rows = await get_calibration(
         "development",
         industry="fintech",
@@ -348,13 +434,15 @@ async def test_get_calibration_for_all_phases_returns_one_key_per_phase(in_memor
     await save_estimate_history(
         env,
         stage2=Stage2Context(industry="fintech", project_type=ProjectType.GREENFIELD),
-        stage3=Stage3Maturity(discovery_maturity=3, development_maturity=3),
+        stage3=Stage3Context(codebase_context=CodebaseContext.BROWNFIELD_LARGE_FAMILIAR),
     )
     for phase in ("discovery", "development"):
         await refresh_calibration_for_phase(phase)
 
     by_phase = await get_calibration_for_all_phases(
-        industry="fintech", project_type="greenfield", stage3=Stage3Maturity(discovery_maturity=3)
+        industry="fintech",
+        project_type="greenfield",
+        stage3=Stage3Context(codebase_context=CodebaseContext.BROWNFIELD_LARGE_FAMILIAR),
     )
     assert set(by_phase.keys()) == {
         "discovery",
@@ -367,3 +455,84 @@ async def test_get_calibration_for_all_phases_returns_one_key_per_phase(in_memor
     # Phases without seeded history return empty lists.
     assert by_phase["ux_design"] == []
     assert by_phase["discovery"], "expected discovery calibration after seeding"
+
+
+# ---------- reduction bands ----------
+
+
+@pytest.mark.asyncio
+async def test_get_reduction_bands_returns_nested_dict(in_memory_db) -> None:
+    from db.orm_models import AiReductionBand
+    from db.repositories import get_reduction_bands
+
+    async with in_memory_db() as session:
+        session.add_all(
+            [
+                AiReductionBand(
+                    phase="development", tooling_level="agentic", min_reduction=0.12, max_reduction=0.22
+                ),
+                AiReductionBand(
+                    phase="development", tooling_level="chat", min_reduction=0.08, max_reduction=0.16
+                ),
+                AiReductionBand(
+                    phase="qa_testing", tooling_level="none", min_reduction=0.0, max_reduction=0.0
+                ),
+            ]
+        )
+        await session.commit()
+
+    bands = await get_reduction_bands()
+    assert bands["development"]["agentic"] == [0.12, 0.22]
+    assert bands["development"]["chat"] == [0.08, 0.16]
+    assert bands["qa_testing"]["none"] == [0.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_get_reduction_bands_empty_when_disabled() -> None:
+    from db.repositories import get_reduction_bands
+
+    postgres_adapter._reset_for_tests()
+    assert await get_reduction_bands() == {}
+
+
+@pytest.mark.asyncio
+async def test_upsert_reduction_bands_inserts_then_updates(in_memory_db) -> None:
+    from db.repositories import get_reduction_bands, upsert_reduction_bands
+
+    # Insert.
+    assert await upsert_reduction_bands(
+        [("development", "agentic", 0.14, 0.24), ("ux_design", "chat", 0.02, 0.07)]
+    )
+    bands = await get_reduction_bands()
+    assert bands["development"]["agentic"] == [0.14, 0.24]
+    assert bands["ux_design"]["chat"] == [0.02, 0.07]
+
+    # Update in place (same key, no duplicate row).
+    assert await upsert_reduction_bands([("development", "agentic", 0.30, 0.45)])
+    bands = await get_reduction_bands()
+    assert bands["development"]["agentic"] == [0.30, 0.45]
+    assert bands["ux_design"]["chat"] == [0.02, 0.07]  # untouched
+
+
+@pytest.mark.asyncio
+async def test_upsert_reduction_bands_returns_false_when_disabled() -> None:
+    from db.repositories import upsert_reduction_bands
+
+    postgres_adapter._reset_for_tests()
+    assert await upsert_reduction_bands([("development", "agentic", 0.1, 0.2)]) is False
+
+
+@pytest.mark.asyncio
+async def test_admin_effective_bands_merge_db_override(in_memory_db) -> None:
+    from db.repositories import upsert_reduction_bands
+    from reduction_bands_admin import get_effective_bands
+
+    await upsert_reduction_bands([("development", "agentic", 0.30, 0.45)])
+    resp = await get_effective_bands()
+    row = next(
+        b for b in resp.bands
+        if b.phase == "development" and b.tooling_level == "agentic"
+    )
+    assert (row.min_pct, row.max_pct) == (30.0, 45.0)  # the override, as percent
+    assert row.is_override is True
+    assert (row.default_min_pct, row.default_max_pct) == (36.0, 66.0)  # code default still shown

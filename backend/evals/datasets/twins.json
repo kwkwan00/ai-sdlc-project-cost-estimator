@@ -1,0 +1,206 @@
+[
+  {
+    "id": "twin-discovery-healthcare",
+    "agent": "discovery",
+    "input": {
+      "raw_input": "We need a HIPAA-compliant patient scheduling portal for a regional clinic network. Patients view lab results, book/reschedule appointments, message providers, and request refills. Staff manage availability and review messages. ~25 screens across 4 roles (patient, provider, billing admin, scheduler). Integrations: Epic EHR via FHIR, Stripe billing, Twilio SMS reminders, Okta SSO. Responsive web only.",
+      "parsed_context": {
+        "industry_hint": "healthcare",
+        "summary": "HIPAA patient scheduling portal with EHR, billing, SMS, and SSO integrations.",
+        "screen_count": 25,
+        "user_roles": ["patient", "provider", "billing admin", "scheduler"],
+        "integrations": ["Epic FHIR", "Stripe", "Twilio", "Okta"]
+      },
+      "stage2": {
+        "industry": "healthcare",
+        "project_type": "greenfield",
+        "screen_count_estimate": 25,
+        "integration_count": 4,
+        "integration_list": ["Epic FHIR", "Stripe", "Twilio", "Okta"],
+        "regulatory_requirements": ["HIPAA"],
+        "target_timeline_weeks": 20
+      },
+      "stage3": {
+        "codebase_context": "greenfield",
+        "ai_tooling": {"discovery": "chat", "development": "agentic", "code_review": "agentic", "qa_testing": "chat"}
+      }
+    },
+    "expected_output": "A UCP-based discovery estimate that reflects 25 screens, 4 roles, and 4 integrations; calls out HIPAA compliance discovery work; produces both AI-assisted and manual-only hour ranges with sane PERT ordering; surfaces gaps (e.g. exact FHIR resource scope, audit requirements) and assumptions; confidence and role-hours present.",
+    "gold": {"target_manual_ml": 583, "target_ai_ml": 568},
+    "notes": "Discovery twin uses UCP. Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
+  },
+  {
+    "id": "twin-ux-healthcare",
+    "agent": "ux_design",
+    "input": {
+      "raw_input": "We need a HIPAA-compliant patient scheduling portal for a regional clinic network. Patients view lab results, book/reschedule appointments, message providers, and request refills. Staff manage availability and review messages. ~25 screens across 4 roles. Integrations: Epic EHR via FHIR, Stripe billing, Twilio SMS, Okta SSO. Responsive web only.",
+      "parsed_context": {
+        "industry_hint": "healthcare",
+        "summary": "HIPAA patient scheduling portal, 25 screens, 4 roles.",
+        "screen_count": 25,
+        "user_roles": ["patient", "provider", "billing admin", "scheduler"]
+      },
+      "stage2": {
+        "industry": "healthcare",
+        "project_type": "greenfield",
+        "screen_count_estimate": 25,
+        "integration_count": 4,
+        "regulatory_requirements": ["HIPAA"]
+      },
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"ux_design": "chat"}}
+    },
+    "expected_output": "A UX/design estimate (SCP-style) scaled to ~25 responsive screens and 4 distinct user roles; accounts for accessibility needs typical of healthcare; both scenario hour ranges; design-system / wireframe assumptions; role-hours weighted toward product + ui_ux.",
+    "gold": {"target_manual_ml": 639, "target_ai_ml": 639},
+    "notes": "UX twin (SCP). Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
+  },
+  {
+    "id": "twin-development-healthcare",
+    "agent": "development",
+    "input": {
+      "raw_input": "HIPAA patient scheduling portal. 25 screens, 4 roles, integrations: Epic FHIR, Stripe, Twilio, Okta. Responsive web. Greenfield build with an agentic AI coding workflow.",
+      "parsed_context": {
+        "industry_hint": "healthcare",
+        "summary": "HIPAA portal greenfield build, 4 integrations.",
+        "screen_count": 25,
+        "integrations": ["Epic FHIR", "Stripe", "Twilio", "Okta"]
+      },
+      "stage2": {
+        "industry": "healthcare",
+        "project_type": "greenfield",
+        "screen_count_estimate": 25,
+        "integration_count": 4,
+        "integration_list": ["Epic FHIR", "Stripe", "Twilio", "Okta"],
+        "regulatory_requirements": ["HIPAA"]
+      },
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"development": "agentic"}}
+    },
+    "expected_output": "A COCOMO II development estimate sized to 4 integrations + 25 screens on greenfield; AI-assisted hours meaningfully below manual-only given agentic tooling, but within the reduction guardrail; SLOC/effort breakdown; integration-risk gaps; role-hours present for both scenarios.",
+    "gold": {"target_manual_ml": 11479, "target_ai_ml": 7548},
+    "notes": "Development twin uses COCOMO II. Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
+  },
+  {
+    "id": "twin-code-review-healthcare",
+    "agent": "code_review",
+    "input": {
+      "raw_input": "HIPAA patient scheduling portal. Greenfield, agentic dev + agentic review tooling. Security-sensitive (PHI). 4 integrations.",
+      "parsed_context": {"industry_hint": "healthcare", "summary": "PHI-handling portal needing rigorous review."},
+      "stage2": {"industry": "healthcare", "project_type": "greenfield", "regulatory_requirements": ["HIPAA"], "integration_count": 4},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"code_review": "agentic"}}
+    },
+    "expected_output": "A Fagan-inspection code-review estimate that scales review/rework hours to the dev volume and elevates rigor for PHI/security-sensitive code; both scenario ranges; review-rate and rework breakdown; junior reviewers capped; role-hours present.",
+    "gold": {"target_manual_ml": 130, "target_ai_ml": 101},
+    "notes": "Code review twin uses Fagan. Targets from planning-outline lines 1992/2012-2013 (Code Review: manual mid 130, AI mid 101). Wide-tolerance drift detector."
+  },
+  {
+    "id": "twin-deployment-healthcare",
+    "agent": "deployment",
+    "input": {
+      "raw_input": "HIPAA patient scheduling portal. Needs secure cloud deployment, audit logging, encrypted PHI storage, CI/CD. Integrations with Epic FHIR, Stripe, Twilio, Okta.",
+      "parsed_context": {"industry_hint": "healthcare", "summary": "Regulated deployment with audit + encryption needs."},
+      "stage2": {"industry": "healthcare", "project_type": "greenfield", "regulatory_requirements": ["HIPAA"], "integration_count": 4},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"deployment": "chat"}}
+    },
+    "expected_output": "A CMP-style deployment/DevOps estimate covering CI/CD, infra-as-code, secure PHI storage, audit logging and the four integration deploy paths; both scenario ranges; compliance/infra gaps; role-hours weighted to engineering + devops (>=75%).",
+    "gold": {"target_manual_ml": 640, "target_ai_ml": 635},
+    "notes": "Deployment twin uses CMP; engineering+devops+data >= 75%. Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
+  },
+  {
+    "id": "twin-qa-healthcare",
+    "agent": "qa_testing",
+    "input": {
+      "raw_input": "HIPAA patient scheduling portal. 25 screens, 4 roles, 4 integrations. Needs functional, integration, security, and accessibility testing. PHI in scope.",
+      "parsed_context": {"industry_hint": "healthcare", "summary": "Comprehensive QA incl. security + accessibility."},
+      "stage2": {"industry": "healthcare", "project_type": "greenfield", "screen_count_estimate": 25, "integration_count": 4, "regulatory_requirements": ["HIPAA"]},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"qa_testing": "chat"}}
+    },
+    "expected_output": "A TPA-based QA estimate scaled to 25 screens + 4 integrations with extra weight for security/accessibility/compliance testing; both scenario ranges; test-coverage breakdown; gaps on test-data + environments; role-hours present.",
+    "notes": "QA twin uses TPA. No accuracy target: the outline gives no clean QA worked mid (the ~1,177 on line 2837 is a derived project sum, not a single twin worked example), so estimate_accuracy SKIPS this case."
+  },
+
+  {
+    "id": "twin-discovery-fintech",
+    "agent": "discovery",
+    "input": {
+      "raw_input": "Build a fintech KYC onboarding app for a digital bank. New customers complete identity verification, document upload, sanctions/PEP screening, and risk scoring before account opening. ~18 screens, 3 roles (applicant, compliance reviewer, ops admin). Integrations: Persona (IDV), Plaid (bank linking), a sanctions-screening API, and an internal core-banking API. SOC 2 and PCI-DSS in scope.",
+      "parsed_context": {
+        "industry_hint": "fintech",
+        "summary": "Digital-bank KYC onboarding with IDV, sanctions screening, and risk scoring.",
+        "screen_count": 18,
+        "user_roles": ["applicant", "compliance reviewer", "ops admin"],
+        "integrations": ["Persona", "Plaid", "sanctions API", "core-banking API"]
+      },
+      "stage2": {
+        "industry": "fintech",
+        "project_type": "greenfield",
+        "screen_count_estimate": 18,
+        "integration_count": 4,
+        "integration_list": ["Persona", "Plaid", "sanctions API", "core-banking API"],
+        "regulatory_requirements": ["SOC 2", "PCI-DSS"],
+        "target_timeline_weeks": 16
+      },
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"discovery": "chat", "development": "agentic"}}
+    },
+    "expected_output": "A UCP discovery estimate reflecting 18 screens, 3 roles, and 4 KYC/compliance integrations; calls out SOC 2 + PCI-DSS discovery; both scenario ranges with valid PERT ordering; gaps around sanctions-list cadence and risk-scoring rules; role-hours present.",
+    "notes": "Discovery twin, fintech."
+  },
+  {
+    "id": "twin-ux-fintech",
+    "agent": "ux_design",
+    "input": {
+      "raw_input": "Fintech KYC onboarding app. 18 screens, 3 roles. Multi-step identity-verification wizard with document capture, plus a compliance-reviewer queue UI. Trust + clarity are critical.",
+      "parsed_context": {"industry_hint": "fintech", "summary": "Onboarding wizard + reviewer queue UI.", "screen_count": 18, "user_roles": ["applicant", "compliance reviewer", "ops admin"]},
+      "stage2": {"industry": "fintech", "project_type": "greenfield", "screen_count_estimate": 18, "integration_count": 4, "regulatory_requirements": ["SOC 2", "PCI-DSS"]},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"ux_design": "chat"}}
+    },
+    "expected_output": "A UX estimate scaled to ~18 screens with weight for a multi-step IDV wizard and a reviewer-queue interface; trust/error-state design; both scenario ranges; role-hours weighted to product + ui_ux.",
+    "notes": "UX twin, fintech."
+  },
+  {
+    "id": "twin-development-fintech",
+    "agent": "development",
+    "input": {
+      "raw_input": "Fintech KYC onboarding app, greenfield, agentic AI coding. 18 screens, 4 integrations (Persona, Plaid, sanctions API, core-banking). Risk-scoring engine plus async screening workflows.",
+      "parsed_context": {"industry_hint": "fintech", "summary": "KYC app with risk engine + async screening.", "screen_count": 18, "integrations": ["Persona", "Plaid", "sanctions API", "core-banking API"]},
+      "stage2": {"industry": "fintech", "project_type": "greenfield", "screen_count_estimate": 18, "integration_count": 4, "integration_list": ["Persona", "Plaid", "sanctions API", "core-banking API"], "regulatory_requirements": ["SOC 2", "PCI-DSS"]},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"development": "agentic"}}
+    },
+    "expected_output": "A COCOMO II development estimate sized to 4 integrations + a risk-scoring engine + async workflows; AI-assisted below manual within the guardrail; SLOC/effort breakdown; integration + compliance gaps; role-hours present for both scenarios.",
+    "notes": "Development twin, fintech."
+  },
+  {
+    "id": "twin-code-review-fintech",
+    "agent": "code_review",
+    "input": {
+      "raw_input": "Fintech KYC onboarding app. Greenfield, agentic dev + agentic review. Handles PII and payment data; SOC 2 + PCI-DSS. Risk-scoring logic must be reviewed carefully.",
+      "parsed_context": {"industry_hint": "fintech", "summary": "PII/payment data; high review rigor."},
+      "stage2": {"industry": "fintech", "project_type": "greenfield", "regulatory_requirements": ["SOC 2", "PCI-DSS"], "integration_count": 4},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"code_review": "agentic"}}
+    },
+    "expected_output": "A Fagan code-review estimate elevating rigor for payment/PII and risk-scoring code; review-rate + rework breakdown; junior reviewers capped; both scenario ranges; role-hours present.",
+    "notes": "Code review twin, fintech."
+  },
+  {
+    "id": "twin-deployment-fintech",
+    "agent": "deployment",
+    "input": {
+      "raw_input": "Fintech KYC onboarding app. Secure cloud deploy, PCI-DSS scope, audit logging, secrets management, CI/CD, async-screening worker infra. Integrations with Persona, Plaid, sanctions API, core-banking.",
+      "parsed_context": {"industry_hint": "fintech", "summary": "PCI-scoped deploy with worker infra + audit."},
+      "stage2": {"industry": "fintech", "project_type": "greenfield", "regulatory_requirements": ["SOC 2", "PCI-DSS"], "integration_count": 4},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"deployment": "chat"}}
+    },
+    "expected_output": "A CMP deployment estimate covering CI/CD, PCI-scoped infra, secrets management, audit logging, worker infrastructure and four integration deploy paths; both scenario ranges; role-hours weighted to engineering + devops (>=75%).",
+    "notes": "Deployment twin, fintech."
+  },
+  {
+    "id": "twin-qa-fintech",
+    "agent": "qa_testing",
+    "input": {
+      "raw_input": "Fintech KYC onboarding app. 18 screens, 4 integrations. Needs functional, integration, security, and compliance testing, plus validation of risk-scoring outcomes. PII + payment data in scope.",
+      "parsed_context": {"industry_hint": "fintech", "summary": "QA incl. security + risk-scoring validation."},
+      "stage2": {"industry": "fintech", "project_type": "greenfield", "screen_count_estimate": 18, "integration_count": 4, "regulatory_requirements": ["SOC 2", "PCI-DSS"]},
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"qa_testing": "chat"}}
+    },
+    "expected_output": "A TPA QA estimate scaled to 18 screens + 4 integrations with extra weight for security/compliance and risk-scoring validation; test-coverage breakdown; gaps on test data + sandbox environments; both scenario ranges; role-hours present.",
+    "notes": "QA twin, fintech."
+  }
+]

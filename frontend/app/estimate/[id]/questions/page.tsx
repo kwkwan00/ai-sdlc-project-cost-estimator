@@ -6,6 +6,7 @@ import { use, useEffect, useState } from "react";
 
 import { StageProgress } from "@/components/StageProgress";
 import { getEstimate, submitAnswers } from "@/lib/api-client";
+import { questionsPollInterval } from "@/lib/estimate-status";
 
 interface PageProps {
   params: Promise<{ id: string }>;
@@ -16,16 +17,15 @@ export default function QuestionsPage({ params }: PageProps) {
   const router = useRouter();
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
+  // Set once answers are submitted so polling resumes through Pass 2 → completed.
+  // (`awaiting_answers` deliberately stops polling while we wait on the user, so
+  // without this the page would never see the post-submit status transitions.)
+  const [resuming, setResuming] = useState(false);
 
-  const { data, error, isLoading } = useQuery({
+  const { data, error, isLoading, refetch } = useQuery({
     queryKey: ["estimate", id],
     queryFn: () => getEstimate(id),
-    refetchInterval: (q) => {
-      const env = q.state.data;
-      if (!env) return 1500;
-      if (env.status === "pass_1_running" || env.status === "pending") return 1500;
-      return false;
-    },
+    refetchInterval: (q) => questionsPollInterval(q.state.data?.status, resuming),
   });
 
   useEffect(() => {
@@ -40,12 +40,16 @@ export default function QuestionsPage({ params }: PageProps) {
 
   const handleSubmit = async (skip: boolean) => {
     setSubmitting(true);
+    setResuming(true);
     try {
       const ans = skip ? {} : answers;
       await submitAnswers(id, ans, skip);
-      // Poll until completed; the useQuery refetchInterval handles the rest.
+      // Pass 2 runs in the background; resume polling so we catch `completed`
+      // (which the effect above redirects on). Kick an immediate refetch.
+      await refetch();
     } catch (e) {
       setSubmitting(false);
+      setResuming(false);
       alert("Failed to submit answers: " + (e as Error).message);
     }
   };
@@ -74,7 +78,9 @@ export default function QuestionsPage({ params }: PageProps) {
           <div className="h-4 w-4 rounded-full border-2 border-brand-500 border-t-transparent animate-spin" />
           <span>Pass 1 in progress — six twins running in parallel.</span>
         </div>
-      ) : data.status === "pass_2_running" || data.status === "synthesizing" ? (
+      ) : data.status === "pass_2_running" ||
+        data.status === "synthesizing" ||
+        resuming ? (
         <div className="card flex items-center gap-3">
           <div className="h-4 w-4 rounded-full border-2 border-brand-500 border-t-transparent animate-spin" />
           <span>Pass 2 in progress — refining with your answers...</span>

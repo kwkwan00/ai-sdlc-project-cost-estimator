@@ -6,9 +6,12 @@ JSON-serializable (no arbitrary Python types in fields).
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class Phase(str, Enum):
@@ -48,6 +51,12 @@ class RoleHours(BaseModel):
 
     Carries the role's description + tags so downstream code (synthesize, frontend)
     doesn't have to re-resolve them from the roster.
+
+    `role_id` MUST reference a `CustomRole.role_id` in the active `RoleRoster`
+    (Stage 2). Referential integrity is a convention enforced by
+    `role_attribution.attribute_roles` (which only emits roster role_ids) and by the
+    aggregation in `synthesize_estimate` — NOT by this model, which has no roster
+    context. Do not add roster validation here.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -59,7 +68,7 @@ class RoleHours(BaseModel):
 
 
 class RoleHeadcount(BaseModel):
-    """One row in the final estimate's recommended-staffing table."""
+    """One row in the final estimate's recommended-staffing + cost table."""
 
     model_config = ConfigDict(extra="forbid")
     role_id: str
@@ -67,6 +76,13 @@ class RoleHeadcount(BaseModel):
     category: RoleCategory
     seniority: RoleSeniority
     headcount: int = Field(ge=0)
+    # Per-staff cost breakdown: this role's total hours across all phases and the
+    # resulting labor cost, for each scenario. (hours × rate_per_hour.)
+    rate_per_hour: float = Field(default=0.0, ge=0)
+    ai_assisted_hours: float = Field(default=0.0, ge=0)
+    manual_only_hours: float = Field(default=0.0, ge=0)
+    ai_assisted_cost_usd: float = Field(default=0.0, ge=0)
+    manual_only_cost_usd: float = Field(default=0.0, ge=0)
 
 
 class HourRange(BaseModel):
@@ -76,6 +92,42 @@ class HourRange(BaseModel):
     optimistic: float = Field(ge=0, description="Best-case hours")
     most_likely: float = Field(ge=0, description="Most-likely hours (mid)")
     pessimistic: float = Field(ge=0, description="Worst-case hours")
+
+    @model_validator(mode="after")
+    def _coerce_pert_ordering(self) -> HourRange:
+        """Coerce the three points into a valid PERT ordering instead of raising.
+
+        A malformed LLM range (e.g. optimistic > pessimistic) would silently corrupt
+        every downstream PERT mean. We repair it in place: optimistic becomes the
+        minimum, pessimistic the maximum, and most_likely is clamped into
+        [optimistic, pessimistic]. We coerce rather than raise because this runs inside
+        a twin's forced-tool-use validation — a hard raise there crashes the twin, and
+        the project values graceful degradation. Already-valid ranges pass through
+        untouched.
+        """
+        o, m, p = self.optimistic, self.most_likely, self.pessimistic
+        new_optimistic = min(o, m, p)
+        new_pessimistic = max(o, m, p)
+        new_most_likely = min(max(m, new_optimistic), new_pessimistic)
+        if (
+            new_optimistic != o
+            or new_pessimistic != p
+            or new_most_likely != m
+        ):
+            logger.warning(
+                "HourRange PERT ordering coerced: "
+                "(o=%s, m=%s, p=%s) -> (o=%s, m=%s, p=%s)",
+                o,
+                m,
+                p,
+                new_optimistic,
+                new_most_likely,
+                new_pessimistic,
+            )
+            self.optimistic = new_optimistic
+            self.most_likely = new_most_likely
+            self.pessimistic = new_pessimistic
+        return self
 
     @property
     def pert_mean(self) -> float:
@@ -138,7 +190,14 @@ class PhaseEstimate(BaseModel):
     gaps: list[Gap] = Field(default_factory=list)
 
     confidence: float = Field(ge=0, le=1, description="Twin's self-reported confidence")
-    notes: str = Field(default="", description="Free-form reasoning / method notes")
+    # The algorithm's numeric component breakdown (e.g. Fagan: inspection rate, review
+    # hours, rework multiplier, tooling hours). Structured so the UI can render it
+    # graphically instead of parsing prose. Empty for stub/fallback estimates.
+    breakdown: dict[str, float] = Field(default_factory=dict)
+    # Realized AI effort reduction applied to this phase, as a percentage (may be
+    # negative — AI net-slower). Matches `ai_assisted_hours = manual × (1 - pct/100)`.
+    effective_ai_reduction_pct: float = Field(default=0.0)
+    notes: str = Field(default="", description="Free-form reasoning notes (prose only)")
 
 
 class ClarifyingQuestion(BaseModel):
@@ -150,6 +209,34 @@ class ClarifyingQuestion(BaseModel):
     impact_hours: float = Field(ge=0)
     answered: bool = False
     answer: str | None = None
+
+
+class LlmModelUsage(BaseModel):
+    """Token usage + cost for a single model across the estimation run."""
+
+    model_config = ConfigDict(extra="forbid")
+    model: str
+    calls: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0.0, ge=0)
+
+
+class LlmUsage(BaseModel):
+    """Anthropic token usage + estimated $ cost of producing THIS estimate.
+
+    The meta-cost of running the estimator itself (all twin + orchestrator LLM
+    calls across Pass 1 and Pass 2), distinct from the project's labor cost.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    call_count: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0.0, ge=0)
+    by_model: list[LlmModelUsage] = Field(default_factory=list)
 
 
 class DualScenarioEstimate(BaseModel):
@@ -167,7 +254,15 @@ class DualScenarioEstimate(BaseModel):
     duration_weeks_low: float
     duration_weeks_high: float
 
+    # Human-readable warnings surfaced by the consistency_check / synthesize_estimate
+    # step (e.g. cross-phase hour anomalies). Populated by the orchestrator; default
+    # empty keeps this fully backward-compatible.
+    consistency_warnings: list[str] = Field(default_factory=list)
+
     headcount_by_role: list[RoleHeadcount] = Field(default_factory=list)
     weekly_burn_rate_usd: float = 0.0
     total_cost_ai_assisted_usd: float = 0.0
     total_cost_manual_only_usd: float = 0.0
+    # Meta-cost: Anthropic tokens + $ spent producing this estimate. Empty/zero
+    # when no LLM calls were captured (e.g. the stub/LLM-free path).
+    llm_usage: LlmUsage = Field(default_factory=LlmUsage)

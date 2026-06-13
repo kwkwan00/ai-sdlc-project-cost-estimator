@@ -8,7 +8,7 @@ Multi-agent SDLC cost estimator. Six specialized LangGraph "twin" agents (Discov
 
 Canonical design spec: `ai-sdlc-project-cost-estimator-planning-outline.md` (3,462 lines). When in doubt about scope, algorithm details, or worked numbers, that document is authoritative. Phase 1 / MVP scope is summarized in `README.md`.
 
-Monorepo: `backend/` (Python 3.12 + FastAPI + LangGraph) and `frontend/` (Next.js 15 App Router) as siblings, plus `docker-compose.yml` for Neo4j + Postgres + Qdrant.
+Monorepo: `backend/` (Python 3.12 + FastAPI + LangGraph) and `frontend/` (Next.js 15 App Router) as siblings, plus `docker-compose.yml` for Neo4j + Postgres + Qdrant + a self-hosted `docs-mcp-server` (always-on) and a self-hosted Langfuse stack (gated behind the `langfuse` compose profile — see below).
 
 ## Common commands
 
@@ -34,7 +34,7 @@ make smoke               # uv run python -m orchestrator.smoke  (one-shot Pass 1
 Backend tests (pytest, asyncio auto-mode):
 
 ```bash
-cd backend && uv run pytest                              # full suite (~116 tests)
+cd backend && uv run pytest                              # full suite (~281 tests)
 cd backend && uv run pytest tests/test_discovery_twin.py # one file
 cd backend && uv run pytest tests/test_postgres_layer.py # Postgres history + calibration
 cd backend && uv run pytest tests/test_api.py::test_health -q
@@ -52,6 +52,8 @@ cd backend && uv run alembic downgrade -1
 
 `env.py` resolves the DSN via `config.get_settings().resolved_postgres_dsn`, so the same commands work from the host shell or inside the dockerized backend. The FastAPI lifespan also runs `upgrade head` automatically when `POSTGRES_MIGRATE_ON_START=true` (default).
 
+Migrations run `0001`→`0006`: `0001` initial history + calibration, `0002` reduction bands table, `0003` doubled reduction bands, `0004` drop the noncoding-autocomplete bands, `0005` add `estimate_history.envelope_json`, `0006` make `raw_input` nullable + set `calibration_aggregates.maturity_level` server_default `-1`.
+
 Frontend tests (vitest, node env) + lint:
 
 ```bash
@@ -67,11 +69,13 @@ cd frontend && npm run build             # produces standalone output for Docker
 Dockerized full stack (use after `cp .env.example .env` and filling in `ANTHROPIC_API_KEY`):
 
 ```bash
-docker compose up -d --build                          # full stack
+docker compose up -d --build                          # core stack (Neo4j, Postgres, Qdrant, docs-mcp, apps)
 docker compose up -d --build estimator-backend estimator-frontend   # rebuild apps only
 docker compose logs estimator-backend | grep "Backend ready"
 docker compose logs estimator-frontend | grep "Frontend ready"
 ```
+
+The Langfuse services (`langfuse-web`, `langfuse-worker`, `clickhouse`, `redis`, `minio`, `minio-init`) carry `profiles: ["langfuse"]`, so a plain `docker compose up` does **not** start them. To bring them up, set `COMPOSE_PROFILES=langfuse` in `.env` (or export it in the shell). The core stack runs fine without Langfuse — tracing just no-ops.
 
 ## Architecture
 
@@ -91,27 +95,47 @@ START → parse_input
 
 `pass1_estimates` and `pass2_estimates` use `Annotated[list, operator.add]` reducers so the six parallel twins can append without conflict. Other state fields are single-writer.
 
+The post-fan-out tail passes data via **typed, single-writer `EstimationState` fields**, not an untyped scratch bus: `consistency_check` writes `consistency_warnings: list[str]`; `commercial_processing` writes `total_cost_ai_assisted_usd` / `total_cost_manual_only_usd: float`; `synthesize_estimate` reads them and surfaces `consistency_warnings` onto `DualScenarioEstimate.consistency_warnings`. `parse_input` also writes the typed `calibration_examples: list[dict]` and `reduction_bands: dict`. Keep new inter-node results as declared, typed state fields.
+
 The graph is paused at `await_user_answers` via LangGraph's `interrupt()`. The HTTP layer (`main.py`) resumes it with `Command(resume={"answers": ...})` after the frontend POSTs to `/estimates/{id}/answers`.
 
 ### Twin node pattern (backend/orchestrator/nodes/_twin_base.py)
 
-Every twin follows the same shape — only the prompt file and post-processing math differ:
+Nearly all twin boilerplate is hoisted into `_twin_base.py`. A twin module declares only its algorithm-specific pieces and calls one factory; it does **not** hand-roll the LLM call, reduction, or node functions.
 
-1. `load_prompt("<twin>")` reads `orchestrator/prompts/<twin>.md`.
-2. `build_twin_user_prompt(state, pass_num)` renders parsed context + Stage 2/3 + (on pass 2) the user's clarifying answers as a JSON block.
-3. `orchestrator.llm.call_structured(...)` calls Claude with a Pydantic response model exposed as a forced-choice tool (tool_use is forced; the JSON tool input is validated back into the model). This is more reliable than JSON-mode prompting — keep using it.
-4. `orchestrator.role_attribution.attribute_roles(total_hours, role_pct, phase)` is the single shared role-split helper. All six twins call it for both AI-assisted and manual-only hour buckets; never inline this logic in a twin.
-5. Return `{"pass1_estimates": [PhaseEstimate(...)]}` or `{"pass2_estimates": [...]}` keyed on the pass number.
+The shared machinery:
 
-When adding a seventh twin or modifying an existing one, replicate this five-step pattern. The plumbing lives in `_twin_base.py` and `llm.py`; do not re-implement it per twin.
+1. `make_twin_nodes(*, phase, prompt_name, tool_name, response_model, build_fn, stub_algorithm, stub_ai_mid, stub_manual_mid, proposed_reduction_fn=None, trace_name)` returns the twin's two LangGraph node functions `(pass1_node, pass2_node)`. Each is wrapped in `@traced(name=f"{trace_name}.p1")` / `.p2` (e.g. `twin.development.p1`) and returns `{"pass1_estimates": [PhaseEstimate(...)]}` / `{"pass2_estimates": [...]}`. This is the only structural difference between the passes.
+2. `run_twin(...)` is the shared execution body the factory wires up: `load_prompt(prompt_name)` → `build_twin_user_prompt(state, pass_num, phase_value=phase.value)` → `call_structured(...)` (forced tool-use; validated back into the response model) → `effective_ai_reduction(...)` → the twin's `build_fn(inputs, effective_reduction=eff, roster=roster)`. On any exception it logs and returns `stub_phase_estimate(...)` so the graph always completes (this is also the no-API-key/test path).
+3. Helpers a twin reuses instead of reimplementing: `roster_for(state)` (Stage 2 roster, `RoleRoster.default()` fallback), `tooling_for(stage3, phase)` (the phase's `AiToolingLevel`), `load_prompt(name)`.
+4. `orchestrator.role_attribution.attribute_roles(total_hours, roster, phase)` is the single shared role-split helper — note the signature takes the **roster**, not a percentages tuple. Each twin's `build_fn` calls it for both the AI-assisted and manual-only hour buckets; never inline this logic.
+5. `build_twin_user_prompt(state, pass_num, *, phase_value=...)` renders the parsed context + Stage 2 roster + Stage 3 + per-phase `calibration` rows + an `ai_reduction_guardrail` block (the active `[lo, hi]` band so the LLM proposes *within* the guardrail) + (on pass 2) the user's clarifying `user_answers`, as a JSON block. The `phase_value` kwarg is required at every call site — keep it threaded for a seventh twin.
+
+So a twin module (e.g. `development_architect.py`) declares only: its prompt name, tool name, Pydantic inputs `response_model`, `phase`, stub mid-point hours, its `build_phase_estimate(inputs, *, effective_reduction, roster)` math, and an optional `_proposed_reduction(inputs)` hook. The hook reads the twin's LLM-proposed reduction off its inputs and is passed as `proposed_reduction_fn`; **development, code_review, deployment, qa pass it; discovery and ux do NOT** (those use the band midpoint via `proposed_reduction=None`). It then calls `make_twin_nodes(...)` once and exports `<twin>_pass1, <twin>_pass2`.
+
+When adding a seventh twin, replicate this declarative shape — supply `build_fn` + the optional reduction hook and call `make_twin_nodes`. The plumbing lives in `_twin_base.py`, `llm.py`, and `ai_acceleration.py`; do not re-implement it per twin.
 
 ### Two-output cost model
 
-Every `PhaseEstimate` carries **both** `ai_assisted_hours` and `manual_only_hours` as `HourRange(optimistic, most_likely, pessimistic)`, plus matching `*_role_hours: list[RoleHours]` for each. Downstream `synthesize_estimate` aggregates both scenarios into a `DualScenarioEstimate`. The frontend's `<DualScenarioToggle>` flips the view between them. When changing any twin, both scenarios must be produced — never collapse to a single number.
+Every `PhaseEstimate` carries **both** `ai_assisted_hours` and `manual_only_hours` as `HourRange(optimistic, most_likely, pessimistic)`, plus matching `*_role_hours: list[RoleHours]` for each. It also carries `effective_ai_reduction_pct: float` (the realized reduction applied, may be negative — matches `ai = manual × (1 - pct/100)`) and a structured `breakdown: dict[str, float]` (the algorithm's numeric intermediates — e.g. COCOMO's `ksloc` / `person_months` / `stack_multiplier`). The `breakdown` dict **replaced** the old prose breakdowns that used to live in `notes`; `notes` is now prose-only and the frontend renders `breakdown` graphically. Downstream `synthesize_estimate` aggregates both scenarios into a `DualScenarioEstimate`. When changing any twin, both scenarios must be produced — never collapse to a single number.
+
+`HourRange` has a `@model_validator(mode="after")` (`_coerce_pert_ordering`) that **repairs** a malformed three-point range in place (optimistic = min, pessimistic = max, most_likely clamped into `[optimistic, pessimistic]`) and logs a warning — it does NOT raise. This runs inside the twin's forced-tool-use validation, where a hard raise would crash the twin; coercion keeps the run alive without silently corrupting the PERT mean. Don't change it to raise.
+
+### AI-reduction guardrail bands (backend/orchestrator/ai_acceleration.py)
+
+The per-(phase, tooling) AI effort reduction is a **guardrail band** `[lo, hi]` (a fraction), **not** a multiplier. `DEFAULT_BANDS` is keyed `(Phase, AiToolingLevel)` where `AiToolingLevel ∈ {none, autocomplete, chat, agentic}`. The `AUTOCOMPLETE` band only exists for the code-writing phases — discovery, ux_design, and code_review have **no** autocomplete band (and the `none` level is always `(0, 0)`); `band_for(...)` falls back to `(0.0, 0.0)` → zero reduction, no overhead.
+
+`effective_ai_reduction(*, phase, tooling, codebase, roster, proposed_reduction=None, regulated=False, bands=None)` is the single entry point the twins use (via `run_twin`):
+
+- Clamps the twin's `proposed_reduction` into the `[lo, hi]` band ("LLM proposes within guardrails"). Pass `proposed_reduction=None` (discovery/ux) to use the **band midpoint**.
+- Moderates by `CODEBASE_FACTOR[codebase]` (greenfield 1.0 → brownfield_large_familiar 0.40) × `seniority_factor(roster)` (effort-share weighted, clamped ~[0.6, 1.25]).
+- Subtracts penalties (regulated 0.08, familiar-large-brownfield 0.06) that can flip it negative, then clamps to `[NEGATIVE_FLOOR (-0.15), hi]`. AI can be net-slower (METR 2025).
+
+Bands are **DB-tunable**: the `ai_reduction_bands` table overrides any cell. `parse_input` loads the DB overrides into `state["reduction_bands"]` (nested `{phase_value: {tooling_value: [lo, hi]}}`); `band_for` prefers them over `DEFAULT_BANDS`. `default_bands()` returns the editable `(phase, tooling, lo, hi)` rows (excluding `none`) that back the admin Settings UI, and the admin endpoints `GET/PUT /admin/reduction-bands` read/write them. When editing AI-reduction behavior, change it **here** (or the table) — never inline a reduction in a twin.
 
 ### User-defined role roster (Stage 2)
 
-The team is **not** four fixed roles — it's a user-defined `RoleRoster` of `CustomRole` entries, each carrying `role_id`, `name`, `category` (`product` / `engineering` / `ui_ux` / `qa` / `devops` / `data` / `other`), `seniority` (`senior` / `mid` / `junior` / `other`), `rate_per_hour`, and `percentage`. The roster lives in `Stage2Context.roster`. Stage 3 only carries the AI maturity sliders.
+The team is **not** four fixed roles — it's a user-defined `RoleRoster` of `CustomRole` entries, each carrying `role_id`, `description` (the free-form display label — NOT `name`), `category` (`product` / `engineering` / `ui_ux` / `qa` / `devops` / `data` / `other`), `seniority` (`senior` / `mid` / `junior` / `other`), `rate_per_hour`, and `percentage`. `RoleRoster` validates unique `role_id`s and percentages summing to 100 (±0.5 for slider rounding). The roster lives in `Stage2Context.roster`. (Stage 3 no longer carries maturity sliders — see the Stage 3 note below.)
 
 `orchestrator/role_attribution.py::attribute_roles(total_hours, roster, phase)` returns `list[RoleHours]` (one entry per roster role, including zeroed-out entries) with phase-specific overrides keyed on the **tags**, not on fixed role IDs:
 
@@ -123,7 +147,24 @@ The team is **not** four fixed roles — it's a user-defined `RoleRoster` of `Cu
 
 `commercial_processing` looks up rates from the roster by `role_id`. `synthesize_estimate` aggregates per-role hours across phases and emits `headcount_by_role: list[RoleHeadcount]`. The frontend renders headcount using the user's own role names + category/seniority labels.
 
-When adding a seventh twin: import `RoleRoster` (not `RolePercentages` — that's gone), call `attribute_roles(hours, roster, phase)`, and populate `ai_assisted_role_hours` / `manual_only_role_hours` on the `PhaseEstimate`. The roster comes from `state.get("stage2").roster` with `RoleRoster.default()` as the fallback when Stage 2 is absent.
+When adding a seventh twin: import `RoleRoster` (not `RolePercentages` — that's gone), call `attribute_roles(hours, roster, phase)`, and populate `ai_assisted_role_hours` / `manual_only_role_hours` on the `PhaseEstimate`. The roster comes from `roster_for(state)` (Stage 2 roster with `RoleRoster.default()` as the fallback when Stage 2 is absent).
+
+### Stage 3 inputs (AI-acceleration drivers, not maturity sliders)
+
+`Stage3Context` no longer carries per-phase "AI maturity" sliders. It now carries:
+
+- `codebase_context: CodebaseContext` — `greenfield` / `brownfield_small` / `brownfield_large_unfamiliar` / `brownfield_large_familiar`. The single biggest moderator of realized AI speedup (familiar-large can go net-negative).
+- `ai_tooling: PhaseToolingLevels` — the per-phase `AiToolingLevel` the twins consume. In the wizard these are **not** entered by hand; they're derived from the freeform field below by the tooling classifier. Each phase defaults to `none`.
+- `ai_tooling_description: str` — the user's freeform description of their AI dev tools (e.g. "Claude Code for dev, CodeRabbit for review, Figma AI for design"). Persisted for audit; the classified `ai_tooling` is what drives the estimate.
+
+### Pre-submission & support agents (model tiering)
+
+Four non-twin LLM agents. Each follows the same shape as the twins (`load_prompt` + `call_structured` forced tool-use) with a deterministic fallback, and each is **pinned to its own model** independent of `ANTHROPIC_MODEL` so light agents stay cheap. `llm.py` resolves `use_model = model or settings.anthropic_model`; the six twins pass no `model=` (so they use `ANTHROPIC_MODEL`, default `claude-sonnet-4-6`), these four pass an explicit `model=`:
+
+- **prefill** (`prefill.py::run_prefill_agent`, `anthropic_model_prefill` default Haiku) — normalizes raw Stage 1 text into Stage 2 fields (enum-constrained response model + deterministic synonym/coercion backstop validators). Roster-**free** by design. Endpoint `POST /estimates/draft/prefill`. Degrades to empty Stage 2 + 0.7 ambiguity on failure.
+- **roster** (`roster_agent.py::run_roster_agent`, `anthropic_model_roster` default Sonnet, `effort="low"`) — proposes a `RoleRoster`. The LLM emits structure only (roles + category/seniority tags + rough split); a deterministic backstop assigns stable unique `role_id`s, table-driven `rate_per_hour`, and rebalances percentages to exactly 100 (Hamilton largest-remainder). The LLM must **not** emit `role_id` or `rate`. It is **not** chained into the synchronous prefill response — it runs as a separate AG-UI streaming agent (`roster_agui.py`, `roster_agui_endpoint`) at `POST /estimates/draft/roster/agui` (RUN_STARTED → STATE_SNAPSHOT → RUN_FINISHED), so the prefilled form renders instantly and the roster streams in a beat later.
+- **tooling classifier** (`tooling_classifier.py::classify_ai_tooling`, `anthropic_model_tooling` default Sonnet) — maps the freeform tooling description to per-phase `AiToolingLevel`s. Tools the model can't identify go in `unknown_tools` and are researched via the co-located docs-mcp-server: `llm.py::research_with_local_mcp` is the backend acting as an **MCP client over streamable HTTP**, running the tool loop in-process (so the server can live on localhost / in the compose network). With `docs_mcp_auto_scrape` on (default) it scrapes-then-indexes a missing tool's docs before answering; on timeout/unavailability unknown tools stay `none`. Endpoint `POST /estimates/draft/classify-tooling`. Degrades to all-`none`.
+- **question consolidator** (`merge_pass1.py::_consolidate_semantically`, `anthropic_model_merge` default Haiku) — semantic dedup of clarifying questions that the six twins raised independently. Validates the LLM's clusters form an exact partition; falls back to the deterministic exact-topic dedup (`_dedupe_gaps`) on any failure or non-partition.
 
 ### Persistence (backend/db/)
 
@@ -131,33 +172,54 @@ Three stores, distinct jobs. All three degrade silently when unreachable — **t
 
 - **LangGraph checkpointer** — `make_checkpointer()` returns `InMemorySaver` in MVP. LangGraph state lives in-process — surviving server restarts is **not** an MVP guarantee. There is a TODO to swap in a real Neo4j-backed `BaseCheckpointSaver` in Phase 3; the call site is already abstracted, so swap there without touching graph/nodes.
 - **Neo4j envelope snapshots** — `save_estimate_envelope(...)` writes a denormalized snapshot (one `Estimate` node + N `Phase` nodes) via Cypher MERGE. Silently no-ops when `NEO4J_PASSWORD` is unset or the driver fails to connect.
-- **Postgres history + calibration** — three tables (`estimate_history`, `phase_history`, `calibration_aggregates`). `save_estimate_history(envelope, stage2, stage3)` upserts the envelope and replaces its phase rows on every status transition (Pass 2 wholesale supersedes Pass 1 in-place, keyed on `estimate_id`). When status hits `completed`, `refresh_calibration_for_phase(phase)` is called for every phase, recomputing rolling per-(phase, industry, project_type, maturity) aggregates from `phase_history`. Repositories use `session_scope()` from `db/postgres_adapter.py` which yields **None when Postgres is disabled** — every repo function must handle that and return the empty case. Tests install an aiosqlite engine onto `postgres_adapter._engine / _sessionmaker` via `_reset_for_tests()`; the ORM uses portable column types so SQLite ↔ Postgres schemas match.
-- **Twin calibration injection** — `parse_input` calls `get_calibration_for_all_phases(...)` and writes the flattened result into `state["calibration_examples"]` (already declared in `EstimationState`). `_twin_base.build_twin_user_prompt(state, pass_num=..., phase_value="discovery")` filters that list by phase and renders it into the prompt under a `"calibration"` key inside the JSON context block. The `phase_value` kwarg is required at every twin call site — keep it threaded if you add a seventh twin.
+- **Postgres history + calibration** — four tables (`estimate_history`, `phase_history`, `calibration_aggregates`, `ai_reduction_bands`). `save_estimate_history(envelope, stage2, stage3)` upserts the envelope and replaces its phase rows on every status transition (Pass 2 wholesale supersedes Pass 1 in-place, keyed on `estimate_id`); it also stores the full serialized envelope in `estimate_history.envelope_json` for verbatim redisplay. Read paths: `list_estimate_history(limit)` (summary dicts for the dashboard) and `get_estimate_envelope(id)` (the stored `envelope_json`). When status hits `completed`, `refresh_calibration_for_phase(phase)` is called for every phase, recomputing rolling per-(phase, industry, project_type, codebase-context) aggregates from `phase_history`. **"maturity" now means codebase-context code**: `calibration_aggregates.maturity_level` (and the `maturity` repo params / `phase_history.maturity_level`) hold the codebase-context code `0–3` (greenfield → brownfield_large_familiar; see `_codebase_code`), with `-1` (`_ANY_MATURITY`) as the "any" rollup sentinel since `0` is a real, default code. The column kept its historical name to avoid a migration. The `ai_reduction_bands` table is read by `get_reduction_bands()` and written by `upsert_reduction_bands(items)`. Repositories use `session_scope()` from `db/postgres_adapter.py` which yields **None when Postgres is disabled** — every repo function must handle that and return the empty case. Tests install an aiosqlite engine onto `postgres_adapter._engine / _sessionmaker` via `_reset_for_tests()`; the ORM uses portable column types so SQLite ↔ Postgres schemas match.
+- **Twin calibration + reduction-band injection** — `parse_input` calls `get_calibration_for_all_phases(...)` and writes the flattened result into `state["calibration_examples"]`, and `get_reduction_bands()` into `state["reduction_bands"]` (both declared in `EstimationState`). `_twin_base.build_twin_user_prompt(state, pass_num=..., phase_value="discovery")` filters calibration by phase (rendered under a `"calibration"` key) and renders the active guardrail under `"ai_reduction_guardrail"`. The `phase_value` kwarg is required at every twin call site — keep it threaded if you add a seventh twin.
 - **Qdrant** — `db/qdrant_adapter.py` is scaffolded but **not** populated in MVP (vector-similarity calibration is Phase 3; the SQL aggregates above are the MVP version).
 
 ### Observability (backend/observability/langfuse_wrapper.py)
 
 `@traced(name=..., as_type=...)` is a drop-in for langfuse's `@observe`. When `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` are empty the wrapper installs a **no-op decorator that preserves `inspect.iscoroutinefunction` status** — this matters because LangGraph inspects node functions to decide sync vs async dispatch. If you write a new tracing wrapper, keep the async-preserving branch or LangGraph will start raising "Expected dict, got coroutine".
 
-Langfuse is **self-hosted via docker-compose**: `langfuse-web` (UI on host port `3100` → container `3000`), `langfuse-worker`, ClickHouse (events store, host port `8123`), Redis (queues + cache, internal only), and MinIO (S3-compatible blob storage, host ports `9020` / `9021`). The metadata DB lives in the shared Postgres instance under a separate `langfuse` database created by `data/postgres-init/01-create-langfuse-db.sh` on first volume init. The estimator backend points at `http://langfuse-web:3000` inside the compose network; on the host (`make be`) it uses `http://localhost:3100`. Public/secret API keys are NOT auto-generated — sign in to the Langfuse UI, create a project, copy the keys back to `.env`.
+Langfuse is **self-hosted via docker-compose but gated behind the `langfuse` compose profile** (`profiles: ["langfuse"]` on every Langfuse service): a default `docker compose up` does **not** start it — set `COMPOSE_PROFILES=langfuse` in `.env` to enable. Services: `langfuse-web` (UI on host port `3100` → container `3000`), `langfuse-worker`, ClickHouse (events store, host port `8123`), Redis (queues + cache, internal only), MinIO (S3-compatible blob storage, host ports `9020` / `9021`), and a one-shot `minio-init`. The metadata DB lives in the shared Postgres instance under a separate `langfuse` database created by `data/postgres-init/01-create-langfuse-db.sh` on first volume init. The estimator backend points at `http://langfuse-web:3000` inside the compose network; on the host (`make be`) it uses `http://localhost:3100`. Public/secret API keys are NOT auto-generated — sign in to the Langfuse UI, create a project, copy the keys back to `.env`.
+
+### LLM usage / meta-cost (backend/orchestrator/usage.py)
+
+`usage.py` captures the Anthropic token cost of producing an estimate (distinct from the project's labor cost). It's a `contextvar` accumulator: `bind_usage_accumulator(list)` binds a per-context list, `record_usage(...)` appends one call's tokens (a no-op when nothing is bound — tests, stub path, pre-submission agents), and `summarize_usage(acc)` folds the list into an `LlmUsage` (totals + per-model breakdown + `$` via a substring-keyed pricing map, cache-read billed at ~0.1×). `call_structured` calls `record_usage` on every call. `main.py` binds **one** accumulator per estimate (Pass 1 and Pass 2 append to the same list) and `summarize_usage`s it onto `DualScenarioEstimate.llm_usage`; the review page renders it in an LLM-cost modal.
 
 ### HTTP layer (backend/main.py)
 
-- `POST /estimates` creates an envelope, kicks off `_run_pass1` as a background task, returns the envelope immediately.
-- `GET /estimates/{id}/stream` is the SSE event stream (`status`, `questions`, `final`, `error`). Frontend uses this to render Pass 1/Pass 2 progress.
-- `POST /estimates/{id}/answers` is only valid when status is `AWAITING_ANSWERS`; it resumes the graph and runs Pass 2.
-- `_envelopes` + `_event_streams` are in-memory dicts. Restart loses both. Pair this with the `InMemorySaver` checkpointer above when reasoning about durability.
+Endpoints (the draft/admin/history routes are new):
+
+- `POST /estimates/draft/prefill` — LLM prefill for the Stage 2 wizard (roster-free).
+- `POST /estimates/draft/classify-tooling` — classify the Stage 3 AI-tooling free text.
+- `POST /estimates/draft/roster/agui` — AG-UI streaming team-roster proposal.
+- `GET` / `PUT /admin/reduction-bands` — read / update the AI-reduction guardrail bands (backs the Settings screen; `PUT` no-ops with `editable=false` when Postgres is off).
+- `POST /estimates` — creates an envelope, kicks off `_run_pass1` in the background, returns the envelope immediately.
+- `GET /estimates/history` — recent persisted estimates (newest first) for the dashboard; `[]` when Postgres is off.
+- `GET /estimates/{id}` — current state and the **authoritative source of truth**. On an in-memory cache miss it falls back to the persisted `envelope_json` (so completed estimates redisplay after a restart / in a fresh session).
+- `POST /estimates/{id}/answers` — only valid when status is `AWAITING_ANSWERS`; resumes the graph and runs Pass 2.
+- `GET /estimates/{id}/stream` — SSE event stream (`status` / `questions` / `final` / `error`), **best-effort, in-process only**.
+- `GET /health` — liveness.
+
+Runtime mechanics to preserve:
+
+- Background work goes through `_spawn_background(coro, label=...)`, which retains a strong reference in a task set and adds an `add_done_callback` that logs escaped exceptions — never bare `asyncio.create_task` (the task would be GC'd mid-run and exceptions swallowed).
+- `_envelopes` is a bounded `OrderedDict` (cap `_MAX_RETAINED_ESTIMATES` = 256) that evicts the oldest **non-in-flight** entry over capacity; completed/failed estimates remain fetchable from Postgres. `_llm_usage` (the per-estimate token accumulator) is freed in the run's `finally` on **both** success and failure.
+- SSE is a per-estimate `_EventBroker`: fan-out to multiple subscribers, each with its own queue, plus a bounded replay buffer (`_MAX_HISTORY`). A (re)connecting subscriber gets the current status, then the buffered backlog, then live events — late joiners / reconnects / multiple concurrent clients all see the full sequence (no event stealing). A stalled consumer's bounded queue is dropped rather than blocking publish. SSE is **not** durable across a restart — use `GET /estimates/{id}` for authoritative state.
+- `observability/request_logging.py::RequestLoggingMiddleware` is a **pure-ASGI** request logger (wraps `send` only, never the body) so it is streaming/SSE-safe — Starlette's `BaseHTTPMiddleware` would buffer and break the SSE + AG-UI streams.
 
 The FastAPI lifespan logs `✓ Backend ready at http://...` after the graph compiles — operators (and tests) grep for this. Don't remove or restructure the message format without updating `tests/test_lifespan_ready_log.py`.
 
 ### Frontend wizard (frontend/app/estimate/)
 
-Routes follow the five planning-outline stages:
+Routes follow the five planning-outline stages, plus a landing dashboard and a settings screen:
 
+- `app/page.tsx` — landing dashboard: lists historical estimates via `GET /estimates/history` and links to redisplay completed ones (the review page reconstructs them from `envelope_json`).
 - `app/estimate/new/` — Stage 1 (raw text).
-- `app/estimate/draft/{create,context,maturity}/` — pre-submission Stage 2/3 wizard backed by `lib/wizard-store.ts` (client-side state, no estimate id yet). **The team roster lives in Stage 2** (`<RoleRosterEditor>`), not Stage 3.
+- `app/estimate/draft/{create,context,maturity}/` — pre-submission Stage 2/3 wizard backed by `lib/wizard-store.ts` (client-side state, no estimate id yet). **The team roster lives in Stage 2** (`<RoleRosterEditor>`), not Stage 3. The `maturity` route is now **Stage 3 = a freeform AI-tooling textarea + codebase-context picker** (the per-phase maturity sliders and `MaturitySlider.tsx` are deleted); on submit it calls `classifyTooling` to derive `ai_tooling`, then `createEstimate`.
 - `app/estimate/[id]/questions/` — Stage 4 (clarifying questions, posts answers back to resume the graph).
-- `app/estimate/[id]/review/` — Stage 5 (dual-scenario review + role-attributed cost table).
+- `app/estimate/[id]/review/` — Stage 5 (dual-scenario review + role-attributed cost table), with per-phase algorithm-`breakdown` charts (`<AlgorithmBreakdownChart>`), detail modals, and an LLM meta-cost modal driven by `final_estimate.llm_usage`.
+- `app/settings/` — edits the AI-reduction guardrail bands (gear icon) via `GET`/`PUT /admin/reduction-bands`.
 
 Pages that read `useSearchParams()` must be wrapped in `<Suspense>` — Next.js 15 build will fail otherwise. `/estimate/new` and `/estimate/draft/create` already do this; mirror it for any new query-param page.
 
@@ -180,6 +242,7 @@ Pages that read `useSearchParams()` must be wrapped in `<Suspense>` — Next.js 
 - **`parse_input` has an LLM-free fallback path** (`backend/orchestrator/nodes/parse_input.py`) so the graph still runs when `ANTHROPIC_API_KEY` is missing. Tests rely on this. Don't make parse_input hard-fail without an env check.
 - **Anthropic structured output**: every LLM call goes through `orchestrator/llm.py::call_structured(..., response_model=SomeModel)`. The tool is forced via `tool_choice={"type": "tool", "name": tool_name}` so Claude must call it. Free-text JSON parsing is **not** an accepted alternative — past attempts were flaky.
 - **Plan to stay independent across the twins**: Phase 1 MVP explicitly excludes A2A peer-to-peer cross-phase signaling between twins. They share only what they read from the state. Don't introduce per-twin imports of other twins' output structures.
+- **Postgres never-raise contract mechanics**: `session_scope()` commits on clean exit and rolls back + re-raises on `SQLAlchemyError`. So a repo function that catches an exception **inside** the `async with session_scope()` block and returns its empty case MUST `await session.rollback()` in the except first — otherwise (a) the partial write would still be committed on clean exit, and (b) on asyncpg the poisoned-transaction commit re-raises out of the function, breaking the never-raise contract. Every repo `except` in `db/repositories.py` does this (or wraps the `try` **outside** the `async with`, as `upsert_reduction_bands` does). This is load-bearing — keep the rollback when adding repo functions.
 
 ## Global rule: always fetch latest docs before LLM/agentic code
 

@@ -1,6 +1,7 @@
 "use client";
 
 import type {
+  ClassifyToolingResponse,
   CreateEstimateInput,
   Stage2Input,
   Stage3Input,
@@ -14,6 +15,9 @@ export interface Stage2Prefill {
   stage2: Omit<Stage2Input, "roster">;
   summary: string;
   ambiguity_score: number;
+  // AI tools the description mentioned, for pre-filling the Stage 3 tooling field.
+  // Empty string when none were named.
+  ai_tooling_description: string;
 }
 
 const API_BASE =
@@ -63,6 +67,73 @@ export async function prefillFromDescription(
   return jsonFetch("/estimates/draft/prefill", {
     method: "POST",
     body: JSON.stringify({ raw_input: rawInput }),
+  });
+}
+
+/** Classify a freeform AI-tooling description into per-phase levels. The backend
+ *  always returns a valid mapping (all "none" on a blank description or any
+ *  LLM/MCP failure), so the only error case is a network failure — callers should
+ *  treat that as "continue with no AI tooling". */
+export async function classifyTooling(
+  description: string
+): Promise<ClassifyToolingResponse> {
+  return jsonFetch("/estimates/draft/classify-tooling", {
+    method: "POST",
+    body: JSON.stringify({ description }),
+  });
+}
+
+export interface EstimateHistoryItem {
+  estimate_id: string;
+  project_name: string;
+  status: string;
+  industry: string | null;
+  project_type: string | null;
+  total_ai_assisted_hours: number | null;
+  total_manual_only_hours: number | null;
+  ai_hours_saved: number | null;
+  total_cost_ai_assisted_usd: number | null;
+  confidence: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** Recent persisted estimates for the dashboard history list. Empty when the
+ *  backend has no Postgres history configured. */
+export async function listEstimateHistory(): Promise<EstimateHistoryItem[]> {
+  return jsonFetch("/estimates/history");
+}
+
+export interface ReductionBandRow {
+  phase: string;
+  tooling_level: string;
+  min_pct: number;
+  max_pct: number;
+  default_min_pct: number;
+  default_max_pct: number;
+  is_override: boolean;
+}
+
+export interface ReductionBandsResponse {
+  editable: boolean;
+  bands: ReductionBandRow[];
+}
+
+export async function getReductionBands(): Promise<ReductionBandsResponse> {
+  return jsonFetch("/admin/reduction-bands");
+}
+
+export async function saveReductionBands(
+  bands: {
+    phase: string;
+    tooling_level: string;
+    min_pct: number;
+    max_pct: number;
+  }[]
+): Promise<ReductionBandsResponse> {
+  return jsonFetch("/admin/reduction-bands", {
+    method: "PUT",
+    body: JSON.stringify({ bands }),
   });
 }
 

@@ -27,7 +27,11 @@ from db.orm_models import Base  # noqa: E402  — autogenerate target
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False is critical: the default (True) would
+    # disable every logger the app already created — including all of our
+    # module loggers — when migrations run (e.g. POSTGRES_MIGRATE_ON_START on
+    # startup), silently killing application logging for the rest of the process.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Always prefer the app's resolved DSN over alembic.ini's placeholder.
 _resolved_dsn = get_settings().resolved_postgres_dsn
@@ -46,13 +50,25 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        # Default is 32, but several revision ids exceed that (e.g.
+        # 0007_double_development_chat_agentic_bands). Without this, fresh Postgres
+        # DBs create alembic_version.version_num as VARCHAR(32) and silently fail
+        # every migration past the first long id. Keep this ≥ the longest revision id.
+        version_table_column_length=128,
     )
     with context.begin_transaction():
         context.run_migrations()
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        # See run_migrations_offline: keep ≥ the longest revision id so fresh DBs
+        # don't recreate alembic_version.version_num as the default VARCHAR(32).
+        version_table_column_length=128,
+    )
     with context.begin_transaction():
         context.run_migrations()
 

@@ -1,4 +1,4 @@
-.PHONY: help up down logs ps be fe smoke clean install-be install-fe
+.PHONY: help up down logs ps be fe smoke evals clean install-be install-fe
 
 help:
 	@echo "Targets:"
@@ -11,6 +11,7 @@ help:
 	@echo "  make be         - run FastAPI backend on :8000"
 	@echo "  make fe         - run Next.js frontend on :3000"
 	@echo "  make smoke      - run backend smoke test (one Pass-1 cycle)"
+	@echo "  make evals      - run the LLM-as-judge evals harness"
 	@echo "  make clean      - remove containers + volumes"
 
 up:
@@ -41,6 +42,9 @@ fe:
 
 smoke:
 	cd backend && uv run python -m orchestrator.smoke
+
+evals:
+	cd backend && uv run python -m evals.run
 
 clean:
 	docker compose down -v

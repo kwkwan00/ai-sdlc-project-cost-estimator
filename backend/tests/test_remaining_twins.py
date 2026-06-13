@@ -5,8 +5,8 @@ stub path because no ANTHROPIC_API_KEY is set during testing).
 
 Per-twin we test:
 - The compute_* function math
-- The maturity-level AI reduction cap
-- The build_phase_estimate end-to-end shape (role attribution sums to total)
+- The build_phase_estimate end-to-end shape (role attribution sums to total),
+  including the effective-AI-reduction application (incl. negative reductions)
 """
 
 from __future__ import annotations
@@ -22,9 +22,6 @@ from orchestrator.nodes.code_review_sentinel import (
     compute_review_hours,
 )
 from orchestrator.nodes.code_review_sentinel import (
-    ai_reduction_for_maturity as cr_cap,
-)
-from orchestrator.nodes.code_review_sentinel import (
     build_phase_estimate as build_cr,
 )
 
@@ -32,9 +29,6 @@ from orchestrator.nodes.code_review_sentinel import (
 from orchestrator.nodes.deployment_devops import (
     CMPInputs,
     compute_cmp_hours,
-)
-from orchestrator.nodes.deployment_devops import (
-    ai_reduction_for_maturity as dep_cap,
 )
 from orchestrator.nodes.deployment_devops import (
     build_phase_estimate as build_dep,
@@ -46,9 +40,6 @@ from orchestrator.nodes.development_architect import (
     StackCategory,
     compute_cocomo_hours,
     resolve_sloc,
-)
-from orchestrator.nodes.development_architect import (
-    ai_reduction_for_maturity as dev_cap,
 )
 from orchestrator.nodes.development_architect import (
     build_phase_estimate as build_dev,
@@ -63,9 +54,6 @@ from orchestrator.nodes.qa_testing_strategist import (
     compute_test_points,
 )
 from orchestrator.nodes.qa_testing_strategist import (
-    ai_reduction_for_maturity as qa_cap,
-)
-from orchestrator.nodes.qa_testing_strategist import (
     build_phase_estimate as build_qa,
 )
 
@@ -73,9 +61,6 @@ from orchestrator.nodes.qa_testing_strategist import (
 from orchestrator.nodes.ux_design_strategist import (
     UXSCPInputs,
     compute_scp_hours,
-)
-from orchestrator.nodes.ux_design_strategist import (
-    ai_reduction_for_maturity as ux_cap,
 )
 from orchestrator.nodes.ux_design_strategist import (
     build_phase_estimate as build_ux,
@@ -107,18 +92,13 @@ def test_ux_scp_responsive_adds_35_percent() -> None:
     assert mid_resp == pytest.approx(mid_base * 1.35)
 
 
-@pytest.mark.parametrize("level,expected", [(1, 0.0), (3, 0.20), (5, 0.40)])
-def test_ux_maturity_cap(level: int, expected: float) -> None:
-    assert ux_cap(level) == expected
-
-
 def test_ux_build_phase_estimate_role_attribution_sums_to_total() -> None:
     inputs = UXSCPInputs(
         simple_screens=20, average_screens=10, complex_screens=4, novel_screens=0,
         design_system_factor=0.7, interaction_complexity_multiplier=1.2, iteration_factor=1.3,
         is_responsive=True, confidence=0.7,
     )
-    est = build_ux(inputs, maturity_level=3, roster=RoleRoster.default())
+    est = build_ux(inputs, effective_reduction=0.30, roster=RoleRoster.default())
     assert est.phase is Phase.UX_DESIGN
     assert sum(rh.hours for rh in est.ai_assisted_role_hours) == pytest.approx(
         est.ai_assisted_hours.most_likely, abs=1e-3
@@ -180,22 +160,27 @@ def test_dev_infrastructure_leverage_reduces_hours() -> None:
     assert high_leverage == pytest.approx(no_leverage * 0.6, rel=1e-3)
 
 
-def test_dev_ai_reduction_is_capped_by_maturity_level() -> None:
-    # User asks for 50% AI reduction, but maturity is 2 (cap = 10%).
+def test_dev_ai_reduction_applies_effective_reduction() -> None:
     inputs = DevCOCOMOInputs(
         sloc_estimate=10000, scale_factor_sum=12, eaf_composite=1.0,
         stack_category=StackCategory.MODERN_WEB, ai_reduction_pct=50,
         confidence=0.7,
     )
-    est = build_dev(inputs, maturity_level=2, roster=RoleRoster.default())
+    est = build_dev(inputs, effective_reduction=0.10, roster=RoleRoster.default())
     ratio = est.ai_assisted_hours.most_likely / est.manual_only_hours.most_likely
-    # Cap is 10% → ratio should be 0.9.
+    # 10% reduction → ratio should be 0.9.
     assert ratio == pytest.approx(0.9, abs=0.001)
 
 
-@pytest.mark.parametrize("level,expected", [(1, 0.0), (3, 0.25), (5, 0.55)])
-def test_dev_maturity_cap(level: int, expected: float) -> None:
-    assert dev_cap(level) == expected
+def test_dev_negative_reduction_makes_ai_slower() -> None:
+    inputs = DevCOCOMOInputs(
+        sloc_estimate=10000, scale_factor_sum=12, eaf_composite=1.0,
+        stack_category=StackCategory.MODERN_WEB, ai_reduction_pct=50,
+        confidence=0.7,
+    )
+    est = build_dev(inputs, effective_reduction=-0.10, roster=RoleRoster.default())
+    # Negative reduction → AI hours exceed manual hours.
+    assert est.ai_assisted_hours.most_likely > est.manual_only_hours.most_likely
 
 
 # ============== Code Review ==============
@@ -209,6 +194,27 @@ def test_review_hours_scale_with_ksloc() -> None:
     mid, b = compute_review_hours(inputs)
     assert b["inspection_rate_loc_per_hr"] == 175
     assert mid == pytest.approx(85.7, abs=0.2)
+
+
+def test_review_build_phase_estimate_emits_structured_breakdown() -> None:
+    inputs = CodeReviewInputs(
+        total_ksloc=26, primary_language="typescript", kickback_rate_pct=20,
+        pr_complexity_factor=1.0, tooling_setup_hours=12, confidence=0.7,
+        notes="Manual-only review on a greenfield TS portal.",
+    )
+    est = build_cr(inputs, effective_reduction=0.0, roster=RoleRoster.default())
+    # The Fagan components are structured data, not embedded in prose.
+    assert {
+        "inspection_rate_loc_per_hr",
+        "review_hours_pre_tooling",
+        "rework_multiplier",
+        "tooling_setup_hours",
+    } <= est.breakdown.keys()
+    assert est.breakdown["tooling_setup_hours"] == 12
+    assert est.effective_ai_reduction_pct == 0.0
+    # notes is now prose only — no "breakdown:" / "Effective AI reduction" boilerplate.
+    assert "breakdown" not in est.notes.lower()
+    assert est.notes == "Manual-only review on a greenfield TS portal."
 
 
 def test_review_kickback_increases_via_rework_multiplier() -> None:
@@ -233,17 +239,12 @@ def test_review_tooling_setup_adds_flat_hours() -> None:
     assert mid_with_tooling - no_tooling_mid == 50
 
 
-@pytest.mark.parametrize("level,expected", [(1, 0.0), (3, 0.20), (5, 0.30)])
-def test_review_maturity_cap(level: int, expected: float) -> None:
-    assert cr_cap(level) == expected
-
-
 def test_review_build_phase_estimate_role_attribution_sums() -> None:
     inputs = CodeReviewInputs(
         total_ksloc=8.5, primary_language="typescript", kickback_rate_pct=25,
         pr_complexity_factor=1.0, tooling_setup_hours=20, confidence=0.7,
     )
-    est = build_cr(inputs, maturity_level=3, roster=RoleRoster.default())
+    est = build_cr(inputs, effective_reduction=0.30, roster=RoleRoster.default())
     assert est.phase is Phase.CODE_REVIEW
     assert sum(rh.hours for rh in est.ai_assisted_role_hours) == pytest.approx(
         est.ai_assisted_hours.most_likely, abs=1e-3
@@ -275,17 +276,12 @@ def test_cmp_regulatory_multiplier_compounds_with_conservative_bias() -> None:
     assert mid == pytest.approx(224.0, abs=0.01)
 
 
-@pytest.mark.parametrize("level,expected", [(1, 0.0), (3, 0.10), (5, 0.25)])
-def test_deployment_maturity_cap(level: int, expected: float) -> None:
-    assert dep_cap(level) == expected
-
-
 def test_deployment_build_phase_estimate_role_attribution_sums() -> None:
     inputs = CMPInputs(
         cmp_score=1.8, cicd_components=4, monitoring_components=3, handoff_hours=40,
         regulatory_multiplier=1.25, conservative_bias_pct=12, confidence=0.7,
     )
-    est = build_dep(inputs, maturity_level=2, roster=RoleRoster.default())
+    est = build_dep(inputs, effective_reduction=0.30, roster=RoleRoster.default())
     assert est.phase is Phase.DEPLOYMENT
     assert sum(rh.hours for rh in est.manual_only_role_hours) == pytest.approx(
         est.manual_only_hours.most_likely, abs=1e-3
@@ -330,19 +326,16 @@ def test_qa_auto_select_plan(has_ai: bool, has_reg: bool, expected: QAPlan) -> N
     assert auto_select_plan(has_ai, has_reg) == expected
 
 
-@pytest.mark.parametrize("level,expected", [(1, 0.0), (3, 0.18), (5, 0.30)])
-def test_qa_maturity_cap(level: int, expected: float) -> None:
-    assert qa_cap(level) == expected
-
-
 def test_qa_build_phase_estimate_records_selected_plan_in_algorithm() -> None:
     inputs = QATPAInputs(
         total_function_points=180, df_weighted=1.0, qd_score=14, qi_score=48,
         supplementary_hours=150, has_ai_features=True, has_regulatory_requirements=True,
         recommended_plan=QAPlan.PLAN_C, confidence=0.7,
     )
-    est = build_qa(inputs, maturity_level=3, roster=RoleRoster.default())
+    est = build_qa(inputs, effective_reduction=0.30, roster=RoleRoster.default())
     assert est.algorithm == "TPA_Plan_C"
-    assert "Plan A:" in est.notes
-    assert "Plan B:" in est.notes
-    assert "Plan C:" in est.notes
+    # Plan hours + TPA components are now structured in `breakdown`, not prose.
+    assert {"plan_a_hours", "plan_b_hours", "plan_c_hours", "total_tp"} <= est.breakdown.keys()
+    assert est.breakdown["plan_c_hours"] > 0
+    assert est.effective_ai_reduction_pct == 30.0
+    assert "Selected plan C" in est.notes

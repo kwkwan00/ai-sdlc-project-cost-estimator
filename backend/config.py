@@ -14,15 +14,56 @@ class Settings(BaseSettings):
     )
 
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(default="claude-opus-4-5-20250929", alias="ANTHROPIC_MODEL")
-    # Per-agent model overrides for the two lightweight pre-submission agents.
-    # These are independent of ANTHROPIC_MODEL (which the six estimation twins
-    # use) so the prefill/roster helpers don't inherit the heavyweight Opus model.
+    anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
+    # Per-agent model overrides. These are independent of ANTHROPIC_MODEL (which the
+    # six estimation twins use, defaulting to Sonnet) so each helper can pin its own
+    # tier: the lightweight pre-submission/merge agents stay on Haiku, while the
+    # roster/tooling agents that need broader knowledge match the twins on Sonnet.
     anthropic_model_prefill: str = Field(
         default="claude-haiku-4-5", alias="ANTHROPIC_MODEL_PREFILL"
     )
     anthropic_model_roster: str = Field(
         default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_ROSTER"
+    )
+    # Lightweight consolidation pass that clusters near-duplicate clarifying
+    # questions in merge_pass1. Cheap/fast; degrades to deterministic topic-dedup
+    # when unset or unreachable.
+    anthropic_model_merge: str = Field(
+        default="claude-haiku-4-5", alias="ANTHROPIC_MODEL_MERGE"
+    )
+    # Classifies the freeform Stage 3 AI-tooling description into per-phase levels.
+    # Benefits from broad tool knowledge, so defaults to Sonnet rather than Haiku.
+    anthropic_model_tooling: str = Field(
+        default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_TOOLING"
+    )
+    # LLM-as-judge model for the evals harness (backend/evals/). The judge wants a
+    # strong model — defaults to Sonnet, overridable via `python -m evals.run
+    # --judge-model`. Independent of ANTHROPIC_MODEL so judging doesn't inherit the
+    # twins' model.
+    anthropic_model_eval: str = Field(
+        default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_EVAL"
+    )
+    # Self-hosted docs-mcp-server the tooling classifier consults (as an MCP client
+    # over streamable HTTP) to research tools it doesn't recognize. Co-located in
+    # docker-compose; empty url disables research → unknown tools stay 'none'.
+    docs_mcp_url: str = Field(
+        default="http://localhost:6280/mcp", alias="DOCS_MCP_URL"
+    )
+    docs_mcp_auth_token: str = Field(default="", alias="DOCS_MCP_AUTH_TOKEN")
+    # Hard ceiling on the docs-mcp research call. It runs in the Stage 3 submit
+    # critical path; a slow/unreachable MCP server must not hang "Continue" — on
+    # timeout the unknown tools stay 'none' (the conservative fallback).
+    docs_mcp_research_timeout_s: float = Field(
+        default=25.0, alias="DOCS_MCP_RESEARCH_TIMEOUT_S"
+    )
+    # When True, an unrecognized tool that isn't in the docs-mcp index is SCRAPED
+    # (its latest docs indexed) before the estimate continues, instead of just
+    # searching the existing index. Scraping is slow (crawl + embed), so it uses a
+    # larger timeout. Requires an embeddings provider on docs-mcp-server
+    # (OPENAI_API_KEY). On timeout/failure the tool still degrades to 'none'.
+    docs_mcp_auto_scrape: bool = Field(default=True, alias="DOCS_MCP_AUTO_SCRAPE")
+    docs_mcp_scrape_timeout_s: float = Field(
+        default=240.0, alias="DOCS_MCP_SCRAPE_TIMEOUT_S"
     )
 
     neo4j_uri: str = Field(default="bolt://localhost:7687", alias="NEO4J_URI")

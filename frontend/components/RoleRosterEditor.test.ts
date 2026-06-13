@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { CustomRoleInput } from "@/lib/schemas";
-import { addRow, clampPercentage, rebalanceOnEdit, removeRow } from "./RoleRosterEditor";
+import {
+  addRow,
+  clampPercentage,
+  normalizeShares,
+  rebalanceOnEdit,
+  removeRow,
+} from "./RoleRosterEditor";
 
 const START: CustomRoleInput[] = [
   {
@@ -234,5 +240,62 @@ describe("removeRow", () => {
     expect(next[0].role_id).toBe("jr_product");
     expect(next[0].category).toBe("product");
     expect(next[0].rate_per_hour).toBe(140);
+  });
+});
+
+// ---------- normalizeShares (the "Auto-adjust to 100%" button) ----------
+
+describe("normalizeShares", () => {
+  it("is a no-op shape when shares already total 100", () => {
+    const next = normalizeShares(START);
+    expect(sum(next)).toBe(100);
+    expect(next.map((r) => r.percentage)).toEqual([20, 10, 50, 20]);
+  });
+
+  it("scales an over-100 roster proportionally back to 100", () => {
+    const over = START.map((r) => ({ ...r, percentage: r.percentage * 2 })); // sums to 200
+    const next = normalizeShares(over);
+    expect(sum(next)).toBe(100);
+    // Proportions preserved: original 20/10/50/20 → 20/10/50/20.
+    expect(next.map((r) => r.percentage)).toEqual([20, 10, 50, 20]);
+  });
+
+  it("scales an under-100 roster up to 100", () => {
+    const under: CustomRoleInput[] = [
+      { ...START[0], percentage: 10 },
+      { ...START[1], percentage: 10 },
+      { ...START[2], percentage: 20 },
+    ]; // sums to 40
+    const next = normalizeShares(under);
+    expect(sum(next)).toBe(100);
+    expect(next.map((r) => r.percentage)).toEqual([25, 25, 50]);
+  });
+
+  it("splits evenly when all rows are zero (no division by zero)", () => {
+    const zeroed = START.map((r) => ({ ...r, percentage: 0 }));
+    const next = normalizeShares(zeroed);
+    expect(sum(next)).toBe(100);
+    expect(next.map((r) => r.percentage)).toEqual([25, 25, 25, 25]);
+  });
+
+  it("absorbs rounding drift so the sum is exactly 100", () => {
+    const three: CustomRoleInput[] = [
+      { ...START[0], percentage: 1 },
+      { ...START[1], percentage: 1 },
+      { ...START[2], percentage: 1 },
+    ];
+    const next = normalizeShares(three); // 33.33 each → 33/33/34
+    expect(sum(next)).toBe(100);
+  });
+
+  it("collapses to 100 for a single-row roster", () => {
+    expect(normalizeShares([{ ...START[0], percentage: 7 }])[0].percentage).toBe(100);
+  });
+
+  it("preserves tags, rates, and descriptions", () => {
+    const next = normalizeShares(START.map((r) => ({ ...r, percentage: r.percentage * 3 })));
+    expect(next[2].role_id).toBe("sr_eng");
+    expect(next[2].category).toBe("engineering");
+    expect(next[2].rate_per_hour).toBe(240);
   });
 });

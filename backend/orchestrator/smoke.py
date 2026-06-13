@@ -15,7 +15,13 @@ import uuid
 
 from langgraph.types import Command
 
-from models.project_schema import Stage2Context, Stage3Maturity
+from models.project_schema import (
+    AiToolingLevel,
+    CodebaseContext,
+    PhaseToolingLevels,
+    Stage2Context,
+    Stage3Context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +49,14 @@ async def main(*, use_llm: bool = True) -> None:
         "project_name": "Patient Portal (smoke)",
         "raw_input": HEALTHCARE_FIXTURE,
         "stage2": Stage2Context(industry="healthcare", target_timeline_weeks=20),
-        "stage3": Stage3Maturity(),
+        "stage3": Stage3Context(
+            codebase_context=CodebaseContext.GREENFIELD,
+            ai_tooling=PhaseToolingLevels(
+                development=AiToolingLevel.AGENTIC,
+                code_review=AiToolingLevel.AGENTIC,
+                qa_testing=AiToolingLevel.CHAT,
+            ),
+        ),
         "parsed_context": {} if use_llm else {"industry_hint": "healthcare", "summary": "smoke"},
     }
 

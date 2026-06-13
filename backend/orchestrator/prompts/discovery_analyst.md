@@ -77,22 +77,29 @@ Return a single integer `efactor` = sum of the 8 ratings (max 40).
 
 ### Project type signal
 
-- `phase_ratio_hint`: 0.07 (greenfield web), 0.08 (default), 0.10 (regulated), 0.12 (legacy replacement)
-- `productivity_factor`: 20–28 hours/UCP. Pick higher for regulated / complex domains.
+- `phase_ratio_hint`: 0.05–0.15. Use 0.07 (greenfield web), 0.08 (default), 0.10 (regulated), 0.12 (legacy replacement).
+- `productivity_factor`: 18–32 hours/UCP (typically 20–28). Pick higher for regulated / complex domains.
 
-### Qualitative outputs
+## Worked example (abbreviated)
 
-- 2–5 `assumptions` you made (e.g., "Assuming 6 distinct use cases based on the
-  scope description")
-- 1–3 `risks` (e.g., "Stakeholder count may be higher than estimated; would push effort by ~30 hrs")
-- 0–3 `gaps` — questions you'd want answered to firm up the estimate. Each gap has a
-  topic, plain-English question, `impact_hours` (rough magnitude), and a `suggested_default`
-  if the user skips.
-- A `confidence` score 0..1 reflecting how grounded your inputs are.
-- A short `notes` field summarizing your reasoning.
+> *"Internal admin tool: 5 CRUD screens, 1 CSV import, login. Small co-located team, requirements settled."*
+> → `simple_use_cases` 4, `average_use_cases` 2, `complex_use_cases` 0; `simple_actors` 0,
+> `average_actors` 1 (admin via panel), `complex_actors` 0; `tfactor` ≈ 18, `efactor` ≈ 24;
+> `stakeholder_group_count` 2, `decision_maker_accessibility` `readily_available`,
+> `alignment_difficulty` `pre_aligned`; `phase_ratio_hint` 0.08, `productivity_factor` 22.
 
-## Important
+## Qualitative outputs
 
-- Use the **most likely** numbers you can infer; do not be over-conservative.
-- Be brief in `notes` — your reasoning trace will be auditable separately.
-- If something is unstated, write a gap rather than guessing wildly.
+- `assumptions` (2–5) — the load-bearing judgment calls behind your numbers, each a short factual statement (e.g. "6 use cases inferred from the stated scope"). State the assumption, not a hedge.
+- `risks` (1–3) — what could push effort up, with rough magnitude (e.g. "stakeholder count may be higher → +~30 hrs").
+- `gaps` (0–3) — unknowns worth asking the user about. Each: `topic` (short label), `question_text` (plain-English question), `impact_hours` (roughly how much the answer would move the estimate), `suggested_default` (your best guess if they skip). Only raise a gap whose answer would *materially* change hours — skip trivia, and don't duplicate another phase's obvious question.
+- `confidence` (0..1) — how grounded your inputs are: ~0.8 well-specified, ~0.5 partial, ~0.3 mostly inferred.
+- `notes` — Keep `notes` to one or two sentences of qualitative reasoning — numeric component breakdowns are emitted structurally by the system; do not enumerate them in `notes`.
+
+## Estimation stance
+
+Estimate the **most likely** values, not the worst case — downstream code derives the optimistic/pessimistic range from your central numbers. If something material is unstated, write a `gap` rather than inflating a guess.
+
+You do NOT propose or apply any AI speed-up. The system applies it downstream from the project's tooling guardrail. Estimate manual most-likely effort only.
+
+The team is a user-defined roster, not a fixed set of roles — do not assume any specific role count or mix. Downstream code splits your hours across whatever roster the user defined.

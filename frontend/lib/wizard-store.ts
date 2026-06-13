@@ -28,6 +28,9 @@ interface WizardSession {
   /** One-paragraph summary the LLM produced from the raw input. Optional;
    *  surfaced as a small echo on Stage 2 so the user can sanity-check. */
   prefill_summary?: string;
+  /** AI tools the prefill found in the Stage 1 description, if any. Seeds the
+   *  Stage 3 tooling textarea on first visit (the user can still edit/clear it). */
+  prefill_ai_tooling?: string;
   /** Set once the AG-UI roster agent has proposed (or attempted) a team on
    *  Stage 2, so revisiting the page doesn't re-trigger the run. */
   roster_proposed?: boolean;

@@ -148,6 +148,16 @@ async def call_structured(
     # Every LLM / forced-tool call is logged at INFO with cost + latency so the
     # operational narrative shows model usage without needing Langfuse enabled.
     usage = getattr(response, "usage", None)
+    # Record token usage into the active per-estimate accumulator (no-op when none
+    # is bound — e.g. tests, the stub path, pre-submission agents).
+    from orchestrator.usage import record_usage
+
+    record_usage(
+        model=use_model,
+        input_tokens=getattr(usage, "input_tokens", 0) or 0,
+        output_tokens=getattr(usage, "output_tokens", 0) or 0,
+        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+    )
     logger.info(
         "llm call ✓ model=%s tool=%s latency=%dms stop=%s "
         "tokens(in/out/cache_read)=%s/%s/%s",
@@ -169,6 +179,77 @@ async def call_structured(
         f"Stop reason: {response.stop_reason}. Content types: "
         f"{[getattr(b, 'type', '?') for b in response.content]}"
     )
+
+
+@traced(name="claude-mcp-research", as_type="generation")
+async def research_with_local_mcp(
+    *,
+    system: str,
+    user: str,
+    mcp_url: str,
+    headers: dict[str, str] | None = None,
+    model: str | None = None,
+    max_tokens: int = 2048,
+) -> str:
+    """Free-text call backed by a SELF-HOSTED MCP server (e.g. docs-mcp-server).
+
+    The backend is the MCP client here: it connects to `mcp_url` over streamable
+    HTTP, lists the server's tools, exposes them to Claude via the SDK tool runner,
+    lets Claude call them to research, and returns the concatenated text of its final
+    answer. Because the tool round trips happen in-process (not via Anthropic's
+    server-side connector), the MCP server can live on localhost / inside the compose
+    network — unreachable from Anthropic's cloud.
+
+    Unlike `call_structured`, this does NOT force a tool. Callers wrap it in
+    try/except + a timeout: any failure (server down, `mcp` not installed, tool
+    error) should degrade gracefully rather than break the flow.
+    """
+    import inspect as _inspect
+
+    from anthropic.lib.tools.mcp import async_mcp_tool
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    client = _get_client()
+    use_model = model or get_settings().anthropic_model
+    started = time.perf_counter()
+
+    async with streamablehttp_client(mcp_url, headers=headers or None) as streams:
+        # v1 yields (read, write, get_session_id); v2 yields (read, write).
+        read, write = streams[0], streams[1]
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools_result = await session.list_tools()
+            runner = client.beta.messages.tool_runner(
+                model=use_model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+                tools=[async_mcp_tool(t, session) for t in tools_result.tools],
+            )
+            if _inspect.isawaitable(runner):
+                runner = await runner
+            # The runner drives the tool loop; the LAST assistant message it yields
+            # (stop_reason=end_turn, no tool_use) carries the final prose answer.
+            last = None
+            async for message in runner:
+                last = message
+            text = ""
+            if last is not None:
+                text = "".join(
+                    getattr(b, "text", "")
+                    for b in last.content
+                    if getattr(b, "type", None) == "text"
+                )
+
+    logger.info(
+        "local mcp research ✓ model=%s tools=%d latency=%dms out_chars=%d",
+        use_model,
+        len(tools_result.tools),
+        int((time.perf_counter() - started) * 1000),
+        len(text),
+    )
+    return text
 
 
 def call_structured_sync(

@@ -23,6 +23,7 @@ dependencies = [
     "asyncpg>=0.29",
     "alembic>=1.13",
     "greenlet>=3.0",
+    "mcp>=1.12",
 ]
 
 [dependency-groups]

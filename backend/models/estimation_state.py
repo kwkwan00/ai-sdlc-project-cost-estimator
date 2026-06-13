@@ -5,7 +5,7 @@ from __future__ import annotations
 import operator
 from typing import Annotated, TypedDict
 
-from models.project_schema import Stage2Context, Stage3Maturity
+from models.project_schema import Stage2Context, Stage3Context
 from models.twin_outputs import (
     ClarifyingQuestion,
     DualScenarioEstimate,
@@ -24,10 +24,13 @@ class EstimationState(TypedDict, total=False):
     project_name: str
     raw_input: str
     stage2: Stage2Context | None
-    stage3: Stage3Maturity
+    stage3: Stage3Context
 
     parsed_context: dict
     calibration_examples: list[dict]
+    # DB-loaded per-(phase, tooling) reduction guardrail bands, nested
+    # {phase_value: {tooling_value: [lo, hi]}}. Empty → twins use code defaults.
+    reduction_bands: dict
 
     pass1_estimates: Annotated[list[PhaseEstimate], operator.add]
     clarifying_questions: list[ClarifyingQuestion]
@@ -35,5 +38,12 @@ class EstimationState(TypedDict, total=False):
 
     pass2_estimates: Annotated[list[PhaseEstimate], operator.add]
     final_estimate: DualScenarioEstimate | None
+
+    # Inter-node results (single-writer; written post-fan-out, so no reducer).
+    # `consistency_check` emits warnings consumed by `synthesize_estimate`.
+    consistency_warnings: list[str]
+    # `commercial_processing` prices the roster; consumed by `synthesize_estimate`.
+    total_cost_ai_assisted_usd: float
+    total_cost_manual_only_usd: float
 
     error: str | None

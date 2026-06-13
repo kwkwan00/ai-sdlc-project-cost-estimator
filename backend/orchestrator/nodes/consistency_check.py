@@ -38,10 +38,7 @@ async def consistency_check(state: EstimationState) -> dict:
     if (w := _capers_jones_qa_ratio_warning(pass2)) is not None:
         warnings.append(w)
 
-    # Stash warnings on parsed_context so synthesize can pick them up.
-    parsed = dict(state.get("parsed_context", {}))
-    parsed["consistency_warnings"] = warnings
     logger.info(
         "consistency_check complete: %d phase(s), %d warning(s)", len(pass2), len(warnings)
     )
-    return {"parsed_context": parsed}
+    return {"consistency_warnings": warnings}

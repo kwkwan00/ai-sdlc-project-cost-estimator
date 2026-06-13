@@ -8,12 +8,14 @@ Three concerns, three small surfaces:
    `save_estimate_envelope` semantics: silently no-ops when Postgres is disabled.
 
 2. `refresh_calibration_for_phase(phase)` — recompute the rolling per-(phase,
-   industry, project_type, maturity) aggregates from `phase_history`. Called after
-   estimates complete so subsequent runs see the new data.
+   industry, project_type, codebase-context) aggregates from `phase_history`. Called
+   after estimates complete so subsequent runs see the new data. The codebase-context
+   code is stored in the column historically named `maturity_level`.
 
 3. `get_calibration(phase, ...)` — read aggregates for a given phase, optionally
-   filtered by industry / project_type / maturity. Returned as plain dicts so callers
-   (twins / parse_input) can hand them straight to the LLM prompt without ORM leakage.
+   filtered by industry / project_type / codebase-context. Returned as plain dicts so
+   callers (twins / parse_input) can hand them straight to the LLM prompt without ORM
+   leakage. The codebase-context code rides in the `maturity_level` column/param.
 """
 
 from __future__ import annotations
@@ -23,9 +25,19 @@ from typing import Any
 
 from sqlalchemy import delete, select
 
-from db.orm_models import CalibrationAggregate, EstimateHistory, PhaseHistory
+from db.orm_models import (
+    AiReductionBand,
+    CalibrationAggregate,
+    EstimateHistory,
+    PhaseHistory,
+)
 from db.postgres_adapter import session_scope
-from models.project_schema import EstimateEnvelope, Stage2Context, Stage3Maturity
+from models.project_schema import (
+    CodebaseContext,
+    EstimateEnvelope,
+    Stage2Context,
+    Stage3Context,
+)
 from models.twin_outputs import DualScenarioEstimate, PhaseEstimate
 
 logger = logging.getLogger(__name__)
@@ -34,18 +46,23 @@ logger = logging.getLogger(__name__)
 # ---------- helpers ----------
 
 
-def _maturity_for_phase(phase_value: str, stage3: Stage3Maturity | None) -> int | None:
+def _codebase_code(stage3: Stage3Context | None) -> int | None:
+    """Map the project-level codebase context to its integer code (0–3).
+
+    Phase-independent: the codebase context is a single project-level signal, not a
+    per-phase one. The returned code is stored in the column historically named
+    `maturity_level` (no migration — the column was repurposed). Returns None when
+    Stage 3 is absent.
+    """
     if stage3 is None:
         return None
     mapping = {
-        "discovery": stage3.discovery_maturity,
-        "ux_design": stage3.ux_design_maturity,
-        "development": stage3.development_maturity,
-        "code_review": stage3.code_review_maturity,
-        "deployment": stage3.deployment_maturity,
-        "qa_testing": stage3.qa_testing_maturity,
+        CodebaseContext.GREENFIELD: 0,
+        CodebaseContext.BROWNFIELD_SMALL: 1,
+        CodebaseContext.BROWNFIELD_LARGE_UNFAMILIAR: 2,
+        CodebaseContext.BROWNFIELD_LARGE_FAMILIAR: 3,
     }
-    return mapping.get(phase_value)
+    return mapping.get(stage3.codebase_context)
 
 
 def _phase_row(
@@ -81,7 +98,7 @@ async def save_estimate_history(
     envelope: EstimateEnvelope,
     *,
     stage2: Stage2Context | None,
-    stage3: Stage3Maturity | None,
+    stage3: Stage3Context | None,
 ) -> None:
     """Upsert one envelope + its phases into the history tables.
 
@@ -108,6 +125,7 @@ async def save_estimate_history(
 
             existing.project_name = envelope.project_name
             existing.status = envelope.status.value
+            existing.envelope_json = envelope.model_dump(mode="json")
             existing.industry = industry
             existing.project_type = project_type
             existing.engagement_model = engagement
@@ -136,7 +154,7 @@ async def save_estimate_history(
                         p,
                         industry=industry,
                         project_type=project_type,
-                        maturity=_maturity_for_phase(p.phase.value, stage3),
+                        maturity=_codebase_code(stage3),
                     )
                     for p in phases
                 ]
@@ -147,14 +165,75 @@ async def save_estimate_history(
                 len(phases),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("save_estimate_history failed (%s); rolling back", exc)
-            raise
+            # Roll back so session_scope's clean-exit commit is a no-op: otherwise a
+            # mid-body failure would leave a partial write to commit, and on asyncpg the
+            # poisoned transaction would make that commit re-raise out of this function
+            # (breaking the never-raise contract).
+            await session.rollback()
+            logger.warning("save_estimate_history failed (%s); skipping", exc)
+            return
+
+
+async def list_estimate_history(limit: int = 50) -> list[dict[str, Any]]:
+    """Recent persisted estimates (newest first) as summary dicts for the history
+    list. Returns [] when Postgres is disabled or unreadable."""
+    async with session_scope() as session:
+        if session is None:
+            return []
+        try:
+            result = await session.execute(
+                select(EstimateHistory)
+                .order_by(EstimateHistory.updated_at.desc())
+                .limit(limit)
+            )
+            rows = list(result.scalars().all())
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.warning("list_estimate_history failed (%s)", exc)
+            return []
+    return [
+        {
+            "estimate_id": r.id,
+            "project_name": r.project_name,
+            "status": r.status,
+            "industry": r.industry,
+            "project_type": r.project_type,
+            "total_ai_assisted_hours": r.total_ai_assisted_mid_hours,
+            "total_manual_only_hours": r.total_manual_only_mid_hours,
+            "ai_hours_saved": r.ai_hours_saved,
+            "total_cost_ai_assisted_usd": r.total_cost_ai_assisted_usd,
+            "confidence": r.confidence,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+        }
+        for r in rows
+    ]
+
+
+async def get_estimate_envelope(estimate_id: str) -> dict[str, Any] | None:
+    """The full persisted EstimateEnvelope JSON for redisplay, or None when Postgres
+    is disabled / the estimate isn't in history / no snapshot was stored."""
+    async with session_scope() as session:
+        if session is None:
+            return None
+        try:
+            row = await session.get(EstimateHistory, estimate_id)
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.warning("get_estimate_envelope failed (%s)", exc)
+            return None
+        return row.envelope_json if row else None
 
 
 # ---------- calibration ----------
 
 
-_ANY = ""  # sentinel for "any value" in CalibrationAggregate dimensions
+_ANY = ""  # sentinel for "any value" in CalibrationAggregate string dimensions
+# The `maturity_level` column now holds a codebase-context code (0–3: greenfield,
+# brownfield_small, brownfield_large_unfamiliar, brownfield_large_familiar). 0 is a
+# real, common (default) code and can't double as the "any" sentinel, so use -1
+# (outside 0–3) instead. The column keeps its historical name to avoid a migration.
+_ANY_MATURITY = -1
 
 
 async def refresh_calibration_for_phase(phase_value: str) -> int:
@@ -162,8 +241,9 @@ async def refresh_calibration_for_phase(phase_value: str) -> int:
 
     Returns the number of aggregate rows written. Skips silently when Postgres is
     disabled. Aggregates are computed for **every** (industry, project_type,
-    maturity) triple present in phase_history, plus a single "any" rollup with
-    industry="" / project_type="" / maturity_level=0 that twins can use as a fallback.
+    codebase-context) triple present in phase_history, plus a single "any" rollup with
+    industry="" / project_type="" / maturity_level=-1 that twins use as a fallback.
+    The codebase-context code lives in the column historically named `maturity_level`.
     """
     async with session_scope() as session:
         if session is None:
@@ -171,80 +251,98 @@ async def refresh_calibration_for_phase(phase_value: str) -> int:
                 "postgres disabled; skipping calibration refresh for phase %s", phase_value
             )
             return 0
-
-        # Per-dimension aggregates.
-        per_dim_q = await session.execute(
-            select(
-                PhaseHistory.industry,
-                PhaseHistory.project_type,
-                PhaseHistory.maturity_level,
-                _avg(PhaseHistory.ai_assisted_mid).label("avg_ai"),
-                _avg(PhaseHistory.manual_only_mid).label("avg_manual"),
-                _avg(PhaseHistory.confidence).label("avg_conf"),
-                _count(PhaseHistory.id).label("n"),
+        try:
+            return await _refresh_calibration(session, phase_value)
+        except Exception as exc:  # noqa: BLE001
+            # _refresh_calibration deletes then re-inserts aggregates; roll back so a
+            # failed insert can't leave the delete committed (wiping a phase's
+            # aggregates with no replacement) and so the trailing commit can't re-raise.
+            await session.rollback()
+            logger.warning(
+                "refresh_calibration_for_phase failed for phase %s (%s); skipping",
+                phase_value,
+                exc,
             )
-            .where(PhaseHistory.phase == phase_value)
-            .group_by(
-                PhaseHistory.industry, PhaseHistory.project_type, PhaseHistory.maturity_level
+            return 0
+
+
+async def _refresh_calibration(session: Any, phase_value: str) -> int:
+    """Inner body of refresh_calibration_for_phase (caller guards + handles errors)."""
+    # Per-dimension aggregates.
+    per_dim_q = await session.execute(
+        select(
+            PhaseHistory.industry,
+            PhaseHistory.project_type,
+            PhaseHistory.maturity_level,
+            _avg(PhaseHistory.ai_assisted_mid).label("avg_ai"),
+            _avg(PhaseHistory.manual_only_mid).label("avg_manual"),
+            _avg(PhaseHistory.confidence).label("avg_conf"),
+            _count(PhaseHistory.id).label("n"),
+        )
+        .where(PhaseHistory.phase == phase_value)
+        .group_by(
+            PhaseHistory.industry, PhaseHistory.project_type, PhaseHistory.maturity_level
+        )
+    )
+    rows = per_dim_q.all()
+
+    # "Any" rollup across the whole phase.
+    any_q = await session.execute(
+        select(
+            _avg(PhaseHistory.ai_assisted_mid).label("avg_ai"),
+            _avg(PhaseHistory.manual_only_mid).label("avg_manual"),
+            _avg(PhaseHistory.confidence).label("avg_conf"),
+            _count(PhaseHistory.id).label("n"),
+        ).where(PhaseHistory.phase == phase_value)
+    )
+    any_row = any_q.one()
+
+    # Clear stale rows for this phase, then bulk insert.
+    await session.execute(
+        delete(CalibrationAggregate).where(CalibrationAggregate.phase == phase_value)
+    )
+
+    written = 0
+    if any_row.n and any_row.n > 0:
+        session.add(
+            CalibrationAggregate(
+                phase=phase_value,
+                industry=_ANY,
+                project_type=_ANY,
+                maturity_level=_ANY_MATURITY,
+                sample_count=int(any_row.n),
+                avg_ai_assisted_mid=float(any_row.avg_ai or 0.0),
+                avg_manual_only_mid=float(any_row.avg_manual or 0.0),
+                avg_confidence=float(any_row.avg_conf or 0.0),
+                avg_ai_reduction_pct=_reduction_pct(any_row.avg_manual, any_row.avg_ai),
             )
         )
-        rows = per_dim_q.all()
+        written += 1
 
-        # "Any" rollup across the whole phase.
-        any_q = await session.execute(
-            select(
-                _avg(PhaseHistory.ai_assisted_mid).label("avg_ai"),
-                _avg(PhaseHistory.manual_only_mid).label("avg_manual"),
-                _avg(PhaseHistory.confidence).label("avg_conf"),
-                _count(PhaseHistory.id).label("n"),
-            ).where(PhaseHistory.phase == phase_value)
-        )
-        any_row = any_q.one()
-
-        # Clear stale rows for this phase, then bulk insert.
-        await session.execute(
-            delete(CalibrationAggregate).where(CalibrationAggregate.phase == phase_value)
-        )
-
-        written = 0
-        if any_row.n and any_row.n > 0:
-            session.add(
-                CalibrationAggregate(
-                    phase=phase_value,
-                    industry=_ANY,
-                    project_type=_ANY,
-                    maturity_level=0,
-                    sample_count=int(any_row.n),
-                    avg_ai_assisted_mid=float(any_row.avg_ai or 0.0),
-                    avg_manual_only_mid=float(any_row.avg_manual or 0.0),
-                    avg_confidence=float(any_row.avg_conf or 0.0),
-                    avg_ai_reduction_pct=_reduction_pct(any_row.avg_manual, any_row.avg_ai),
-                )
+    for r in rows:
+        session.add(
+            CalibrationAggregate(
+                phase=phase_value,
+                industry=(r.industry or _ANY),
+                project_type=(r.project_type or _ANY),
+                maturity_level=(
+                    r.maturity_level if r.maturity_level is not None else _ANY_MATURITY
+                ),
+                sample_count=int(r.n),
+                avg_ai_assisted_mid=float(r.avg_ai or 0.0),
+                avg_manual_only_mid=float(r.avg_manual or 0.0),
+                avg_confidence=float(r.avg_conf or 0.0),
+                avg_ai_reduction_pct=_reduction_pct(r.avg_manual, r.avg_ai),
             )
-            written += 1
-
-        for r in rows:
-            session.add(
-                CalibrationAggregate(
-                    phase=phase_value,
-                    industry=(r.industry or _ANY),
-                    project_type=(r.project_type or _ANY),
-                    maturity_level=(r.maturity_level or 0),
-                    sample_count=int(r.n),
-                    avg_ai_assisted_mid=float(r.avg_ai or 0.0),
-                    avg_manual_only_mid=float(r.avg_manual or 0.0),
-                    avg_confidence=float(r.avg_conf or 0.0),
-                    avg_ai_reduction_pct=_reduction_pct(r.avg_manual, r.avg_ai),
-                )
-            )
-            written += 1
-
-        logger.info(
-            "postgres: refreshed calibration for phase %s (%d aggregate row(s))",
-            phase_value,
-            written,
         )
-        return written
+        written += 1
+
+    logger.info(
+        "postgres: refreshed calibration for phase %s (%d aggregate row(s))",
+        phase_value,
+        written,
+    )
+    return written
 
 
 async def get_calibration(
@@ -263,6 +361,9 @@ async def get_calibration(
 
     Returns [] when Postgres is disabled — callers must handle the empty case
     (it's the same as "no calibration data yet", which is the cold-start reality).
+
+    The `maturity` param / `maturity_level` field carry the codebase-context code
+    (0–3; -1 = any), keeping their historical names to avoid a migration.
     """
     async with session_scope() as session:
         if session is None:
@@ -270,23 +371,32 @@ async def get_calibration(
                 "postgres disabled; returning no calibration for phase %s", phase_value
             )
             return []
-        result = await session.execute(
-            select(CalibrationAggregate).where(CalibrationAggregate.phase == phase_value)
-        )
-        rows = result.scalars().all()
+        try:
+            result = await session.execute(
+                select(CalibrationAggregate).where(CalibrationAggregate.phase == phase_value)
+            )
+            rows = result.scalars().all()
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.warning(
+                "get_calibration failed for phase %s (%s); returning none",
+                phase_value,
+                exc,
+            )
+            return []
         if not rows:
             logger.debug("no calibration aggregates stored for phase %s", phase_value)
             return []
 
         ind = (industry or "").strip()
         ptype = (project_type or "").strip()
-        mat = maturity or 0
+        mat = maturity if maturity is not None else _ANY_MATURITY
 
         def score(r: CalibrationAggregate) -> tuple[int, int]:
             specificity = (
                 int(r.industry == ind and ind != "")
                 + int(r.project_type == ptype and ptype != "")
-                + int(r.maturity_level == mat and mat != 0)
+                + int(r.maturity_level == mat and mat != _ANY_MATURITY)
             )
             return (specificity, r.sample_count)
 
@@ -299,7 +409,9 @@ async def get_calibration(
                 "phase": r.phase,
                 "industry": r.industry or None,
                 "project_type": r.project_type or None,
-                "maturity_level": r.maturity_level or None,
+                "maturity_level": (
+                    r.maturity_level if r.maturity_level != _ANY_MATURITY else None
+                ),
                 "sample_count": r.sample_count,
                 "avg_ai_assisted_mid": r.avg_ai_assisted_mid,
                 "avg_manual_only_mid": r.avg_manual_only_mid,
@@ -314,7 +426,7 @@ async def get_calibration_for_all_phases(
     *,
     industry: str | None = None,
     project_type: str | None = None,
-    stage3: Stage3Maturity | None = None,
+    stage3: Stage3Context | None = None,
     per_phase_limit: int = 3,
 ) -> dict[str, list[dict[str, Any]]]:
     """Convenience wrapper: fetch calibration for every SDLC phase at once.
@@ -336,10 +448,77 @@ async def get_calibration_for_all_phases(
             ph,
             industry=industry,
             project_type=project_type,
-            maturity=_maturity_for_phase(ph, stage3) if stage3 else None,
+            maturity=_codebase_code(stage3) if stage3 else None,
             limit=per_phase_limit,
         )
     return out
+
+
+# ---------- reduction bands ----------
+
+
+async def get_reduction_bands() -> dict[str, dict[str, list[float]]]:
+    """Return DB-stored AI-reduction guardrail bands as nested
+    ``{phase: {tooling_level: [min, max]}}``.
+
+    Returns an empty dict when Postgres is disabled or the table is empty/unreadable
+    — callers (the twins, via parse_input → state) then fall back to the in-code
+    ``DEFAULT_BANDS`` in orchestrator/ai_acceleration.py.
+    """
+    rows = []
+    async with session_scope() as session:
+        if session is None:
+            logger.debug("postgres disabled; no reduction bands (using code defaults)")
+            return {}
+        try:
+            result = await session.execute(select(AiReductionBand))
+            rows = list(result.scalars().all())
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.warning("get_reduction_bands failed (%s); using code defaults", exc)
+            return {}
+    out: dict[str, dict[str, list[float]]] = {}
+    for r in rows:
+        out.setdefault(r.phase, {})[r.tooling_level] = [r.min_reduction, r.max_reduction]
+    return out
+
+
+async def upsert_reduction_bands(
+    items: list[tuple[str, str, float, float]],
+) -> bool:
+    """Upsert per-(phase, tooling_level) AI-reduction bands (fractions 0..1).
+
+    `items` are ``(phase, tooling_level, min_reduction, max_reduction)``. Each row is
+    updated in place or inserted, keyed on (phase, tooling_level). Returns True when
+    persisted, False when Postgres is disabled or the write fails — the admin endpoint
+    surfaces that so the UI can warn the change wasn't saved.
+    """
+    try:
+        async with session_scope() as session:
+            if session is None:
+                return False
+            existing = {
+                (r.phase, r.tooling_level): r
+                for r in (await session.execute(select(AiReductionBand))).scalars().all()
+            }
+            for phase, tooling, lo, hi in items:
+                row = existing.get((phase, tooling))
+                if row is not None:
+                    row.min_reduction = lo
+                    row.max_reduction = hi
+                else:
+                    session.add(
+                        AiReductionBand(
+                            phase=phase,
+                            tooling_level=tooling,
+                            min_reduction=lo,
+                            max_reduction=hi,
+                        )
+                    )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("upsert_reduction_bands failed (%s)", exc)
+        return False
 
 
 # ---------- private helpers ----------

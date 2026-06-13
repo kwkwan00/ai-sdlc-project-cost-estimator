@@ -1,0 +1,110 @@
+[
+  {
+    "id": "prefill-healthcare",
+    "agent": "prefill",
+    "input": {
+      "raw_input": "We need a HIPAA-compliant patient scheduling portal for a regional clinic network. Patients view lab results, book/reschedule appointments, message providers, and request prescription refills. Clinic staff manage appointment availability and review messages. About 25 screens across 4 user roles. Integrations: Epic EHR (FHIR), Stripe billing, Twilio SMS reminders, and Okta SSO. Responsive web only, no mobile app initially."
+    },
+    "expected_output": "Normalized Stage 2 context: industry=healthcare, project_type=greenfield, ~25 screens, 4 integrations (Epic/FHIR, Stripe, Twilio, Okta), regulatory includes HIPAA. The summary should faithfully capture the portal's purpose, the patient-facing features, the staff admin view, and the integration set without inventing facts (e.g. no mobile app, no claims not in the source).",
+    "gold": {"industry": "healthcare", "project_type": "greenfield", "regulatory_requirements": ["HIPAA"], "screen_count": 25, "integration_count": 4},
+    "notes": "Prefill — summarization scores the summary against raw_input; extraction_accuracy scores the normalized fields against gold."
+  },
+  {
+    "id": "prefill-fintech",
+    "agent": "prefill",
+    "input": {
+      "raw_input": "Build a fintech KYC onboarding app for a digital bank. New customers complete identity verification, document upload, sanctions and PEP screening, and risk scoring before an account is opened. Roughly 18 screens across 3 roles: applicant, compliance reviewer, and ops admin. Integrations: Persona for identity verification, Plaid for bank linking, a third-party sanctions-screening API, and an internal core-banking API. SOC 2 and PCI-DSS compliance are required."
+    },
+    "expected_output": "Normalized Stage 2 context: industry=fintech, project_type=greenfield, ~18 screens, 4 integrations (Persona, Plaid, sanctions API, core-banking), regulatory includes SOC 2 and PCI-DSS. The summary should capture KYC onboarding, IDV, sanctions/PEP screening, risk scoring, the three roles, and the integrations, with no fabricated facts.",
+    "gold": {"industry": "fintech", "project_type": "greenfield", "regulatory_requirements": ["SOC 2", "PCI-DSS"], "screen_count": 18, "integration_count": 4},
+    "notes": "Prefill — fintech scenario."
+  },
+
+  {
+    "id": "roster-healthcare",
+    "agent": "roster",
+    "input": {
+      "raw_input": "HIPAA-compliant patient scheduling portal for a regional clinic network. 25 screens, 4 roles, integrations with Epic FHIR, Stripe, Twilio, Okta. Responsive web. 20-week target.",
+      "stage2": {
+        "industry": "healthcare",
+        "project_type": "greenfield",
+        "screen_count_estimate": 25,
+        "integration_count": 4,
+        "integration_list": ["Epic FHIR", "Stripe", "Twilio", "Okta"],
+        "regulatory_requirements": ["HIPAA"],
+        "target_timeline_weeks": 20
+      }
+    },
+    "expected_output": "A coherent staffing plan + roster for a regulated healthcare web build: product, engineering (a mix of senior and mid/junior), UI/UX, QA, and DevOps coverage; a short delivery plan covering discovery, design, build, integrations, compliance, and launch; percentages that sum sensibly and a rationale tied to the project's integration + compliance load.",
+    "notes": "Roster agent."
+  },
+  {
+    "id": "roster-fintech",
+    "agent": "roster",
+    "input": {
+      "raw_input": "Fintech KYC onboarding app for a digital bank. 18 screens, 3 roles, integrations with Persona, Plaid, a sanctions API, and core-banking. SOC 2 + PCI-DSS. 16-week target.",
+      "stage2": {
+        "industry": "fintech",
+        "project_type": "greenfield",
+        "screen_count_estimate": 18,
+        "integration_count": 4,
+        "integration_list": ["Persona", "Plaid", "sanctions API", "core-banking API"],
+        "regulatory_requirements": ["SOC 2", "PCI-DSS"],
+        "target_timeline_weeks": 16
+      }
+    },
+    "expected_output": "A staffing plan + roster suited to a compliance-heavy fintech build: product, engineering, UI/UX, QA, and DevOps/security coverage; a delivery plan addressing IDV, screening, risk scoring, integrations, and SOC 2 / PCI-DSS controls; a rationale that justifies the role mix against the regulatory + integration complexity.",
+    "notes": "Roster agent — fintech."
+  },
+
+  {
+    "id": "tooling-rich",
+    "agent": "tooling",
+    "input": {
+      "description": "We use Claude Code as an agentic coding assistant for development, CodeRabbit for automated code review, GitHub Copilot autocomplete in the IDE, and Figma AI for design exploration. QA is manual."
+    },
+    "expected_output": "Per-phase classification: development=agentic (Claude Code), code_review reflects CodeRabbit (chat or agentic), ux_design reflects Figma AI (chat/autocomplete), with autocomplete acknowledged for IDE Copilot. QA stays none (manual). Unknown tools should be empty or minimal, and the notes should justify each mapping.",
+    "gold": {"ai_tooling": {"discovery": "none", "ux_design": "chat", "development": "agentic", "code_review": "agentic", "deployment": "none", "qa_testing": "none"}},
+    "notes": "Tooling classifier — description-only path. Gold: Claude Code=agentic dev, CodeRabbit=agentic review, Figma AI=chat ux_design, QA manual=none. classification_accuracy is exact per-phase match; expect the model to land most phases but the gold encodes the intended mapping."
+  },
+  {
+    "id": "tooling-sparse",
+    "agent": "tooling",
+    "input": {
+      "description": "The team mostly works manually but occasionally uses ChatGPT and Claude chat to draft and refactor code snippets while writing the application. No other phase uses AI tooling."
+    },
+    "expected_output": "A conservative classification: development around chat level (occasional LLM chat assistance), other phases none. The reasoning should avoid over-crediting AI tooling given the 'mostly manual' framing.",
+    "gold": {"ai_tooling": {"discovery": "none", "ux_design": "none", "development": "chat", "code_review": "none", "deployment": "none", "qa_testing": "none"}},
+    "notes": "Tooling classifier — sparse/conservative case. Gold: only development=chat (occasional ChatGPT/Claude chat), all else none."
+  },
+
+  {
+    "id": "consolidator-overlap",
+    "agent": "consolidator",
+    "input": {
+      "candidates": [
+        {"gap": {"topic": "integration_scope", "question_text": "How many third-party integrations are in scope and which systems?", "impact_hours": 120, "suggested_default": "4 integrations"}, "phases": ["development"]},
+        {"gap": {"topic": "integrations", "question_text": "Which external systems must we integrate with for this release?", "impact_hours": 80, "suggested_default": "Epic, Stripe, Twilio, Okta"}, "phases": ["deployment"]},
+        {"gap": {"topic": "auth", "question_text": "What identity provider and SSO mechanism should we support?", "impact_hours": 40, "suggested_default": "Okta SSO"}, "phases": ["development"]},
+        {"gap": {"topic": "compliance_audit", "question_text": "What audit-logging and compliance evidence does HIPAA require here?", "impact_hours": 60, "suggested_default": "Standard HIPAA audit logging"}, "phases": ["deployment", "qa_testing"]}
+      ]
+    },
+    "expected_output": "The two integration questions (integration_scope + integrations) should be clustered/merged into one question since a single answer resolves both; the auth and compliance_audit questions should remain distinct. The merged set should be a valid partition of the inputs with no dropped or duplicated questions.",
+    "gold": {"clusters": [[0, 1], [2], [3]]},
+    "notes": "Consolidator — overlapping integration questions. Gold partition: inputs 0+1 (the two integration questions) merge; 2 (auth) and 3 (compliance_audit) stay distinct → 3 clusters."
+  },
+  {
+    "id": "consolidator-distinct",
+    "agent": "consolidator",
+    "input": {
+      "candidates": [
+        {"gap": {"topic": "idv_provider", "question_text": "Which identity-verification provider should onboarding use?", "impact_hours": 70, "suggested_default": "Persona"}, "phases": ["development"]},
+        {"gap": {"topic": "sanctions_cadence", "question_text": "How often must sanctions/PEP lists be re-screened against existing customers?", "impact_hours": 50, "suggested_default": "Daily"}, "phases": ["development"]},
+        {"gap": {"topic": "risk_rules", "question_text": "What rules drive the customer risk score and its thresholds?", "impact_hours": 90, "suggested_default": "Standard KYC risk matrix"}, "phases": ["development", "qa_testing"]}
+      ]
+    },
+    "expected_output": "These three questions cover distinct concerns (IDV provider, sanctions re-screening cadence, risk-scoring rules) and should NOT be over-merged; each should remain its own cluster, forming a valid partition of the inputs.",
+    "gold": {"clusters": [[0], [1], [2]]},
+    "notes": "Consolidator — genuinely distinct questions; tests against over-merging. Gold partition: 3 singleton clusters."
+  }
+]

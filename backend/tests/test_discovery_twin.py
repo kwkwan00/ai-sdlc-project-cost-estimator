@@ -26,7 +26,6 @@ from orchestrator.nodes.discovery_analyst import (
     DecisionMakerAccessibility,
     DiscoveryUCPInputs,
     _stakeholder_multiplier,
-    ai_reduction_for_maturity,
     build_phase_estimate,
     compute_ucp_hours,
     pert_range,
@@ -103,21 +102,6 @@ def test_stakeholder_multiplier_compounds_factors() -> None:
     assert _stakeholder_multiplier(inputs) == pytest.approx(1.35 * 1.4 * 1.25)
 
 
-# ---- AI reduction caps ----
-
-@pytest.mark.parametrize(
-    "level,expected",
-    [(1, 0.0), (2, 0.15), (3, 0.30), (4, 0.50), (5, 0.65)],
-)
-def test_ai_reduction_caps_by_maturity_level(level: int, expected: float) -> None:
-    assert ai_reduction_for_maturity(level) == expected
-
-
-def test_ai_reduction_for_unknown_level_returns_zero() -> None:
-    assert ai_reduction_for_maturity(0) == 0.0
-    assert ai_reduction_for_maturity(99) == 0.0
-
-
 # ---- PERT range ----
 
 def test_pert_range_orders_optimistic_below_pessimistic() -> None:
@@ -128,30 +112,38 @@ def test_pert_range_orders_optimistic_below_pessimistic() -> None:
 
 # ---- build_phase_estimate end-to-end ----
 
-def test_build_phase_estimate_at_maturity_1_has_no_ai_savings() -> None:
+def test_build_phase_estimate_at_zero_reduction_has_no_ai_savings() -> None:
     inputs = _fixture_inputs()
-    est = build_phase_estimate(inputs, maturity_level=1, roster=RoleRoster.default())
+    est = build_phase_estimate(inputs, effective_reduction=0.0, roster=RoleRoster.default())
 
     assert est.phase is Phase.DISCOVERY
     assert est.algorithm == "UCP"
-    # At maturity 1, AI hours == manual hours (no reduction).
+    # At zero reduction, AI hours == manual hours.
     assert est.ai_assisted_hours.most_likely == est.manual_only_hours.most_likely
     assert est.ai_assisted_hours.most_likely == pytest.approx(199, rel=0.05)
 
 
-def test_build_phase_estimate_at_maturity_3_applies_30pct_reduction() -> None:
+def test_build_phase_estimate_applies_30pct_reduction() -> None:
     inputs = _fixture_inputs()
-    est = build_phase_estimate(inputs, maturity_level=3, roster=RoleRoster.default())
+    est = build_phase_estimate(inputs, effective_reduction=0.30, roster=RoleRoster.default())
 
     # AI mid should be 70% of manual mid.
     ratio = est.ai_assisted_hours.most_likely / est.manual_only_hours.most_likely
     assert ratio == pytest.approx(0.7, abs=0.001)
 
 
+def test_build_phase_estimate_negative_reduction_makes_ai_slower() -> None:
+    inputs = _fixture_inputs()
+    est = build_phase_estimate(inputs, effective_reduction=-0.10, roster=RoleRoster.default())
+
+    # Negative reduction → AI hours exceed manual hours.
+    assert est.ai_assisted_hours.most_likely > est.manual_only_hours.most_likely
+
+
 def test_build_phase_estimate_role_hours_sum_to_total() -> None:
     inputs = _fixture_inputs()
     est = build_phase_estimate(
-        inputs, maturity_level=3, roster=RoleRoster.default()
+        inputs, effective_reduction=0.30, roster=RoleRoster.default()
     )
 
     total_ai = sum(rh.hours for rh in est.ai_assisted_role_hours)
@@ -170,7 +162,7 @@ def test_build_phase_estimate_carries_assumptions_risks_gaps() -> None:
         risks=["r1"],
         gaps=[Gap(topic="t", question_text="q?", impact_hours=50, suggested_default="x")],
     )
-    est = build_phase_estimate(inputs, maturity_level=2, roster=RoleRoster.default())
+    est = build_phase_estimate(inputs, effective_reduction=0.30, roster=RoleRoster.default())
     assert [a.text for a in est.assumptions] == ["a1", "a2"]
     assert [r.description for r in est.risks] == ["r1"]
     assert [g.topic for g in est.gaps] == ["t"]

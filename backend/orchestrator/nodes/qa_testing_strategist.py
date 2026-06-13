@@ -1,7 +1,8 @@
 """QA & Testing Strategist — TPA + three-plan recommendation per planning outline §3.6.
 
-MVP: returns hours for the recommended plan (A/B/C) only. The other two plans are
-stashed in `notes` for transparency; expanded side-by-side UI rendering is post-MVP.
+The recommended plan (A/B/C) drives the phase hours. All three plan totals are also
+computed and emitted structurally in `breakdown.plan_a/b/c_hours` for transparency;
+expanded side-by-side UI rendering is post-MVP.
 """
 
 from __future__ import annotations
@@ -11,8 +12,7 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from models.estimation_state import EstimationState
-from models.project_schema import RoleRoster, Stage3Maturity
+from models.project_schema import RoleRoster
 from models.twin_outputs import (
     Assumption,
     Gap,
@@ -20,16 +20,12 @@ from models.twin_outputs import (
     PhaseEstimate,
     Risk,
 )
-from observability.langfuse_wrapper import traced
-from orchestrator.llm import call_structured
 from orchestrator.role_attribution import attribute_roles
 
-from ._twin_base import build_twin_user_prompt, load_prompt, stub_phase_estimate
+from ._twin_base import make_twin_nodes
 from .discovery_analyst import pert_range
 
 logger = logging.getLogger(__name__)
-
-_MATURITY_CAP_QA = {1: 0.0, 2: 0.08, 3: 0.18, 4: 0.25, 5: 0.30}
 
 # Plan baselines per planning outline §3.6.
 PLAN_A_HARNESS_BASE = 352  # eval harness build
@@ -99,12 +95,8 @@ def auto_select_plan(has_ai: bool, has_reg: bool) -> QAPlan:
     return QAPlan.PLAN_A
 
 
-def ai_reduction_for_maturity(level: int) -> float:
-    return _MATURITY_CAP_QA.get(level, 0.0)
-
-
 def build_phase_estimate(
-    inputs: QATPAInputs, *, maturity_level: int, roster: RoleRoster
+    inputs: QATPAInputs, *, effective_reduction: float, roster: RoleRoster
 ) -> PhaseEstimate:
     total_tp, tp_breakdown = compute_test_points(inputs)
     plans = compute_plan_hours(total_tp, inputs.supplementary_hours)
@@ -120,16 +112,15 @@ def build_phase_estimate(
         )
 
     manual_mid = plans[selected]
-    cap = ai_reduction_for_maturity(maturity_level)
-    effective = min(inputs.ai_reduction_pct / 100.0, cap)
-    ai_mid = manual_mid * (1 - effective)
+    ai_mid = manual_mid * (1 - effective_reduction)
 
-    notes = (
-        f"TPA breakdown: {tp_breakdown}. Selected plan: {selected.value}. "
-        f"Plan A: {plans[QAPlan.PLAN_A]:.0f}h, Plan B: {plans[QAPlan.PLAN_B]:.0f}h, "
-        f"Plan C: {plans[QAPlan.PLAN_C]:.0f}h. AI cap L{maturity_level} = {int(cap*100)}%. "
-        f"{inputs.notes}"
-    ).strip()
+    breakdown = {
+        **tp_breakdown,
+        "plan_a_hours": round(plans[QAPlan.PLAN_A], 1),
+        "plan_b_hours": round(plans[QAPlan.PLAN_B], 1),
+        "plan_c_hours": round(plans[QAPlan.PLAN_C], 1),
+    }
+    notes = f"Selected plan {selected.value} (eval harness / QA team / hybrid). {inputs.notes}".strip()
 
     return PhaseEstimate(
         phase=Phase.QA_TESTING,
@@ -146,42 +137,25 @@ def build_phase_estimate(
         ],
         gaps=inputs.gaps,
         confidence=inputs.confidence,
+        breakdown=breakdown,
+        effective_ai_reduction_pct=round(effective_reduction * 100, 1),
         notes=notes,
     )
 
 
-async def _run_qa(state: EstimationState, pass_num: int) -> PhaseEstimate:
-    stage3 = state.get("stage3") or Stage3Maturity()
-    stage2 = state.get("stage2")
-    roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
-    maturity = stage3.qa_testing_maturity
-    try:
-        inputs = await call_structured(
-            system=load_prompt("qa_testing_strategist"),
-            user=build_twin_user_prompt(state, pass_num=pass_num, phase_value="qa_testing"),
-            response_model=QATPAInputs,
-            tool_name="submit_tpa_assessment",
-        )
-        est = build_phase_estimate(inputs, maturity_level=maturity, roster=roster)
-        logger.info(
-            "qa_testing twin done: pass=%s ai_ml=%.0fh manual_ml=%.0fh",
-            pass_num,
-            est.ai_assisted_hours.most_likely,
-            est.manual_only_hours.most_likely,
-        )
-        return est
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("QA twin failed (%s); returning stub", exc)
-        return stub_phase_estimate(
-            Phase.QA_TESTING, "qa_testing_strategist", "TPA", 1000, 1180, roster
-        )
+def _proposed_reduction(inputs: QATPAInputs) -> float:
+    return inputs.ai_reduction_pct / 100
 
 
-@traced(name="twin.qa_testing.p1")
-async def qa_testing_pass1(state: EstimationState) -> dict:
-    return {"pass1_estimates": [await _run_qa(state, pass_num=1)]}
-
-
-@traced(name="twin.qa_testing.p2")
-async def qa_testing_pass2(state: EstimationState) -> dict:
-    return {"pass2_estimates": [await _run_qa(state, pass_num=2)]}
+qa_testing_pass1, qa_testing_pass2 = make_twin_nodes(
+    phase=Phase.QA_TESTING,
+    prompt_name="qa_testing_strategist",
+    tool_name="submit_tpa_assessment",
+    response_model=QATPAInputs,
+    build_fn=build_phase_estimate,
+    stub_algorithm="TPA",
+    stub_ai_mid=1000,
+    stub_manual_mid=1180,
+    proposed_reduction_fn=_proposed_reduction,
+    trace_name="twin.qa_testing",
+)

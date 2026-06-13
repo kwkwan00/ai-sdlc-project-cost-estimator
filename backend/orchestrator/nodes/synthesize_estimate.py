@@ -6,7 +6,7 @@ import logging
 from collections import defaultdict
 
 from models.estimation_state import EstimationState
-from models.project_schema import RoleRoster
+from models.project_schema import CustomRole, RoleRoster
 from models.twin_outputs import (
     DualScenarioEstimate,
     HourRange,
@@ -43,7 +43,9 @@ def _sum_hours_by_role(phases: list[PhaseEstimate], ai: bool) -> dict[str, float
 @traced(name="synthesize_estimate")
 async def synthesize_estimate(state: EstimationState) -> dict:
     pass2: list[PhaseEstimate] = state.get("pass2_estimates", [])
-    parsed = state.get("parsed_context", {})
+    total_cost_ai = state.get("total_cost_ai_assisted_usd", 0.0)
+    total_cost_manual = state.get("total_cost_manual_only_usd", 0.0)
+    consistency_warnings = state.get("consistency_warnings", [])
     stage2 = state.get("stage2")
     roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
 
@@ -53,7 +55,25 @@ async def synthesize_estimate(state: EstimationState) -> dict:
     manual_range = _sum_range(pass2, ai=False)
 
     ai_hours_by_role = _sum_hours_by_role(pass2, ai=True)
+    manual_hours_by_role = _sum_hours_by_role(pass2, ai=False)
     rate_by_role = {r.role_id: r.rate_per_hour for r in roster.roles}
+
+    def _row(r: CustomRole, headcount: int) -> RoleHeadcount:
+        rate = rate_by_role.get(r.role_id, 0.0)
+        ai_h = ai_hours_by_role.get(r.role_id, 0.0)
+        manual_h = manual_hours_by_role.get(r.role_id, 0.0)
+        return RoleHeadcount(
+            role_id=r.role_id,
+            role_description=r.description,
+            category=r.category,
+            seniority=r.seniority,
+            headcount=headcount,
+            rate_per_hour=rate,
+            ai_assisted_hours=ai_h,
+            manual_only_hours=manual_h,
+            ai_assisted_cost_usd=ai_h * rate,
+            manual_only_cost_usd=manual_h * rate,
+        )
 
     headcount_rows: list[RoleHeadcount] = []
     weekly_burn = 0.0
@@ -68,15 +88,7 @@ async def synthesize_estimate(state: EstimationState) -> dict:
                 # Ceiling so we always have enough capacity to deliver in the
                 # target window. Minimum of 1 if the role has any work at all.
                 hc = max(1, int((role_hours / capacity) + 0.99))
-            headcount_rows.append(
-                RoleHeadcount(
-                    role_id=r.role_id,
-                    role_description=r.description,
-                    category=r.category,
-                    seniority=r.seniority,
-                    headcount=hc,
-                )
-            )
+            headcount_rows.append(_row(r, hc))
             weekly_burn += hc * WORK_HOURS_PER_WEEK * rate_by_role.get(r.role_id, 0.0)
 
         duration_low = max(1.0, target_weeks * 0.85)
@@ -88,15 +100,7 @@ async def synthesize_estimate(state: EstimationState) -> dict:
         duration_high = ai_range.pessimistic / default_team_capacity if default_team_capacity else 0
         for r in roster.roles:
             role_hours = ai_hours_by_role.get(r.role_id, 0.0)
-            headcount_rows.append(
-                RoleHeadcount(
-                    role_id=r.role_id,
-                    role_description=r.description,
-                    category=r.category,
-                    seniority=r.seniority,
-                    headcount=1 if role_hours > 0 else 0,
-                )
-            )
+            headcount_rows.append(_row(r, 1 if role_hours > 0 else 0))
 
     avg_confidence = (
         sum(p.confidence for p in pass2) / len(pass2) if pass2 else 0.0
@@ -106,18 +110,16 @@ async def synthesize_estimate(state: EstimationState) -> dict:
         total_ai_assisted_hours=ai_range,
         total_manual_only_hours=manual_range,
         ai_hours_saved_pert=manual_range.pert_mean - ai_range.pert_mean,
-        ai_cost_saved_usd=(
-            parsed.get("total_cost_manual_only_usd", 0.0)
-            - parsed.get("total_cost_ai_assisted_usd", 0.0)
-        ),
+        ai_cost_saved_usd=total_cost_manual - total_cost_ai,
         phases=pass2,
         confidence=avg_confidence,
         duration_weeks_low=duration_low,
         duration_weeks_high=duration_high,
         headcount_by_role=headcount_rows,
         weekly_burn_rate_usd=weekly_burn,
-        total_cost_ai_assisted_usd=parsed.get("total_cost_ai_assisted_usd", 0.0),
-        total_cost_manual_only_usd=parsed.get("total_cost_manual_only_usd", 0.0),
+        total_cost_ai_assisted_usd=total_cost_ai,
+        total_cost_manual_only_usd=total_cost_manual,
+        consistency_warnings=consistency_warnings,
     )
     logger.info(
         "synthesize_estimate complete: ai_assisted=%.0fh manual_only=%.0fh (PERT) across %d phase(s); %d role(s) in headcount",

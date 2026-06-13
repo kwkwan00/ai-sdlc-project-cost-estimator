@@ -41,7 +41,7 @@ services:
       # Anthropic — required at runtime; the smoke harness falls back gracefully
       # when missing, but the real estimator needs this.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-opus-4-5-20250929}"
+      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-sonnet-4-6}"
       # Neo4j + Qdrant + Postgres: hostnames resolve via the `sdlc` Docker network.
       NEO4J_URI: "bolt://neo4j:7687"
       NEO4J_USER: "${NEO4J_USER:-neo4j}"
@@ -67,6 +67,13 @@ services:
       # CORS — the frontend runs on the host (not in the network), so allow
       # http://localhost:3000 by default.
       BACKEND_CORS_ORIGINS: "${BACKEND_CORS_ORIGINS:-http://localhost:3000}"
+      # docs-mcp-server — the tooling classifier consults it (as an MCP client over
+      # streamable HTTP) to research unrecognized AI tools. Hardcoded to the
+      # in-network hostname (like NEO4J_URI/LANGFUSE_HOST above); the host value in
+      # .env is for `make be` only. To disable lookups, just don't run the
+      # docs-mcp-server service — the connection fails gracefully → tools stay 'none'.
+      DOCS_MCP_URL: "http://docs-mcp-server:6280/mcp"
+      DOCS_MCP_AUTH_TOKEN: "${DOCS_MCP_AUTH_TOKEN:-}"
     depends_on:
       neo4j:
         condition: service_healthy
@@ -74,6 +81,50 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+    networks:
+      - sdlc
+
+  # Self-hosted documentation MCP server. The estimator backend connects to it as
+  # an MCP client (streamable HTTP at /mcp) to identify AI dev tools it doesn't
+  # recognize during Stage 3 tooling classification. Optional — the classifier
+  # degrades to 'none' for unknown tools when this is down. To make searches return
+  # results you must index docs into it (see arabold/docs-mcp-server docs); an
+  # unindexed server still runs, Claude just falls back to its own knowledge.
+  docs-mcp-server:
+    image: ghcr.io/arabold/docs-mcp-server:latest
+    container_name: sdlc-docs-mcp
+    # --host 0.0.0.0 makes it listen on all interfaces inside the container so the
+    # published port works; the MCP endpoint is served at /mcp on 6280.
+    command: ["--protocol", "http", "--host", "0.0.0.0", "--port", "6280"]
+    environment:
+      # Embeddings provider — REQUIRED for scraping/indexing AND vector search to
+      # return results. Without a key, scrape jobs and search no-op, so the tooling
+      # classifier's scrape-on-miss step degrades and unknown tools stay 'none'.
+      # OpenAI is the default; docs-mcp-server also supports Google/Bedrock/etc.
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      DOCS_MCP_EMBEDDING_MODEL: "${DOCS_MCP_EMBEDDING_MODEL:-text-embedding-3-small}"
+    ports:
+      # Published to the host on 0.0.0.0:6280 → reachable from the host at
+      # http://localhost:6280/mcp (e.g. a host-run `make be` backend, your own MCP
+      # client, or doc-indexing). In-network, other services use the service
+      # hostname http://docs-mcp-server:6280/mcp.
+      - "6280:6280"
+    volumes:
+      # Bind-mount under ./data like the other stateful services (sidesteps the
+      # Docker VM virtual-disk limit; survives `make clean`).
+      - ./data/docs-mcp:/data
+    healthcheck:
+      # Image ships node only (no curl/wget); probe the HTTP server with fetch.
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "fetch('http://127.0.0.1:6280/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
     networks:
       - sdlc
 
@@ -164,6 +215,9 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24
     container_name: sdlc-clickhouse
+    # Part of the optional Langfuse stack — disabled by default. Enable the whole
+    # group with COMPOSE_PROFILES=langfuse (see .env).
+    profiles: ["langfuse"]
     user: "101:101"
     environment:
       CLICKHOUSE_DB: "${LANGFUSE_CLICKHOUSE_DB:-default}"
@@ -188,6 +242,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: sdlc-redis
+    profiles: ["langfuse"]  # optional Langfuse stack — off unless COMPOSE_PROFILES=langfuse
     command:
       - redis-server
       - --requirepass
@@ -209,6 +264,7 @@ services:
   minio:
     image: minio/minio:latest
     container_name: sdlc-minio
+    profiles: ["langfuse"]  # optional Langfuse stack — off unless COMPOSE_PROFILES=langfuse
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: "${LANGFUSE_MINIO_ROOT_USER:-minio}"
@@ -236,6 +292,7 @@ services:
     # exit. Re-runs are no-ops thanks to `mc mb --ignore-existing`.
     image: minio/mc:latest
     container_name: sdlc-minio-init
+    profiles: ["langfuse"]  # optional Langfuse stack — off unless COMPOSE_PROFILES=langfuse
     depends_on:
       minio:
         condition: service_healthy
@@ -252,6 +309,7 @@ services:
   langfuse-worker:
     image: langfuse/langfuse-worker:3
     container_name: sdlc-langfuse-worker
+    profiles: ["langfuse"]  # optional Langfuse stack — off unless COMPOSE_PROFILES=langfuse
     depends_on:
       postgres:
         condition: service_healthy
@@ -291,6 +349,7 @@ services:
   langfuse-web:
     image: langfuse/langfuse:3
     container_name: sdlc-langfuse-web
+    profiles: ["langfuse"]  # optional Langfuse stack — off unless COMPOSE_PROFILES=langfuse
     depends_on:
       postgres:
         condition: service_healthy

@@ -39,6 +39,29 @@ export interface RoleHeadcount {
   category: RoleCategory;
   seniority: RoleSeniority;
   headcount: number;
+  rate_per_hour: number;
+  ai_assisted_hours: number;
+  manual_only_hours: number;
+  ai_assisted_cost_usd: number;
+  manual_only_cost_usd: number;
+}
+
+export interface LlmModelUsage {
+  model: string;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+}
+
+export interface LlmUsage {
+  call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  by_model: LlmModelUsage[];
 }
 
 export interface Assumption {
@@ -74,6 +97,8 @@ export interface PhaseEstimate {
   assumptions: Assumption[];
   risks: Risk[];
   confidence: number;
+  breakdown: Record<string, number>;
+  effective_ai_reduction_pct: number;
   notes: string;
 }
 
@@ -90,6 +115,7 @@ export interface DualScenarioEstimate {
   weekly_burn_rate_usd: number;
   total_cost_ai_assisted_usd: number;
   total_cost_manual_only_usd: number;
+  llm_usage: LlmUsage;
 }
 
 export interface EstimateEnvelope {

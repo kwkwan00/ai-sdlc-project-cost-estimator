@@ -59,6 +59,8 @@ function Stage1Inner() {
         stage2_prefilled: true,
         prefill_ambiguity: prefill.ambiguity_score,
         prefill_summary: prefill.summary,
+        // Carry any AI tools named in the description forward to seed Stage 3.
+        prefill_ai_tooling: prefill.ai_tooling_description,
       });
       router.push(`/estimate/draft/context`);
     } catch (e) {

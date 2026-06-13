@@ -50,8 +50,9 @@ export function clampPercentage(value: number | string): number {
  *  is split evenly across them. All percentages end up as whole integers; any
  *  rounding drift is dropped onto the largest "other" row.
  *
- *  Called from the Share % input's onBlur (not onChange) so the user can finish
- *  typing a multi-digit value before the other rows snap. Exported for testing.
+ *  A single-row-anchored rebalance utility. (The roster editor no longer rebalances
+ *  implicitly on blur — see `normalizeShares` + the "Auto-adjust to 100%" button.)
+ *  Exported for testing / reuse.
  */
 export function rebalanceOnEdit(
   roles: CustomRoleInput[],
@@ -163,6 +164,35 @@ export function removeRow(roles: CustomRoleInput[], index: number): CustomRoleIn
   return redistributed;
 }
 
+/** Proportionally rescale every row's share so they total exactly 100 (whole
+ *  integers). When all rows are zero, splits evenly. Drift from rounding lands on
+ *  the largest row. Invoked by the "Auto-adjust to 100%" button — never implicitly.
+ */
+export function normalizeShares(roles: CustomRoleInput[]): CustomRoleInput[] {
+  if (roles.length === 0) return roles;
+  if (roles.length === 1) return [{ ...roles[0], percentage: 100 }];
+
+  const sum = roles.reduce((acc, r) => acc + r.percentage, 0);
+  const next =
+    sum <= 0
+      ? roles.map((r) => ({ ...r, percentage: Math.round(100 / roles.length) }))
+      : roles.map((r) => ({
+          ...r,
+          percentage: Math.round((r.percentage / sum) * 100),
+        }));
+
+  const total = next.reduce((acc, r) => acc + r.percentage, 0);
+  if (total !== 100) {
+    const drift = 100 - total;
+    const largest = next.reduce(
+      (best, _r, i) => (next[i].percentage >= next[best].percentage ? i : best),
+      0,
+    );
+    next[largest].percentage += drift;
+  }
+  return next;
+}
+
 export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
   const headingId = useId();
   const total = value.reduce((acc, r) => acc + r.percentage, 0);
@@ -193,8 +223,9 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
         seniority, hourly rate, and effort share. The category and seniority tags
         drive phase-specific role biases (e.g. Discovery is senior-biased,
         Deployment is engineering/devops-biased). Effort shares are whole-integer
-        percentages from 0–100 and the boxes auto-rebalance to total 100 when you
-        tab away.
+        percentages from 0–100; edit them freely, then use{" "}
+        <span className="font-medium">Auto-adjust to 100%</span> to rescale them
+        proportionally so they total 100.
       </p>
 
       <div className="space-y-3">
@@ -287,7 +318,7 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
               <div className="md:col-span-2">
                 <label className="label text-xs inline-flex items-center">
                   Share %
-                  <FieldHint text="Whole-integer percentage of total effort this role consumes. Boxes auto-rebalance to total 100 when you tab away — type freely while editing, the other rows snap on commit." />
+                  <FieldHint text="Whole-integer percentage of total effort this role consumes. Type any 0–100 value; other rows are left untouched. Use the 'Auto-adjust to 100%' button to rescale all shares proportionally so they total 100." />
                 </label>
                 <input
                   type="number"
@@ -299,13 +330,9 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
                   value={row.percentage}
                   disabled={disabled}
                   onChange={(e) =>
-                    // While typing, only update this row; the other rows snap
-                    // back onBlur so the user can finish a multi-digit value
-                    // without intermediate states scrambling the rest.
+                    // Edit only this row; other rows are left untouched. Use the
+                    // "Auto-adjust to 100%" button to rebalance the whole roster.
                     updateRow(idx, { percentage: clampPercentage(e.target.value) })
-                  }
-                  onBlur={(e) =>
-                    onChange(rebalanceOnEdit(value, idx, clampPercentage(e.target.value)))
                   }
                   aria-label={`${row.description || "role"} effort percentage`}
                 />
@@ -344,17 +371,26 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
         ))}
       </div>
 
-      <p
-        className={
-          sumValid
-            ? "text-xs muted"
-            : "text-xs text-rose-600 font-medium"
-        }
-        role="status"
-        aria-live="polite"
-      >
-        Total: {total}% {sumValid ? "" : `(must equal 100 — adjust by ${100 - total > 0 ? `+${100 - total}` : `${100 - total}`})`}
-      </p>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p
+          className={
+            sumValid ? "text-xs muted" : "text-xs text-rose-600 font-medium"
+          }
+          role="status"
+          aria-live="polite"
+        >
+          Total: {total}% {sumValid ? "" : `(must equal 100 — adjust by ${100 - total > 0 ? `+${100 - total}` : `${100 - total}`})`}
+        </p>
+        <button
+          type="button"
+          onClick={() => onChange(normalizeShares(value))}
+          disabled={disabled || sumValid || value.length === 0}
+          className="btn-secondary text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+          title="Proportionally rescale all shares so they total 100%"
+        >
+          Auto-adjust to 100%
+        </button>
+      </div>
     </div>
   );
 }

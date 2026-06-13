@@ -1,5 +1,7 @@
 # AI SDLC Project Cost Estimator
 
+**Author:** [Kevin Quon](https://www.linkedin.com/in/kwkwan00/)
+
 Multi-agent system that estimates **effort (hours), cost (USD), duration (weeks), and headcount** for AI-heavy software projects across the six SDLC phases — and produces a **dual-scenario** breakdown showing what each phase costs **with AI assistance** vs. **with manual delivery only**, so the gap is the realized AI ROI.
 
 Six specialized LangGraph "twin" agents — each grounded in a formal estimation algorithm — collaborate through a two-pass orchestrator with a human-in-the-loop clarifying-questions step in the middle.
@@ -10,7 +12,7 @@ Six specialized LangGraph "twin" agents — each grounded in a formal estimation
 
 - **LangGraph in-memory checkpointer** — Pass 1 ↔ Pass 2 interrupt state (in-process only).
 - **Neo4j** — graph-shaped envelope snapshots: one `Estimate` node per run, `INCLUDES_PHASE` edges to phase nodes. Useful for graph queries over the estimate corpus.
-- **Postgres** — structured history (`estimate_history`, `phase_history`) and rolling per-(phase, industry, project_type, maturity) **calibration aggregates** the twins query during Pass 1 to anchor their LLM-derived numbers.
+- **Postgres** — structured history (`estimate_history`, including the full `envelope_json` for verbatim redisplay; `phase_history`), rolling per-(phase, industry, project_type, codebase-context) **calibration aggregates** the twins query during Pass 1 to anchor their LLM-derived numbers, and the admin-tunable `ai_reduction_bands` table.
 
 All three are best-effort: the backend keeps running when any of them is unavailable.
 
@@ -45,8 +47,10 @@ Given a free-text project description (Stage 1) and optional context / maturity 
 1. **Pass 1** — runs all six twins in parallel; each produces a phase estimate **plus** the gaps it needs to firm up.
 2. **Interrupt** — the orchestrator dedupes overlapping gaps into 5–10 clarifying questions and pauses the graph (Stage 4).
 3. **Pass 2** — once the user answers (or skips with defaults), all six twins re-run with the new context.
-4. **Synthesize** — aggregates per-phase outputs into a `DualScenarioEstimate`: total hours, $ cost, duration band, weekly burn, headcount by role, and **AI hours/cost saved** (manual − AI).
-5. **Review** (Stage 5) — frontend renders per-phase bars, a toggle between AI-assisted and manual-only views, and a role-attributed cost table.
+4. **Synthesize** — aggregates per-phase outputs into a `DualScenarioEstimate`: total hours, $ cost, duration band, weekly burn, headcount by role, **AI hours/cost saved** (manual − AI), and the **LLM usage/cost** of producing the estimate (per-model token + dollar breakdown).
+5. **Review** (Stage 5) — frontend renders per-phase bars, a toggle between AI-assisted and manual-only views, a role-attributed cost table, graphical algorithm breakdowns, a confidence meter, an AI-assistance-savings section, and an LLM cost/usage modal.
+
+Before submission, two pre-submission agents help fill the wizard: a **prefill** agent normalizes the Stage 1 free text into a Stage 2 context, and a **roster** agent proposes the team roster. On Stage 3 submit, a **tooling classifier** turns the user's freeform AI-tooling description into per-phase tooling levels (researching unfamiliar tools via a self-hosted docs-mcp-server). Past estimates are listed on the landing page and can be redisplayed.
 
 Every `PhaseEstimate` carries **both scenarios** as `HourRange(optimistic, most_likely, pessimistic)` plus matching role splits — the two numbers travel together end-to-end so you can never accidentally collapse to a single answer.
 
@@ -69,20 +73,39 @@ Each twin:
 2. Renders the parsed context + Stage 2/3 + (on Pass 2) the user's answers as a JSON block.
 3. Calls Claude via `orchestrator/llm.py::call_structured(...)`, which exposes a Pydantic response model as a single tool and **forces** `tool_choice` to it. The tool input is validated back into the model — far more reliable than free-text JSON.
 4. Runs the deterministic algorithm in Python over the LLM-extracted inputs.
-5. Applies an **AI maturity cap** (per-phase, drawn from planning outline §3.x worked examples) to derive the AI-assisted hours from the manual baseline.
-6. Wraps the mid number in a PERT range and splits hours across roles via the shared `role_attribution.attribute_roles(...)`.
+5. Derives the AI-assisted hours from the manual baseline by applying the **AI-reduction guardrail bands** (`orchestrator/ai_acceleration.py::effective_ai_reduction(...)`) — the twin's *proposed* reduction is clamped into the per-(phase, tooling) band, then moderated by codebase context + team seniority, with a small verification penalty that can push the net reduction slightly negative. The realized reduction is recorded on the estimate as `effective_ai_reduction_pct`.
+6. Wraps the mid number in a PERT range, splits hours across roles via the shared `role_attribution.attribute_roles(...)`, and records the algorithm intermediates in a structured `breakdown: dict[str, float]` (not in prose `notes`).
 
 The shared shape lives in `backend/orchestrator/nodes/_twin_base.py`. When adding or modifying a twin, the differences should live in the prompt file + post-processing math, **not** in the plumbing.
 
+### AI-reduction guardrail bands
+
+How much AI realistically reduces (or sometimes *increases*) a phase's effort is governed by **guardrail bands**, not fixed maturity multipliers. `DEFAULT_BANDS` (in `orchestrator/ai_acceleration.py`) keys `(Phase, AiToolingLevel)` → an allowed reduction range `[lo, hi]` (as a fraction). Tooling levels are `none` / `autocomplete` / `chat` / `agentic`; `autocomplete` is a code-writing assist, so it doesn't apply to discovery / ux_design / code_review (those phases have no autocomplete band).
+
+`effective_ai_reduction(...)` clamps the twin's proposed reduction into the band (phases with no LLM proposal use the band midpoint), then multiplies by a codebase-context factor (greenfield 1.0 → brownfield-large-familiar 0.4) and a seniority factor, and subtracts verification penalties (regulated + large-familiar brownfield). The result is floored at `-0.15`, so risky brownfield work can net slightly negative (AI net-slower — METR 2025).
+
+The bands are **DB-tunable** via the `ai_reduction_bands` table (admin endpoints `GET` / `PUT /admin/reduction-bands`), loaded into `state["reduction_bands"]` by `parse_input`; the in-code `DEFAULT_BANDS` are the fallback when Postgres is unavailable.
+
 ### QA's three plans
 
-The QA twin uniquely recommends one of three test strategies and stashes the other two in `notes`:
+The QA twin uniquely recommends one of three test strategies. All three plan totals are computed and emitted structurally in `breakdown.plan_a_hours` / `plan_b_hours` / `plan_c_hours` (the selected plan drives the phase hours):
 
 - **Plan A — automated harness** (best for AI-heavy, low regulatory)
 - **Plan B — dedicated QA team** (best for high regulatory, no AI features)
 - **Plan C — hybrid** (best when both AI and regulatory pressure are high)
 
 Selection is rule-based (`auto_select_plan(has_ai, has_reg)`) but the twin may override; both are logged.
+
+### Pre-submission and support agents
+
+Alongside the six estimation twins, the backend runs four lighter LLM helpers (each pins its own model tier — see [Configuration](#configuration)):
+
+- **Prefill** (`backend/prefill.py`, Haiku) — turns the Stage 1 raw text into a normalized Stage 2 context for the wizard form; chains into the roster agent. Endpoint: `POST /estimates/draft/prefill`.
+- **Roster** (`backend/roster_agent.py`, Sonnet) — proposes the Stage 2 `RoleRoster` from the project context, then deterministically rebalances percentages to 100% and assigns rates/ids. Exposed to the frontend over AG-UI via `POST /estimates/draft/roster/agui` (`backend/roster_agui.py`).
+- **Tooling classifier** (`backend/tooling_classifier.py`, Sonnet) — maps the freeform AI-tooling description to per-phase `AiToolingLevel`s, researching tools it doesn't recognize via a co-located **docs-mcp-server** (MCP client over streamable HTTP, with an optional scrape-then-index step). Falls back to `none` on any failure/timeout. Endpoint: `POST /estimates/draft/classify-tooling`.
+- **Question consolidator** (inside `orchestrator/nodes/merge_pass1.py`, Haiku) — semantic dedup of the twins' overlapping clarifying questions, with a deterministic topic-dedup fallback when unset/unreachable.
+
+Their prompts live in `backend/orchestrator/prompts/` alongside the six twins: `prefill_agent.md`, `roster_agent.md`, `tooling_classifier.md`, `question_consolidator.md`.
 
 ---
 
@@ -105,7 +128,7 @@ Key mechanics:
 - `pass1_estimates` and `pass2_estimates` use `Annotated[list, operator.add]` reducers — the six parallel twins can append independently without write conflicts.
 - The graph pauses at `await_user_answers` via LangGraph's `interrupt()`. The HTTP layer resumes it with `Command(resume={"answers": ...})` after Stage 4.
 - `parse_input` calls Claude to convert raw text into a structured `parsed_context`. It has an **LLM-free fallback** (`_fallback_context`) so the graph still runs without an `ANTHROPIC_API_KEY` (smoke tests rely on this).
-- `commercial_processing` applies the role-rate table from `Stage2Context.role_rates` to produce per-scenario dollar totals.
+- `commercial_processing` looks up per-role rates from the user's `Stage2Context.roster` (by `role_id`) to produce per-scenario dollar totals.
 - `synthesize_estimate` aggregates PERT ranges across phases, computes `ai_hours_saved_pert = manual.pert_mean − ai.pert_mean`, derives headcount + duration band against the target timeline (or a default 5-person team if none was given), and rolls up a weekly burn rate.
 
 Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins share **only** what they read from state.
@@ -118,8 +141,9 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 
 - Python 3.12, `uv` for dependency management
 - FastAPI + `uvicorn[standard]`
-- LangGraph (`langgraph>=0.6`) + Anthropic SDK (`anthropic>=0.40`) via forced tool-use
+- LangGraph (`langgraph>=0.6`) + Anthropic SDK (`anthropic>=0.104`) via forced tool-use
 - Pydantic v2 (`extra="forbid"` on every model)
+- MCP SDK (`mcp>=1.12`) — client for the docs-mcp-server tool research
 - Neo4j driver (`neo4j>=5.25`) for graph-snapshot persistence
 - SQLAlchemy 2.0 async + asyncpg + Alembic for Postgres history + calibration
 - Qdrant client (`qdrant-client>=1.12`) — scaffolded, not populated in MVP
@@ -137,7 +161,8 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 
 **Infra**
 
-- Docker Compose: Neo4j 5.20-community + Postgres 16-alpine + Qdrant + self-hosted Langfuse stack (Langfuse web + worker, ClickHouse, Redis, MinIO) + (optional) the dockerized backend & frontend
+- Docker Compose: Neo4j 5.20-community + Postgres + Qdrant + a `docs-mcp-server` (host port `6280`, backs the tooling classifier) + (optional) the dockerized backend & frontend
+- The self-hosted Langfuse stack (Langfuse web + worker, ClickHouse, Redis, MinIO) is **gated behind the `langfuse` compose profile** (`profiles: ["langfuse"]`) — a plain `docker compose up` excludes it. Enable with `COMPOSE_PROFILES=langfuse` in `.env`.
 - Bind-mount under `./data/{neo4j,postgres,clickhouse,redis,minio}/` (sidesteps the Docker VM disk limit)
 
 ---
@@ -154,16 +179,25 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 ├── data/postgres/             # bind-mounted postgres data
 │
 ├── backend/
-│   ├── main.py                # FastAPI app: /estimates, /stream, /answers, /health
+│   ├── main.py                # FastAPI app: draft/prefill, draft/classify-tooling,
+│   │                          #   draft/roster/agui, admin/reduction-bands,
+│   │                          #   /estimates(+history,+stream,+answers), /health
 │   ├── config.py              # pydantic-settings, reads ../.env or .env
+│   ├── prefill.py             # Stage 1 → Stage 2 prefill agent (Haiku)
+│   ├── roster_agent.py        # team-roster proposal agent (Sonnet)
+│   ├── roster_agui.py         # AG-UI endpoint wrapping the roster agent
+│   ├── tooling_classifier.py  # freeform AI-tooling → per-phase levels (+docs-mcp research)
+│   ├── reduction_bands_admin.py # GET/PUT /admin/reduction-bands handlers
 │   ├── pyproject.toml         # uv-managed deps
 │   ├── Dockerfile             # python:3.12-slim + uv, non-root, HEALTHCHECK /health
 │   │
 │   ├── orchestrator/
 │   │   ├── graph.py           # StateGraph topology
-│   │   ├── llm.py             # call_structured(...) — forced tool-use → Pydantic
+│   │   ├── llm.py             # call_structured(...) — forced tool-use → Pydantic; per-agent model resolution
+│   │   ├── ai_acceleration.py # AI-reduction guardrail bands + effective_ai_reduction()
+│   │   ├── usage.py           # per-run Anthropic token-usage capture + cost estimation
 │   │   ├── role_attribution.py# shared role-split with phase-specific overrides
-│   │   ├── smoke.py           # CLI: `uv run python -m orchestrator.smoke`
+│   │   ├── smoke.py           # CLI: `uv run python -m orchestrator.smoke [--no-llm]`
 │   │   ├── nodes/
 │   │   │   ├── _twin_base.py  # shared twin shape (prompt loader, user-prompt builder, stub)
 │   │   │   ├── parse_input.py # raw text → parsed_context (with LLM-free fallback)
@@ -173,47 +207,54 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 │   │   │   ├── code_review_sentinel.py     # Fagan
 │   │   │   ├── deployment_devops.py        # CMP
 │   │   │   ├── qa_testing_strategist.py    # TPA + 3-plan recommendation
-│   │   │   ├── merge_pass1.py / merge_pass2.py
+│   │   │   ├── merge_pass1.py  # gap→question consolidation (Haiku, deterministic fallback)
+│   │   │   ├── merge_pass2.py
 │   │   │   ├── await_user_answers.py       # interrupt()
 │   │   │   ├── consistency_check.py
-│   │   │   ├── commercial_processing.py
-│   │   │   └── synthesize_estimate.py      # DualScenarioEstimate
-│   │   └── prompts/<twin>.md  # system prompts grounded in the algorithm
+│   │   │   ├── commercial_processing.py    # per-role rates from the roster
+│   │   │   └── synthesize_estimate.py      # DualScenarioEstimate (+ headcount_by_role, llm_usage)
+│   │   └── prompts/           # six twins + prefill_agent, roster_agent, tooling_classifier, question_consolidator
 │   │
 │   ├── models/
-│   │   ├── estimation_state.py  # LangGraph EstimationState TypedDict
-│   │   ├── twin_outputs.py      # Phase, PhaseEstimate, HourRange, RoleAttribution, DualScenarioEstimate, ...
-│   │   └── project_schema.py    # CreateEstimateRequest, EstimateEnvelope, Stage2Context, Stage3Maturity
+│   │   ├── estimation_state.py  # LangGraph EstimationState TypedDict (incl. reduction_bands, calibration_examples)
+│   │   ├── twin_outputs.py      # Phase, PhaseEstimate (breakdown, effective_ai_reduction_pct), HourRange, DualScenarioEstimate, LlmUsage, ...
+│   │   └── project_schema.py    # CreateEstimateRequest, EstimateEnvelope, Stage2Context (roster), Stage3Context (codebase + AI-tooling), CodebaseContext, AiToolingLevel
 │   │
 │   ├── db/
 │   │   ├── neo4j_adapter.py   # driver + make_checkpointer (InMemorySaver in MVP) + save_estimate_envelope
 │   │   ├── postgres_adapter.py# async engine + session_scope() — no-ops when DSN unset
-│   │   ├── orm_models.py      # SQLAlchemy models: EstimateHistory, PhaseHistory, CalibrationAggregate
-│   │   ├── repositories.py    # save_estimate_history, refresh_calibration_for_phase, get_calibration*
+│   │   ├── orm_models.py      # SQLAlchemy models: EstimateHistory (+envelope_json), PhaseHistory, CalibrationAggregate, AiReductionBand
+│   │   ├── repositories.py    # save_estimate_history, list_estimate_history, get_estimate_envelope, refresh_calibration_for_phase, get_calibration*, reduction-band reads/writes
 │   │   ├── migrate.py         # programmatic `alembic upgrade head` for the FastAPI lifespan
 │   │   └── qdrant_adapter.py  # client init (no ingestion in MVP)
 │   │
 │   ├── alembic/               # async migrations (env.py reads settings.resolved_postgres_dsn)
 │   │   ├── env.py
 │   │   ├── script.py.mako
-│   │   └── versions/0001_initial_history_and_calibration.py
+│   │   └── versions/          # 0001 history+calibration … 0006 (reduction bands, envelope_json, nullable raw_input)
 │   ├── alembic.ini
 │   │
 │   ├── observability/
-│   │   └── langfuse_wrapper.py# @traced(...) decorator — no-op when env keys absent, async-preserving
+│   │   ├── langfuse_wrapper.py# @traced(...) decorator — no-op when env keys absent, async-preserving
+│   │   ├── logging_config.py  # configure_logging() — root log level + format
+│   │   └── request_logging.py # ASGI middleware: method / path / status / latency per request
 │   │
-│   └── tests/                 # pytest, asyncio auto-mode (~100 tests)
+│   └── tests/                 # pytest, asyncio auto-mode (~280 tests)
 │
 └── frontend/
     ├── app/
-    │   ├── layout.tsx / page.tsx / providers.tsx
+    │   ├── layout.tsx / page.tsx / providers.tsx   # landing page lists + redisplays past estimates
+    │   ├── settings/page.tsx  # edit the AI-reduction guardrail bands (gear icon)
     │   ├── globals.css        # html { font-size: 14px } — global UI scale
     │   └── estimate/
     │       ├── new/                          # Stage 1
     │       ├── draft/{create,context,maturity}/  # Stages 2-3 wizard (client-side, pre-submit)
     │       └── [id]/{questions,review}/      # Stages 4-5 (server-driven)
-    ├── components/            # PhaseBar, DualScenarioToggle, MaturitySlider, RolePercentageSliders, StageProgress
-    ├── lib/                   # schemas (Zod), api-client (fetch + SSE), wizard-store, types, format
+    ├── components/            # PhaseBar, DualScenarioToggle, RoleRosterEditor, StageProgress,
+    │                          #   ConfidenceMeter, AlgorithmBreakdownChart, AlgorithmTooltip/Badge,
+    │                          #   AiSavingsSection, BreakdownView, Modal, RosterRationaleModal, FieldHint
+    ├── lib/                   # schemas (Zod), api-client (fetch + SSE), wizard-store, types, format,
+    │                          #   algorithms, breakdown, review-ui, estimate-status, roster-agui
     ├── instrumentation.ts     # Next.js startup hook — logs `✓ Frontend ready ...`
     ├── next.config.mjs        # output: "standalone"
     ├── vitest.config.ts       # globs: lib/**, components/**, instrumentation.test.ts
@@ -257,25 +298,32 @@ cd backend && uv run python -m orchestrator.smoke --no-llm
 
 ## Quickstart — full Docker stack
 
-The backend and frontend can run as compose services alongside Neo4j + Qdrant.
+The backend and frontend can run as compose services alongside Neo4j, Postgres, Qdrant, and the docs-mcp-server.
 
 ```bash
 cp .env.example .env             # fill in ANTHROPIC_API_KEY + NEO4J_PASSWORD + POSTGRES_PASSWORD
-# Rotate the Langfuse secrets before anything non-throwaway:
-#   openssl rand -hex 32   # -> paste into LANGFUSE_ENCRYPTION_KEY
-#   openssl rand -base64 32   # -> paste into LANGFUSE_NEXTAUTH_SECRET / LANGFUSE_SALT
-docker compose up -d --build     # builds estimator apps + brings up neo4j / postgres / qdrant / langfuse stack
+docker compose up -d --build     # builds estimator apps + brings up neo4j / postgres / qdrant / docs-mcp-server
 docker compose ps                # all services should be healthy
-
-# First-run Langfuse setup (only needed once):
-#   1. open http://localhost:3100 → sign up → create org → create project
-#   2. project settings → API keys → "Create new API key"
-#   3. paste pk-lf-... / sk-lf-... into .env's LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY
-#   4. docker compose restart estimator-backend
-# (Alternative: set the LANGFUSE_INIT_* env vars in .env to seed an org/user
-# on first boot — see .env.example for the full list.)
 docker compose logs estimator-backend  | grep "Backend ready"
 docker compose logs estimator-frontend | grep "Frontend ready"
+```
+
+**Langfuse is optional and off by default.** The self-hosted Langfuse stack is gated behind the `langfuse` compose profile, so a plain `docker compose up` skips it. To run it:
+
+```bash
+# 1. Enable the profile and rotate the Langfuse secrets in .env before anything non-throwaway:
+#      COMPOSE_PROFILES=langfuse
+#      openssl rand -hex 32      # -> LANGFUSE_ENCRYPTION_KEY
+#      openssl rand -base64 32   # -> LANGFUSE_NEXTAUTH_SECRET / LANGFUSE_SALT
+# 2. Bring up the full stack (profile is read from .env's COMPOSE_PROFILES):
+docker compose up -d --build
+# 3. First-run Langfuse setup (only needed once):
+#      a. open http://localhost:3100 → sign up → create org → create project
+#      b. project settings → API keys → "Create new API key"
+#      c. paste pk-lf-... / sk-lf-... into .env's LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY
+#      d. docker compose restart estimator-backend
+# (Alternative: set the LANGFUSE_INIT_* env vars in .env to seed an org/user on first
+# boot — see .env.example for the full list.)
 ```
 
 Notes:
@@ -297,7 +345,17 @@ All settings are read by `backend/config.py` (pydantic-settings) from `.env`. Th
 | Var | Required | Default | Purpose |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | yes (for real estimates) | — | Claude calls. Twins fall back to stub estimates if missing; `parse_input` uses a deterministic fallback. |
-| `ANTHROPIC_MODEL` | no | `claude-opus-4-5-20250929` | Model id for all twins. Per-twin overrides are out of MVP scope. |
+| `ANTHROPIC_MODEL` | no | `claude-sonnet-4-6` | Model id the six estimation twins use. The four support agents pin their own tier below. |
+| `ANTHROPIC_MODEL_PREFILL` | no | `claude-haiku-4-5` | Stage 1 → Stage 2 prefill agent (cheap/bounded → Haiku). |
+| `ANTHROPIC_MODEL_ROSTER` | no | `claude-sonnet-4-6` | Team-roster proposal agent (knowledge-heavy → Sonnet). |
+| `ANTHROPIC_MODEL_MERGE` | no | `claude-haiku-4-5` | Clarifying-question consolidation in `merge_pass1` (cheap → Haiku; deterministic fallback). |
+| `ANTHROPIC_MODEL_TOOLING` | no | `claude-sonnet-4-6` | AI-tooling classifier (broad tool knowledge → Sonnet). |
+| `DOCS_MCP_URL` | no | `http://localhost:6280/mcp` | Self-hosted docs-mcp-server the tooling classifier consults (MCP over streamable HTTP). Blank disables lookups (unknown tools → `none`). Compose overrides this to the in-network hostname. |
+| `DOCS_MCP_AUTH_TOKEN` | no | `""` | Optional bearer token for docs-mcp-server. |
+| `DOCS_MCP_RESEARCH_TIMEOUT_S` | no | `25.0` | Hard ceiling on the docs-mcp search lookup (it runs in the Stage 3 submit path). On timeout, unknown tools → `none`. |
+| `DOCS_MCP_AUTO_SCRAPE` | no | `true` | When set, an unindexed tool is scraped (docs crawled + embedded) before continuing, not just searched. Requires an embeddings provider (`OPENAI_API_KEY`) on docs-mcp-server. |
+| `DOCS_MCP_SCRAPE_TIMEOUT_S` | no | `240.0` | Larger ceiling for the scrape path. On timeout/failure tools → `none`. |
+| `COMPOSE_PROFILES` | no | `""` | Docker Compose profile selector. Set to `langfuse` to bring up the self-hosted Langfuse stack (off by default). |
 | `NEO4J_URI` | no | `bolt://localhost:7687` | Bolt URI. |
 | `NEO4J_USER` | no | `neo4j` | |
 | `NEO4J_PASSWORD` | no (recommended) | `""` | When empty, persistence is silently disabled — the backend still runs. |
@@ -309,7 +367,7 @@ All settings are read by `backend/config.py` (pydantic-settings) from `.env`. Th
 | `POSTGRES_MIGRATE_ON_START` | no | `true` | Run Alembic upgrade in the FastAPI lifespan. Set to `false` in CI/CD if migrations run separately. |
 | `POSTGRES_POOL_SIZE` / `POSTGRES_MAX_OVERFLOW` | no | `5` / `5` | SQLAlchemy connection-pool tuning. |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | no | `""` | Both must be set to enable tracing. Otherwise `@traced` is a no-op. Generated in the Langfuse UI after first launch (`http://localhost:3100`). |
-| `LANGFUSE_HOST` | no | `http://localhost:3100` | Host-mapped port of the self-hosted Langfuse UI. Docker-compose overrides this to `http://langfuse-web:3000` for the dockerized estimator backend. |
+| `LANGFUSE_HOST` | no | `https://cloud.langfuse.com` (`.env.example` sets `http://localhost:3100` for the self-hosted stack) | Langfuse ingest host. Docker-compose overrides this to `http://langfuse-web:3000` for the dockerized estimator backend. |
 | `LANGFUSE_NEXTAUTH_SECRET` / `LANGFUSE_NEXTAUTH_URL` / `LANGFUSE_SALT` | no | placeholder | NextAuth secrets for the Langfuse UI. Rotate before anything non-throwaway. |
 | `LANGFUSE_ENCRYPTION_KEY` | no | placeholder zeros | 32-byte hex key for Langfuse field-level encryption. Generate with `openssl rand -hex 32`. |
 | `LANGFUSE_CLICKHOUSE_USER` / `LANGFUSE_CLICKHOUSE_PASSWORD` | no | `clickhouse` / placeholder | ClickHouse credentials (Langfuse event store). |
@@ -319,6 +377,7 @@ All settings are read by `backend/config.py` (pydantic-settings) from `.env`. Th
 | `LANGFUSE_INIT_*` | no | `""` | Optional org/project/user seeding on first boot. Leave blank to use the UI signup flow. |
 | `BACKEND_HOST` / `BACKEND_PORT` | no | `0.0.0.0` / `8000` | |
 | `BACKEND_CORS_ORIGINS` | no | `http://localhost:3000` | Comma-separated. |
+| `LOG_LEVEL` | no | `INFO` | Root backend log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`), applied by `observability.logging_config`. |
 | `NEXT_PUBLIC_API_URL` | no | `http://localhost:8000` | Inlined at frontend **build** time. |
 
 Graceful degradation is intentional — every external dependency (Anthropic, Neo4j, Qdrant, Langfuse) can be absent and the system still starts. You'll get stubs or warnings instead of crashes.
@@ -329,13 +388,19 @@ Graceful degradation is intentional — every external dependency (Anthropic, Ne
 
 | Method | Path | Purpose |
 |---|---|---|
+| `POST` | `/estimates/draft/prefill` | Pre-submission: normalize Stage 1 raw text into a Stage 2 context (prefill agent). Always returns a valid context (degrades to defaults on LLM failure). |
+| `POST` | `/estimates/draft/classify-tooling` | Pre-submission: classify the freeform Stage 3 AI-tooling description into per-phase `AiToolingLevel`s. Degrades to all-`none` on failure. |
+| `POST` | `/estimates/draft/roster/agui` | Pre-submission: AG-UI agent run that proposes the Stage 2 team roster (streams a `STATE_SNAPSHOT`). |
+| `GET` | `/admin/reduction-bands` | Read the effective AI-reduction guardrail bands (code defaults merged with DB overrides) as editable percentages — backs the Settings screen. |
+| `PUT` | `/admin/reduction-bands` | Persist edited reduction bands. No-ops (response `editable: false`) when Postgres is disabled. |
 | `POST` | `/estimates` | Start a new estimation. Body: `CreateEstimateRequest { project_name?, raw_input, stage2?, stage3? }`. Returns the envelope with status `pending`; Pass 1 runs as a background task. |
-| `GET` | `/estimates/{id}` | Fetch the current envelope (status, pass1/pass2 estimates, clarifying questions, final). |
-| `GET` | `/estimates/{id}/stream` | **SSE** event stream — emits `status` / `questions` / `final` / `error` as the graph progresses. Closes after `final` or `error`. |
+| `GET` | `/estimates/history` | Recent persisted estimates (newest first) for the dashboard history list. Empty when Postgres is disabled. |
+| `GET` | `/estimates/{id}` | Fetch the current envelope (status, pass1/pass2 estimates, clarifying questions, final). **Authoritative source of truth.** On in-memory cache miss it falls back to the persisted `envelope_json` (when Postgres is connected) so completed estimates redisplay after a restart / in a fresh session. |
+| `GET` | `/estimates/{id}/stream` | **SSE** event stream — emits `status` / `questions` / `final` / `error` as the graph progresses. Best-effort, via a per-estimate fan-out broker with a replay buffer: late / reconnecting / multiple concurrent subscribers all receive the backlog (no event stealing). Closes after `final` or `error`. |
 | `POST` | `/estimates/{id}/answers` | Submit Stage 4 answers and resume the graph into Pass 2. Body: `{ answers: { question_id: text }, skip_remaining?: bool }`. Returns 409 if status ≠ `awaiting_answers`. |
 | `GET` | `/health` | `{ "status": "ok", "service": "ai-sdlc-estimator" }`. |
 
-Status machine: `pending → pass_1_running → awaiting_answers → pass_2_running → completed` (or `failed` with `.error`).
+Status machine: `pending → pass_1_running → awaiting_answers → pass_2_running → synthesizing → completed` (or `failed` with `.error`).
 
 OpenAPI docs are served at `http://localhost:8000/docs` once the backend is up.
 
@@ -347,12 +412,12 @@ OpenAPI docs are served at `http://localhost:8000/docs` once the backend is up.
 |---|---|---|
 | `/estimate/new` | 1. Raw input | Wrapped in `<Suspense>` to satisfy Next.js 15's `useSearchParams` rule. |
 | `/estimate/draft/create` | (transition) | Wraps `useSearchParams` in Suspense; submits to `POST /estimates`. |
-| `/estimate/draft/context` | 2. Project context | MVP subset of planning outline §4.2 — industry, project type, screen count, integrations, engagement model, **and the team roster** (name + category + seniority + rate + percentage per role). Client-side state in `lib/wizard-store.ts`. |
-| `/estimate/draft/maturity` | 3. AI maturity | Six per-phase sliders (1–5). Team composition lives in Stage 2 — adjust the roster there, not here. |
+| `/estimate/draft/context` | 2. Project context | MVP subset of planning outline §4.2 — industry, project type, screen count, integrations, engagement model, **and the team roster** (description + category + seniority + rate + percentage per role). The `<RoleRosterEditor>` lives here, with a separate "Auto-adjust to 100%" button (no auto-rebalance on blur). A prefill/roster agent can pre-populate both. Client-side state in `lib/wizard-store.ts`. |
+| `/estimate/draft/maturity` | 3. AI tooling & codebase | A **freeform AI-tooling description** text field (classified into per-phase tooling levels on submit via `POST /estimates/draft/classify-tooling`) plus a codebase-context selector (greenfield / brownfield small / large-unfamiliar / large-familiar). The old per-phase L0–L4 maturity sliders are gone. Team composition lives in Stage 2. |
 | `/estimate/[id]/questions` | 4. Clarifying questions | Renders questions returned by Pass 1; POSTs answers to resume Pass 2. |
-| `/estimate/[id]/review` | 5. Review | Per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, copy-as-markdown. |
+| `/estimate/[id]/review` | 5. Review | Per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, algorithm tooltips, an AI-assistance-savings section, risks/assumptions in modals off the phase cards, and an LLM cost/token-usage modal. Copy-as-markdown. |
 
-The dashboard at `/` lists past estimates pulled from the backend.
+The landing page at `/` lists historical estimates pulled from the backend and redisplays the review page for completed ones. A gear icon opens `/settings`, which edits the AI-reduction guardrail bands (`GET`/`PUT /admin/reduction-bands`).
 
 Global font scale: `app/globals.css` sets `html { font-size: 14px; }` so all Tailwind rem-based utilities shrink uniformly. Change it in one place to rescale the whole UI.
 
@@ -360,20 +425,20 @@ Global font scale: `app/globals.css` sets `html { font-size: 14px; }` so all Tai
 
 ## Estimation algorithms in one breath
 
-- **UCP (Discovery)** — `UUCW = 5·simple + 10·avg + 15·complex`, `UAW = 1·simple + 2·avg + 3·complex`, `TCF = 0.6 + 0.01·TFactor`, `ECF = 1.4 − 0.03·EFactor`, `UCP = (UUCW + UAW)·TCF·ECF`. Hours = `UCP · productivity · phase_ratio · stakeholder_multiplier`. AI maturity cap: `{1:0, 2:0.15, 3:0.30, 4:0.50, 5:0.65}`.
-- **SCP (UX)** — screen count weighted by complexity buckets, divided by design-system maturity. Caps similar to UCP.
+- **UCP (Discovery)** — `UUCW = 5·simple + 10·avg + 15·complex`, `UAW = 1·simple + 2·avg + 3·complex`, `TCF = 0.6 + 0.01·TFactor`, `ECF = 1.4 − 0.03·EFactor`, `UCP = (UUCW + UAW)·TCF·ECF`. Hours = `UCP · productivity · phase_ratio · stakeholder_multiplier`.
+- **SCP (UX)** — screen count weighted by complexity buckets, divided by design-system maturity.
 - **COCOMO II (Development)** — SLOC × effort multipliers (EM) × scale factors (SF). MVP uses the Early Design model.
-- **Fagan (Code Review)** — `KLOC / inspection_rate` planning hours + rework factor. AI cap reflects review-assistant tooling.
+- **Fagan (Code Review)** — `KLOC / inspection_rate` planning hours + rework factor.
 - **CMP (Deployment)** — Configuration Management Points across environments × integration count × infra complexity.
 - **TPA (QA)** — `dynamic_tp = FP · DF · (QD/24)` + `static_tp = FP · QI / 500`. Selected plan (A / B / C) drives the base + per-TP factor.
 
-Every twin then wraps the manual mid in a PERT three-point range and applies the AI-maturity cap to derive the AI-assisted mid.
+Every twin produces a manual baseline, wraps the manual mid in a PERT three-point range, and derives the AI-assisted mid by applying the **AI-reduction guardrail bands** — the twin's proposed reduction clamped into its `(phase, tooling)` band, moderated by codebase context + team seniority, minus a verification penalty (floored at −0.15). See [AI-reduction guardrail bands](#ai-reduction-guardrail-bands) above. The realized fraction is recorded as `effective_ai_reduction_pct`, and algorithm intermediates land in the structured `breakdown`.
 
 ---
 
 ## Role attribution and rates
 
-The team is a **user-defined roster** — Stage 2 lets the user add/remove roles, assign each one a name, a category, a seniority, an hourly rate, and a percentage of total effort. The default roster mirrors the original four-role split (Sr/Jr × Product/Engineering) but the user can replace it entirely.
+The team is a **user-defined roster** — Stage 2 lets the user add/remove roles, assign each one a description, a category, a seniority, an hourly rate, and a percentage of total effort. The default roster mirrors the original four-role split (Sr/Jr × Product/Engineering) but the user can replace it entirely.
 
 **Role categories** (tag drives phase overrides — see below):
 
@@ -401,14 +466,14 @@ All percentages are renormalized to 1.0 after overrides. A roster of `OTHER`/`OT
 
 **Default roster** (used when the user doesn't customize):
 
-| Name | Category | Seniority | Default rate | Default % |
+| Description | Category | Seniority | Default rate | Default % |
 |---|---|---|---|---|
-| Sr. Product | `product` | `senior` | $220/h | 20% |
-| Jr. Product | `product` | `junior` | $140/h | 10% |
-| Sr. Engineer | `engineering` | `senior` | $240/h | 50% |
-| Jr. Engineer | `engineering` | `junior` | $150/h | 20% |
+| Senior product manager | `product` | `senior` | $220/h | 20% |
+| Junior product manager | `product` | `junior` | $140/h | 10% |
+| Senior software engineer | `engineering` | `senior` | $240/h | 50% |
+| Junior software engineer | `engineering` | `junior` | $150/h | 20% |
 
-The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remove rows, dropdowns for category and seniority, an hourly-rate input, and a percentage slider that auto-rebalances to keep the total at 100%.
+The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remove rows, dropdowns for category and seniority, an hourly-rate input, and percentage inputs with a separate **"Auto-adjust to 100%"** button (percentages are not auto-rebalanced on blur). A roster proposal agent (over AG-UI) can pre-populate the whole roster from the project context.
 
 ---
 
@@ -416,15 +481,18 @@ The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remov
 
 - **LangGraph checkpointer** — `db/neo4j_adapter.py::make_checkpointer()` returns `langgraph.checkpoint.memory.InMemorySaver` in MVP. State survives within a process (so `interrupt()` works) but **not** across restarts. A real Neo4j-backed `BaseCheckpointSaver` is a Phase-3 swap at this exact call site.
 - **Neo4j estimate snapshots** — `save_estimate_envelope(...)` writes one `Estimate` node + N `Phase` nodes via idempotent Cypher `MERGE`. Called at status transitions in `main.py`. **Silently no-ops** when Neo4j is unavailable.
-- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, maturity) aggregates in `calibration_aggregates`. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. **Silently no-ops** when Postgres is unavailable. Alembic migrations run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
-- **Langfuse** — `@traced(name=..., as_type=...)` decorates LLM calls and graph nodes. With keys absent, it installs a no-op decorator that **preserves `inspect.iscoroutinefunction`** — important because LangGraph inspects node fns to decide sync vs async dispatch. Self-hosted via docker-compose: a `langfuse-web` (UI on `http://localhost:3100`) + `langfuse-worker` + ClickHouse + Redis + MinIO stack, sharing the project's Postgres for metadata under a separate `langfuse` database. The estimator backend points at `http://langfuse-web:3000` inside the compose network and `http://localhost:3100` when run on the host.
+- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` (including the full `envelope_json` for verbatim redisplay) and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, **codebase-context**) aggregates in `calibration_aggregates`. The codebase-context code (0–3, `-1` = "any") rides in the column historically named `maturity_level` — it no longer holds an AI-maturity level. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. `list_estimate_history(...)` / `get_estimate_envelope(...)` back the history list and the redisplay-after-restart fallback. **Silently no-ops** when Postgres is unavailable. Alembic migrations (`0001`–`0006`) run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
+- **AI-reduction bands** — the admin-tunable `ai_reduction_bands` table holds the per-(phase, tooling) guardrail bands, merged with the in-code defaults and loaded into graph state by `parse_input`. Editable from the `/settings` screen via `GET`/`PUT /admin/reduction-bands`.
+- **LLM usage/cost** — `orchestrator/usage.py` captures each Anthropic call's token usage into a per-estimate accumulator (bound around the Pass 1/Pass 2 run), then summarizes it into `DualScenarioEstimate.llm_usage` (per-model token + dollar breakdown) — the meta-cost of producing the estimate, surfaced in the review page's LLM cost modal. Best-effort: a no-op when no accumulator is bound.
+- **Langfuse** — `@traced(name=..., as_type=...)` decorates LLM calls and graph nodes. With keys absent, it installs a no-op decorator that **preserves `inspect.iscoroutinefunction`** — important because LangGraph inspects node fns to decide sync vs async dispatch. Self-hosted via docker-compose but **gated behind the `langfuse` compose profile** (off by default; enable with `COMPOSE_PROFILES=langfuse`): a `langfuse-web` (UI on `http://localhost:3100`) + `langfuse-worker` + ClickHouse + Redis + MinIO stack, sharing the project's Postgres for metadata under a separate `langfuse` database. The estimator backend points at `http://langfuse-web:3000` inside the compose network; on the host (`make be`) it uses whatever `LANGFUSE_HOST` is set to (`.env.example` ships `http://localhost:3100`).
+- **docs-mcp-server** — a co-located compose service (host port `6280`) the tooling classifier queries (and optionally scrapes-then-indexes) to research unfamiliar AI tools. Degrades gracefully: when unreachable or timed out, unknown tools stay `none`.
 - **Qdrant** — client + collection bootstrap is in place but no data is ingested. Vector calibration is Phase 3 (the SQL aggregates above are the MVP version).
 
 ---
 
 ## Testing
 
-Backend (~116 tests, pytest with asyncio auto-mode):
+Backend (~280 tests, pytest with asyncio auto-mode):
 
 ```bash
 cd backend && uv run pytest                              # full suite
@@ -465,14 +533,18 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 
 **In scope (Phase 1 — implemented)**
 
-- Single LLM (Claude) for all twins via forced tool-use structured output
+- Claude (forced tool-use structured output) for all twins, with a **per-agent multi-model strategy** (twins on Sonnet; prefill + question-merge on Haiku; roster + tooling on Sonnet)
 - Two-pass orchestration with LangGraph `interrupt()` for clarifying questions
 - All six twin algorithms (UCP, SCP, COCOMO II, Fagan, CMP, TPA + 3-plan QA)
+- AI-reduction guardrail bands (admin-tunable per phase × tooling) replacing the old maturity caps
+- Freeform AI-tooling classification with docs-mcp-server research, plus the prefill + roster pre-submission agents
 - Dual-scenario aggregation (AI-assisted vs. manual-only) end-to-end
-- Stage 1 (raw text), simplified Stages 2–3, full Stages 4–5
+- LLM cost / token-usage tracking surfaced on the estimate
+- Stage 1 (raw text), simplified Stages 2–3 (Stage 3 = freeform AI tooling + codebase context), full Stages 4–5
+- Estimate history landing page + verbatim redisplay of completed estimates
 - Neo4j envelope persistence + Postgres history & twin calibration aggregates (when reachable)
 - Alembic migrations + programmatic upgrade on startup
-- Langfuse SDK wired but optional
+- Langfuse SDK wired but optional (gated behind a compose profile)
 - Dockerized full stack
 
 **Deferred (Phase 2 / 3 / 4 — scaffolded, not implemented)**
@@ -482,8 +554,7 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 - Full Stage 2 / 3 field set per planning outline §4.2
 - Qdrant vector-similarity calibration (Postgres SQL aggregates are the MVP version)
 - Neo4j-backed LangGraph checkpointer (in-memory only today)
-- Multi-model strategy (different tiers per twin)
-- Project-profile templates and estimate history / comparison views
+- Side-by-side estimate comparison views (history list + single-estimate redisplay exist; multi-estimate diffing does not)
 - Langfuse trace viewer page (`/estimate/[id]/explain`)
 - Proposal document export / PM-tool integration
 
@@ -495,15 +566,16 @@ Each deferred area has either a corresponding TODO comment or a scaffolded folde
 
 - **Neo4j fails to start with `JettyWebServer.loadStaticContent: Path is null`** — newer 5.x community images regress on arm64. The image is pinned to `neo4j:5.20-community` for that reason. Don't bump without testing on arm64.
 - **Neo4j "no space left on device"** — the Docker VM's virtual disk is full. The compose file uses **bind mounts** under `./data/neo4j/{data,logs}` so the host (which has space) holds the data. If you also see Docker layer build failures, prune: `docker image prune -af && docker builder prune -f`.
-- **Backend says "Langfuse disabled"** — expected when `LANGFUSE_PUBLIC_KEY` or `LANGFUSE_SECRET_KEY` is empty. Self-hosted Langfuse is up at `http://localhost:3100`; sign up there, create a project, and paste the generated `pk-lf-…` / `sk-lf-…` into `.env`.
+- **Backend says "Langfuse disabled"** — expected when `LANGFUSE_PUBLIC_KEY` or `LANGFUSE_SECRET_KEY` is empty. Langfuse is also **off by default** at the compose level — set `COMPOSE_PROFILES=langfuse` in `.env` to start the stack, then sign up at `http://localhost:3100`, create a project, and paste the generated `pk-lf-…` / `sk-lf-…` into `.env`.
+- **Tooling classifier maps unknown tools to `none`** — the docs-mcp-server is unreachable, timed out (`DOCS_MCP_RESEARCH_TIMEOUT_S` / `DOCS_MCP_SCRAPE_TIMEOUT_S`), or has no embeddings provider (`OPENAI_API_KEY`) to search/index against. This is the conservative fallback; the rest of the estimate proceeds. Confirm the `docs-mcp-server` service is healthy on `:6280` and `DOCS_MCP_URL` is reachable from the backend.
 - **Langfuse UI 500s on first load** — usually a `langfuse-web` ↔ Postgres migration race. `docker compose logs langfuse-web | grep -i prisma` will show the migration; wait for it to finish (~30s on first boot) then refresh.
 - **`langfuse-web` healthcheck failing with `password authentication failed` for `estimator`** — the Postgres init script didn't run because `./data/postgres` already had content. Create the DB manually: `docker exec sdlc-postgres psql -U estimator -c "CREATE DATABASE langfuse;"` then `docker compose restart langfuse-web langfuse-worker`.
 - **ClickHouse / MinIO data taking space** — bind-mounted at `./data/clickhouse/` and `./data/minio/`. `docker compose down -v` does NOT wipe them; remove the directories manually for a fully clean reset.
 - **Backend says "Neo4j connect failed; persistence disabled"** — `NEO4J_PASSWORD` not set or Neo4j is down. The backend keeps working without persistence.
 - **Backend says "Postgres disabled (no POSTGRES_DSN / POSTGRES_PASSWORD)"** — expected when neither is set. History writes + twin calibration silently no-op; the rest of the API works. Set `POSTGRES_PASSWORD` (or `POSTGRES_DSN`) to enable.
 - **Backend says "Alembic upgrade failed"** — the lifespan logs but doesn't crash. Run `uv run alembic upgrade head` from `backend/` to apply migrations manually and inspect the error.
-- **Twins not improving across runs** — calibration only refreshes when an estimate reaches status `completed`. Check `calibration_aggregates` in Postgres (`psql -U estimator -d estimator -c "select * from calibration_aggregates"`) to see what's accumulated.
-- **Twin returns a stub estimate** — the twin's LLM call failed (often: `ANTHROPIC_API_KEY` missing or model id wrong). Check `confidence: 0.3` and `notes: "Stub output ..."` in the response. Set the env var and restart.
+- **Twins not improving across runs** — calibration only refreshes when an estimate reaches status `completed`. Check `calibration_aggregates` in Postgres (`psql -U estimator -d estimator -c "select * from calibration_aggregates"`) to see what's accumulated. Note `maturity_level` there is a codebase-context code (0–3, `-1` = any), not an AI-maturity level.
+- **Twin returns a stub estimate** — the twin's LLM call failed (often: `ANTHROPIC_API_KEY` missing or model id wrong). Check the low confidence + stub note in the response. Set the env var and restart.
 - **"Expected dict, got coroutine" from LangGraph** — something wrapped an async node with a sync decorator. The Langfuse no-op decorator already branches on `inspect.iscoroutinefunction`; if you add new decorators, mirror that pattern.
 - **Next.js build fails on `useSearchParams()`** — wrap the page component in `<Suspense>`. `/estimate/new` and `/estimate/draft/create` already do this; copy the pattern.
 - **Frontend can't reach the backend in Docker** — `NEXT_PUBLIC_API_URL` is build-time and is called from the browser. It must be `http://localhost:8000`, never the internal service name.

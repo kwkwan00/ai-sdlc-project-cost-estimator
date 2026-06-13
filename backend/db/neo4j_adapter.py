@@ -10,7 +10,7 @@ for the calibration / history features. This lets us swap in a real
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from neo4j import GraphDatabase
@@ -90,21 +90,56 @@ def save_estimate_envelope(envelope: dict[str, Any]) -> None:
     """
     settings = get_settings()
     phases = envelope.get("phases", [])
-    with driver.session(database=settings.neo4j_database) as session:
-        session.run(
-            cypher,
-            estimate_id=envelope["estimate_id"],
-            project_name=envelope.get("project_name", ""),
-            status=envelope.get("status", "unknown"),
-            updated_at=datetime.utcnow().isoformat(),
-            raw_input=envelope.get("raw_input", "")[:5000],
-            phases=phases,
+    try:
+        with driver.session(database=settings.neo4j_database) as session:
+            session.run(
+                cypher,
+                estimate_id=envelope["estimate_id"],
+                project_name=envelope.get("project_name", ""),
+                status=envelope.get("status", "unknown"),
+                updated_at=datetime.now(UTC).isoformat(),
+                raw_input=envelope.get("raw_input", "")[:5000],
+                phases=phases,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "neo4j: save failed for estimate %s (%s); skipping",
+            envelope.get("estimate_id"),
+            exc,
         )
+        return
     logger.info(
         "neo4j: saved estimate %s (%d phase node(s))",
         envelope["estimate_id"],
         len(phases),
     )
+
+
+def _checkpoint_serde() -> Any:
+    """JsonPlus serializer with our state models on the msgpack allowlist.
+
+    LangGraph's msgpack serde warns on (and will eventually block) deserializing
+    custom types that aren't registered. Every custom type we put in the graph
+    state lives in `models.twin_outputs` / `models.project_schema` /
+    `models.estimation_state`, so we register every class defined in those modules.
+    This silences the warning AND adopts the explicit allowlist the warning
+    recommends, without hand-maintaining a list — new models in those modules are
+    picked up automatically. LangGraph's own checkpointed types are already covered
+    by its built-in SAFE_MSGPACK_TYPES, so passing our classes is sufficient.
+    """
+    import inspect
+
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    from models import estimation_state, project_schema, twin_outputs
+
+    allow: list[type] = [
+        obj
+        for mod in (twin_outputs, project_schema, estimation_state)
+        for _, obj in inspect.getmembers(mod, inspect.isclass)
+        if obj.__module__ == mod.__name__  # defined here, not imported
+    ]
+    return JsonPlusSerializer(allowed_msgpack_modules=allow)
 
 
 def make_checkpointer() -> Any:
@@ -115,4 +150,4 @@ def make_checkpointer() -> Any:
     """
     from langgraph.checkpoint.memory import InMemorySaver
 
-    return InMemorySaver()
+    return InMemorySaver(serde=_checkpoint_serde())

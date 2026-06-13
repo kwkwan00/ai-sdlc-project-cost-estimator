@@ -67,6 +67,57 @@ def test_build_twin_user_prompt_omits_calibration_when_phase_value_unset() -> No
     assert "calibration" not in prompt
 
 
+def test_build_twin_user_prompt_injects_reduction_guardrail() -> None:
+    from models.project_schema import AiToolingLevel, PhaseToolingLevels, Stage3Context
+
+    state = {
+        "raw_input": "Build a thing.",
+        "parsed_context": {},
+        "stage2": None,
+        "stage3": Stage3Context(
+            ai_tooling=PhaseToolingLevels(development=AiToolingLevel.AGENTIC)
+        ),
+        "clarifying_questions": [],
+    }
+    prompt = build_twin_user_prompt(state, pass_num=1, phase_value="development")
+    # DEVELOPMENT/AGENTIC default band is (0.36, 0.66) → 36.0–66.0%.
+    assert "ai_reduction_guardrail" in prompt
+    assert '"min_pct": 36' in prompt
+    assert '"max_pct": 66' in prompt
+    assert '"tooling_level": "agentic"' in prompt
+
+
+def test_build_twin_user_prompt_guardrail_respects_db_override() -> None:
+    from models.project_schema import AiToolingLevel, PhaseToolingLevels, Stage3Context
+
+    state = {
+        "raw_input": "Build a thing.",
+        "parsed_context": {},
+        "stage2": None,
+        "stage3": Stage3Context(
+            ai_tooling=PhaseToolingLevels(development=AiToolingLevel.AGENTIC)
+        ),
+        "clarifying_questions": [],
+        "reduction_bands": {"development": {"agentic": [0.30, 0.45]}},
+    }
+    prompt = build_twin_user_prompt(state, pass_num=1, phase_value="development")
+    assert '"min_pct": 30' in prompt
+    assert '"max_pct": 45' in prompt
+
+
+def test_build_twin_user_prompt_omits_guardrail_when_no_tooling() -> None:
+    # NONE tooling → band hi == 0 → nothing to propose, no guardrail block.
+    state = {
+        "raw_input": "Build a thing.",
+        "parsed_context": {},
+        "stage2": None,
+        "stage3": None,  # defaults → all phases NONE
+        "clarifying_questions": [],
+    }
+    prompt = build_twin_user_prompt(state, pass_num=1, phase_value="development")
+    assert "ai_reduction_guardrail" not in prompt
+
+
 def test_build_twin_user_prompt_pass2_includes_user_answers() -> None:
     from models.twin_outputs import ClarifyingQuestion
 

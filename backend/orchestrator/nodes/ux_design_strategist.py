@@ -6,8 +6,7 @@ import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from models.estimation_state import EstimationState
-from models.project_schema import RoleRoster, Stage3Maturity
+from models.project_schema import RoleRoster
 from models.twin_outputs import (
     Assumption,
     Gap,
@@ -15,17 +14,12 @@ from models.twin_outputs import (
     PhaseEstimate,
     Risk,
 )
-from observability.langfuse_wrapper import traced
-from orchestrator.llm import call_structured
 from orchestrator.role_attribution import attribute_roles
 
-from ._twin_base import build_twin_user_prompt, load_prompt, stub_phase_estimate
+from ._twin_base import make_twin_nodes
 from .discovery_analyst import pert_range
 
 logger = logging.getLogger(__name__)
-
-# Maturity caps for UX. Planning outline shows L3 strong-discovery → 15-25%, L4-5 → 25-40%.
-_MATURITY_CAP_UX = {1: 0.0, 2: 0.10, 3: 0.20, 4: 0.30, 5: 0.40}
 
 RESPONSIVE_MODIFIER = 1.35
 
@@ -70,19 +64,15 @@ def compute_scp_hours(inputs: UXSCPInputs) -> tuple[float, dict]:
     return manual_mid, {
         "raw_screen_points": raw_pts,
         "pre_responsive_hours": round(pre_responsive, 1),
-        "responsive_applied": inputs.is_responsive,
+        "responsive_modifier": RESPONSIVE_MODIFIER if inputs.is_responsive else 1.0,
     }
 
 
-def ai_reduction_for_maturity(level: int) -> float:
-    return _MATURITY_CAP_UX.get(level, 0.0)
-
-
 def build_phase_estimate(
-    inputs: UXSCPInputs, *, maturity_level: int, roster: RoleRoster
+    inputs: UXSCPInputs, *, effective_reduction: float, roster: RoleRoster
 ) -> PhaseEstimate:
     manual_mid, breakdown = compute_scp_hours(inputs)
-    ai_mid = manual_mid * (1 - ai_reduction_for_maturity(maturity_level))
+    ai_mid = manual_mid * (1 - effective_reduction)
 
     return PhaseEstimate(
         phase=Phase.UX_DESIGN,
@@ -99,40 +89,20 @@ def build_phase_estimate(
         ],
         gaps=inputs.gaps,
         confidence=inputs.confidence,
-        notes=f"SCP breakdown: {breakdown}. Maturity L{maturity_level}. {inputs.notes}".strip(),
+        breakdown=breakdown,
+        effective_ai_reduction_pct=round(effective_reduction * 100, 1),
+        notes=inputs.notes.strip(),
     )
 
 
-async def _run_ux(state: EstimationState, pass_num: int) -> PhaseEstimate:
-    stage3 = state.get("stage3") or Stage3Maturity()
-    stage2 = state.get("stage2")
-    roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
-    maturity = stage3.ux_design_maturity
-    try:
-        inputs = await call_structured(
-            system=load_prompt("ux_design_strategist"),
-            user=build_twin_user_prompt(state, pass_num=pass_num, phase_value="ux_design"),
-            response_model=UXSCPInputs,
-            tool_name="submit_scp_assessment",
-        )
-        est = build_phase_estimate(inputs, maturity_level=maturity, roster=roster)
-        logger.info(
-            "ux_design twin done: pass=%s ai_ml=%.0fh manual_ml=%.0fh",
-            pass_num,
-            est.ai_assisted_hours.most_likely,
-            est.manual_only_hours.most_likely,
-        )
-        return est
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("UX twin failed (%s); returning stub", exc)
-        return stub_phase_estimate(Phase.UX_DESIGN, "ux_design_strategist", "SCP", 230, 260, roster)
-
-
-@traced(name="twin.ux_design.p1")
-async def ux_design_pass1(state: EstimationState) -> dict:
-    return {"pass1_estimates": [await _run_ux(state, pass_num=1)]}
-
-
-@traced(name="twin.ux_design.p2")
-async def ux_design_pass2(state: EstimationState) -> dict:
-    return {"pass2_estimates": [await _run_ux(state, pass_num=2)]}
+ux_design_pass1, ux_design_pass2 = make_twin_nodes(
+    phase=Phase.UX_DESIGN,
+    prompt_name="ux_design_strategist",
+    tool_name="submit_scp_assessment",
+    response_model=UXSCPInputs,
+    build_fn=build_phase_estimate,
+    stub_algorithm="SCP",
+    stub_ai_mid=230,
+    stub_manual_mid=260,
+    trace_name="twin.ux_design",
+)

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  classifyToolingResponseSchema,
   customRoleSchema,
   DEFAULT_ROSTER,
   roleRosterSchema,
@@ -127,16 +128,80 @@ describe("stage2Schema", () => {
 });
 
 describe("stage3Schema", () => {
-  it("defaults all maturity levels to 1", () => {
+  it("defaults codebase_context, a blank tooling description, and per-phase ai_tooling to 'none'", () => {
     const result = stage3Schema.parse({});
-    expect(result.discovery_maturity).toBe(1);
-    expect(result.ux_design_maturity).toBe(1);
-    expect(result.qa_testing_maturity).toBe(1);
+    expect(result.codebase_context).toBe("greenfield");
+    expect(result.ai_tooling_description).toBe("");
+    expect(result.ai_tooling).toEqual({
+      discovery: "none",
+      ux_design: "none",
+      development: "none",
+      code_review: "none",
+      deployment: "none",
+      qa_testing: "none",
+    });
   });
 
-  it("rejects maturity levels outside 1..5", () => {
-    expect(stage3Schema.safeParse({ discovery_maturity: 0 }).success).toBe(false);
-    expect(stage3Schema.safeParse({ discovery_maturity: 6 }).success).toBe(false);
-    expect(stage3Schema.safeParse({ discovery_maturity: 3 }).success).toBe(true);
+  it("keeps the freeform tooling description the user typed", () => {
+    const result = stage3Schema.parse({
+      ai_tooling_description: "Claude Code for dev, CodeRabbit on PRs",
+    });
+    expect(result.ai_tooling_description).toBe(
+      "Claude Code for dev, CodeRabbit on PRs"
+    );
+    // Description alone does not set any per-phase level — classification fills those.
+    expect(result.ai_tooling.development).toBe("none");
+  });
+
+  it("applies a per-phase tooling value while defaulting the rest to 'none'", () => {
+    const result = stage3Schema.parse({ ai_tooling: { development: "agentic" } });
+    expect(result.ai_tooling.development).toBe("agentic");
+    expect(result.ai_tooling.discovery).toBe("none");
+    expect(result.ai_tooling.ux_design).toBe("none");
+    expect(result.ai_tooling.code_review).toBe("none");
+    expect(result.ai_tooling.deployment).toBe("none");
+    expect(result.ai_tooling.qa_testing).toBe("none");
+  });
+
+  it("rejects an invalid enum value", () => {
+    expect(stage3Schema.safeParse({ codebase_context: "nope" }).success).toBe(false);
+    expect(
+      stage3Schema.safeParse({ ai_tooling: { development: "bogus" } }).success
+    ).toBe(false);
+  });
+
+  it("accepts valid enum values", () => {
+    const result = stage3Schema.safeParse({
+      codebase_context: "brownfield_large_familiar",
+      ai_tooling: { development: "agentic", qa_testing: "chat" },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.codebase_context).toBe("brownfield_large_familiar");
+      expect(result.data.ai_tooling.development).toBe("agentic");
+      expect(result.data.ai_tooling.qa_testing).toBe("chat");
+      expect(result.data.ai_tooling.discovery).toBe("none");
+    }
+  });
+});
+
+describe("classifyToolingResponseSchema", () => {
+  it("parses the classify-tooling endpoint response", () => {
+    const result = classifyToolingResponseSchema.parse({
+      ai_tooling: { development: "agentic", code_review: "agentic" },
+      unknown_tools: ["ZebraAI"],
+      notes: "Claude Code → dev+review",
+    });
+    expect(result.ai_tooling.development).toBe("agentic");
+    expect(result.ai_tooling.discovery).toBe("none"); // unspecified phases default
+    expect(result.unknown_tools).toEqual(["ZebraAI"]);
+  });
+
+  it("defaults unknown_tools and notes when omitted", () => {
+    const result = classifyToolingResponseSchema.parse({
+      ai_tooling: { development: "chat" },
+    });
+    expect(result.unknown_tools).toEqual([]);
+    expect(result.notes).toBe("");
   });
 });

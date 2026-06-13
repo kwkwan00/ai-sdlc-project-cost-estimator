@@ -11,7 +11,7 @@ import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from db.repositories import get_calibration_for_all_phases
+from db.repositories import get_calibration_for_all_phases, get_reduction_bands
 from models.estimation_state import EstimationState
 from observability.langfuse_wrapper import traced
 from orchestrator.llm import call_structured
@@ -92,6 +92,19 @@ async def _load_calibration(state: EstimationState) -> list[dict]:
     return flat
 
 
+async def _load_reduction_bands() -> dict:
+    """DB-tunable per-(phase, tooling) reduction guardrail bands → graph state.
+
+    Returns {} when Postgres is disabled/unreachable, so twins fall back to the
+    in-code ``DEFAULT_BANDS`` in orchestrator/ai_acceleration.py.
+    """
+    try:
+        return await get_reduction_bands()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reduction-band fetch failed (%s); twins will use code defaults", exc)
+        return {}
+
+
 @traced(name="parse_input")
 async def parse_input(state: EstimationState) -> dict:
     # Short-circuit when an external caller has pre-populated parsed_context
@@ -99,8 +112,13 @@ async def parse_input(state: EstimationState) -> dict:
     existing = state.get("parsed_context") or {}
     if existing:
         calibration = await _load_calibration(state)
+        bands = await _load_reduction_bands()
         logger.debug("parse_input: pre-populated context; %d calibration row(s) loaded", len(calibration))
-        return {"parsed_context": existing, "calibration_examples": calibration}
+        return {
+            "parsed_context": existing,
+            "calibration_examples": calibration,
+            "reduction_bands": bands,
+        }
 
     parsed = await extract_context_from_raw(state["raw_input"])
     parsed_dict = parsed.model_dump()
@@ -118,8 +136,13 @@ async def parse_input(state: EstimationState) -> dict:
     # the LLM-extracted industry / project_type hints.
     state_after = {**state, "parsed_context": parsed_dict}
     calibration = await _load_calibration(state_after)  # type: ignore[arg-type]
+    bands = await _load_reduction_bands()
     logger.debug("parse_input: %d calibration row(s) loaded", len(calibration))
-    return {"parsed_context": parsed_dict, "calibration_examples": calibration}
+    return {
+        "parsed_context": parsed_dict,
+        "calibration_examples": calibration,
+        "reduction_bands": bands,
+    }
 
 
 async def extract_context_from_raw(raw_input: str) -> ParsedContext:

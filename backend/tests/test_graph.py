@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from langgraph.types import Command
 
-from models.project_schema import Stage2Context, Stage3Maturity
+from models.project_schema import Stage2Context, Stage3Context
 
 
 @pytest.fixture
@@ -62,7 +62,7 @@ async def test_graph_compiles_and_interrupts_at_stage4(graph) -> None:
         "project_name": "Patient portal",
         "raw_input": "Build a HIPAA-compliant patient portal.",
         "stage2": Stage2Context(industry="healthcare", target_timeline_weeks=20),
-        "stage3": Stage3Maturity(),
+        "stage3": Stage3Context(),
         "parsed_context": {},
     }
 
@@ -85,7 +85,7 @@ async def test_graph_resumes_to_final_estimate(graph) -> None:
         "project_name": "Patient portal",
         "raw_input": "Build a HIPAA-compliant patient portal.",
         "stage2": Stage2Context(industry="healthcare", target_timeline_weeks=20),
-        "stage3": Stage3Maturity(),
+        "stage3": Stage3Context(),
         "parsed_context": {},
     }
     await graph.ainvoke(initial, config=config)

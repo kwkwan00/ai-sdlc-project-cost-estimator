@@ -22,8 +22,7 @@ from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from models.estimation_state import EstimationState
-from models.project_schema import RoleRoster, Stage3Maturity
+from models.project_schema import RoleRoster
 from models.twin_outputs import (
     Assumption,
     Gap,
@@ -32,18 +31,11 @@ from models.twin_outputs import (
     PhaseEstimate,
     Risk,
 )
-from observability.langfuse_wrapper import traced
-from orchestrator.llm import call_structured
 from orchestrator.role_attribution import attribute_roles
 
-from ._twin_base import build_twin_user_prompt, load_prompt, stub_phase_estimate
+from ._twin_base import make_twin_nodes
 
 logger = logging.getLogger(__name__)
-
-
-# Maturity-level effective AI reduction caps (Discovery phase).
-# Drawn from planning outline §3.1.3 (Level 3 example showed ~30% cap).
-_MATURITY_CAP = {1: 0.0, 2: 0.15, 3: 0.30, 4: 0.50, 5: 0.65}
 
 
 class DecisionMakerAccessibility(str, Enum):
@@ -143,28 +135,17 @@ def pert_range(mid: float, *, opt_factor: float = 0.78, pess_factor: float = 1.3
     )
 
 
-def ai_reduction_for_maturity(maturity_level: int) -> float:
-    """Return the effective AI reduction factor (0..1) for Discovery at this maturity."""
-    return _MATURITY_CAP.get(maturity_level, 0.0)
-
-
 def build_phase_estimate(
     inputs: DiscoveryUCPInputs,
     *,
-    maturity_level: int,
+    effective_reduction: float,
     roster: RoleRoster,
 ) -> PhaseEstimate:
     manual_mid, breakdown = compute_ucp_hours(inputs)
     manual_range = pert_range(manual_mid)
 
-    ai_reduction = ai_reduction_for_maturity(maturity_level)
-    ai_mid = manual_mid * (1 - ai_reduction)
+    ai_mid = manual_mid * (1 - effective_reduction)
     ai_range = pert_range(ai_mid)
-
-    notes = (
-        f"UCP breakdown: {breakdown}. Maturity L{maturity_level} → "
-        f"{int(ai_reduction * 100)}% AI reduction. {inputs.notes}".strip()
-    )
 
     return PhaseEstimate(
         phase=Phase.DISCOVERY,
@@ -186,50 +167,20 @@ def build_phase_estimate(
         ],
         gaps=inputs.gaps,
         confidence=inputs.confidence,
-        notes=notes,
+        breakdown=breakdown,
+        effective_ai_reduction_pct=round(effective_reduction * 100, 1),
+        notes=inputs.notes.strip(),
     )
 
 
-def _roster_for(state: EstimationState) -> RoleRoster:
-    """Pull the roster from Stage 2; fall back to the default if absent."""
-    stage2 = state.get("stage2")
-    return stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
-
-
-async def _run_discovery(state: EstimationState, pass_num: int) -> PhaseEstimate:
-    stage3 = state.get("stage3") or Stage3Maturity()
-    roster = _roster_for(state)
-    maturity = stage3.discovery_maturity
-
-    try:
-        system = load_prompt("discovery_analyst")
-        user_prompt = build_twin_user_prompt(state, pass_num=pass_num, phase_value="discovery")
-        inputs = await call_structured(
-            system=system,
-            user=user_prompt,
-            response_model=DiscoveryUCPInputs,
-            tool_name="submit_ucp_assessment",
-        )
-        est = build_phase_estimate(inputs, maturity_level=maturity, roster=roster)
-        logger.info(
-            "discovery twin done: pass=%s ai_ml=%.0fh manual_ml=%.0fh",
-            pass_num,
-            est.ai_assisted_hours.most_likely,
-            est.manual_only_hours.most_likely,
-        )
-        return est
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Discovery twin failed (%s); returning stub estimate", exc)
-        return stub_phase_estimate(
-            Phase.DISCOVERY, "discovery_analyst", "UCP", 200, 240, roster
-        )
-
-
-@traced(name="twin.discovery_analyst.p1")
-async def discovery_analyst_pass1(state: EstimationState) -> dict:
-    return {"pass1_estimates": [await _run_discovery(state, pass_num=1)]}
-
-
-@traced(name="twin.discovery_analyst.p2")
-async def discovery_analyst_pass2(state: EstimationState) -> dict:
-    return {"pass2_estimates": [await _run_discovery(state, pass_num=2)]}
+discovery_analyst_pass1, discovery_analyst_pass2 = make_twin_nodes(
+    phase=Phase.DISCOVERY,
+    prompt_name="discovery_analyst",
+    tool_name="submit_ucp_assessment",
+    response_model=DiscoveryUCPInputs,
+    build_fn=build_phase_estimate,
+    stub_algorithm="UCP",
+    stub_ai_mid=200,
+    stub_manual_mid=240,
+    trace_name="twin.discovery_analyst",
+)

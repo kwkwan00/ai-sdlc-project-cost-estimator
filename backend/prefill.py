@@ -200,6 +200,9 @@ class Stage2Prefill(BaseModel):
     stage2: Stage2Fields
     summary: str = Field(default="")
     ambiguity_score: float = Field(default=0.5, ge=0, le=1)
+    # AI tools the description mentions, for pre-filling the Stage 3 tooling field.
+    # Empty string when none were named.
+    ai_tooling_description: str = Field(default="")
 
 
 def _normalize_regulatory(mentions: list[str]) -> list[str]:
@@ -271,6 +274,10 @@ class NormalizedProjectContext(BaseModel):
     regulatory_requirements: list[RegulatoryRequirement] = Field(default_factory=list)
     summary: str = Field(default="")
     ambiguity_score: float = Field(default=0.5, ge=0, le=1)
+    # Any AI development tools the description explicitly mentions, as a short phrase
+    # the Stage 3 tooling field can be pre-filled with (e.g. "Claude Code for dev,
+    # CodeRabbit for review"). Empty when the description names no AI tools.
+    ai_tooling_description: str = Field(default="", max_length=2000)
 
     @field_validator("industry", mode="before")
     @classmethod
@@ -381,4 +388,5 @@ async def prefill_stage2_from_raw(raw_input: str) -> Stage2Prefill:
         stage2=_normalized_to_fields(normalized),
         summary=normalized.summary,
         ambiguity_score=normalized.ambiguity_score,
+        ai_tooling_description=normalized.ai_tooling_description,
     )

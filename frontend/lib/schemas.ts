@@ -112,14 +112,58 @@ export const stage2Schema = z.object({
   roster: roleRosterSchema.default({ roles: DEFAULT_ROSTER }),
 });
 
-export const stage3Schema = z.object({
-  discovery_maturity: z.number().int().min(1).max(5).default(1),
-  ux_design_maturity: z.number().int().min(1).max(5).default(1),
-  development_maturity: z.number().int().min(1).max(5).default(1),
-  code_review_maturity: z.number().int().min(1).max(5).default(1),
-  deployment_maturity: z.number().int().min(1).max(5).default(1),
-  qa_testing_maturity: z.number().int().min(1).max(5).default(1),
+export const codebaseContextSchema = z.enum([
+  "greenfield",
+  "brownfield_small",
+  "brownfield_large_unfamiliar",
+  "brownfield_large_familiar",
+]);
+
+export const aiToolingLevelSchema = z.enum([
+  "none",
+  "autocomplete",
+  "chat",
+  "agentic",
+]);
+
+export const phaseToolingSchema = z.object({
+  discovery: aiToolingLevelSchema.default("none"),
+  ux_design: aiToolingLevelSchema.default("none"),
+  development: aiToolingLevelSchema.default("none"),
+  code_review: aiToolingLevelSchema.default("none"),
+  deployment: aiToolingLevelSchema.default("none"),
+  qa_testing: aiToolingLevelSchema.default("none"),
 });
+
+const NO_TOOLING = {
+  discovery: "none",
+  ux_design: "none",
+  development: "none",
+  code_review: "none",
+  deployment: "none",
+  qa_testing: "none",
+} as const;
+
+export const stage3Schema = z.object({
+  codebase_context: codebaseContextSchema.default("greenfield"),
+  // The user describes their AI tooling in free text; a backend agent classifies
+  // it into per-phase levels on submit. `ai_tooling` holds that classified result
+  // (all "none" until classified, so a blank description never inflates the estimate).
+  ai_tooling_description: z.string().max(2000).default(""),
+  ai_tooling: phaseToolingSchema.default({ ...NO_TOOLING }),
+});
+
+// Response of POST /estimates/draft/classify-tooling.
+export const classifyToolingResponseSchema = z.object({
+  ai_tooling: phaseToolingSchema,
+  unknown_tools: z.array(z.string()).default([]),
+  notes: z.string().default(""),
+});
+
+export type CodebaseContext = z.infer<typeof codebaseContextSchema>;
+export type AiToolingLevel = z.infer<typeof aiToolingLevelSchema>;
+export type PhaseTooling = z.infer<typeof phaseToolingSchema>;
+export type ClassifyToolingResponse = z.infer<typeof classifyToolingResponseSchema>;
 
 export const stage1Schema = z.object({
   project_name: z.string().optional(),
@@ -178,3 +222,56 @@ export const ROLE_SENIORITY_LABELS: Record<RoleSeniority, string> = {
   junior: "Junior",
   other: "Other",
 };
+
+export const CODEBASE_CONTEXT_LABELS: Record<CodebaseContext, string> = {
+  greenfield: "Greenfield (new codebase)",
+  brownfield_small: "Brownfield — small / modular",
+  brownfield_large_unfamiliar: "Brownfield — large, unfamiliar to the team",
+  brownfield_large_familiar: "Brownfield — large, well-known to the team",
+};
+
+export const AI_TOOLING_LEVEL_LABELS: Record<AiToolingLevel, string> = {
+  none: "None (no AI tooling)",
+  autocomplete: "Inline autocomplete (Copilot-style)",
+  chat: "AI chat alongside coding",
+  agentic: "Agentic coding (Cursor / Claude Code)",
+};
+
+export type PhaseToolingKey = keyof z.infer<typeof phaseToolingSchema>;
+
+export const PHASE_TOOLING_META: {
+  key: PhaseToolingKey;
+  label: string;
+  examples: string;
+}[] = [
+  {
+    key: "discovery",
+    label: "Discovery / Requirements",
+    examples: "Claude, Claude Cowork (research, summarization)",
+  },
+  {
+    key: "ux_design",
+    label: "UX / Design",
+    examples: "Figma AI, Claude Cowork, v0",
+  },
+  {
+    key: "development",
+    label: "Development",
+    examples: "Claude Code, Cursor, GitHub Copilot",
+  },
+  {
+    key: "code_review",
+    label: "Code Review",
+    examples: "Claude Code, CodeRabbit, Greptile",
+  },
+  {
+    key: "deployment",
+    label: "Deployment / DevOps",
+    examples: "Harness.io, AI CI/CD copilots",
+  },
+  {
+    key: "qa_testing",
+    label: "QA / Testing",
+    examples: "LangSmith, AI test generation",
+  },
+];

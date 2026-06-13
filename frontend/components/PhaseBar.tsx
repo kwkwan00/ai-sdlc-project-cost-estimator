@@ -31,7 +31,7 @@ export function PhaseBar({ phases, mode }: Props) {
   });
 
   return (
-    <div className="h-72 w-full">
+    <div className="h-[26rem] w-full">
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} layout="vertical" margin={{ top: 8, right: 24, left: 24, bottom: 8 }}>
           <CartesianGrid strokeDasharray="3 3" />

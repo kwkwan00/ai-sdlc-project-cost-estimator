@@ -149,16 +149,70 @@ class Stage2Context(BaseModel):
     roster: RoleRoster = Field(default_factory=RoleRoster.default)
 
 
-class Stage3Maturity(BaseModel):
-    """AI maturity per phase (1-5). Defaults to Level 1."""
+class CodebaseContext(str, Enum):
+    """Where the work lands — the single biggest moderator of realized AI speedup.
+
+    Greenfield captures the most; a large mature codebase the team knows well
+    captures the least and can go net-negative (AI's prompt + verification overhead
+    exceeds its help — see METR 2025). Unfamiliar large code sits in between: AI
+    aids navigation but context-loading taxes it.
+    """
+
+    GREENFIELD = "greenfield"
+    BROWNFIELD_SMALL = "brownfield_small"
+    BROWNFIELD_LARGE_UNFAMILIAR = "brownfield_large_unfamiliar"
+    BROWNFIELD_LARGE_FAMILIAR = "brownfield_large_familiar"
+
+
+class AiToolingLevel(str, Enum):
+    """How the team actually applies AI day-to-day — concrete tooling, not an
+    abstract 'maturity'. Higher tiers capture more of a task's AI potential but
+    carry more review/verification overhead.
+    """
+
+    NONE = "none"
+    AUTOCOMPLETE = "autocomplete"
+    CHAT = "chat"
+    AGENTIC = "agentic"
+
+
+class PhaseToolingLevels(BaseModel):
+    """AI tooling level per SDLC phase. Tooling is phase-specific — different tools
+    serve different stages (Claude Code for development/review, Figma AI & Claude
+    Cowork for UX, Harness.io for deployment, LangSmith for QA), so a team often has
+    strong AI assist in one phase and none in another. Each phase defaults to NONE.
+    """
 
     model_config = ConfigDict(extra="forbid")
-    discovery_maturity: int = Field(default=1, ge=1, le=5)
-    ux_design_maturity: int = Field(default=1, ge=1, le=5)
-    development_maturity: int = Field(default=1, ge=1, le=5)
-    code_review_maturity: int = Field(default=1, ge=1, le=5)
-    deployment_maturity: int = Field(default=1, ge=1, le=5)
-    qa_testing_maturity: int = Field(default=1, ge=1, le=5)
+    discovery: AiToolingLevel = AiToolingLevel.NONE
+    ux_design: AiToolingLevel = AiToolingLevel.NONE
+    development: AiToolingLevel = AiToolingLevel.NONE
+    code_review: AiToolingLevel = AiToolingLevel.NONE
+    deployment: AiToolingLevel = AiToolingLevel.NONE
+    qa_testing: AiToolingLevel = AiToolingLevel.NONE
+
+
+class Stage3Context(BaseModel):
+    """Stage 3: the factors that drive how much AI accelerates THIS project.
+
+    Replaces the old per-phase "AI maturity" sliders — that scale measured
+    org/agent AI maturity, not development acceleration. Realized AI reduction is
+    derived per phase from task amenability (LLM-assessed per phase) × codebase
+    context × team seniority (from the Stage 2 roster) × that phase's AI tooling,
+    minus a verification tax, and may go negative. See `orchestrator/ai_acceleration.py`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    codebase_context: CodebaseContext = CodebaseContext.GREENFIELD
+    # Per-phase tooling levels the twins consume. In the Stage 3 wizard these are
+    # no longer entered by hand — the classifier agent derives them from
+    # `ai_tooling_description` (see backend/tooling_classifier.py). Defaults to NONE
+    # so an unclassified / blank description never inflates the AI reduction.
+    ai_tooling: PhaseToolingLevels = Field(default_factory=PhaseToolingLevels)
+    # The user's freeform description of the AI tools they use (e.g. "Claude Code
+    # for dev, CodeRabbit for review, Figma AI for design"). Persisted for audit /
+    # transparency; the classified `ai_tooling` above is what drives the estimate.
+    ai_tooling_description: str = Field(default="", max_length=2000)
 
 
 class CreateEstimateRequest(BaseModel):
@@ -166,7 +220,7 @@ class CreateEstimateRequest(BaseModel):
     project_name: str | None = None
     raw_input: str = Field(min_length=10, description="Stage 1: unstructured project description")
     stage2: Stage2Context | None = None
-    stage3: Stage3Maturity | None = None
+    stage3: Stage3Context | None = None
 
 
 class AnswerSubmission(BaseModel):
