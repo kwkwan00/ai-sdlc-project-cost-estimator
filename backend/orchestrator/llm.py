@@ -14,7 +14,7 @@ import time
 from typing import Any, TypeVar
 
 from anthropic import AsyncAnthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from config import get_settings
 from observability.langfuse_wrapper import traced
@@ -132,53 +132,78 @@ async def call_structured(
         response_model.__name__,
     )
 
-    started = time.perf_counter()
-    try:
-        response = await client.messages.create(**create_kwargs)
-    except Exception as exc:  # noqa: BLE001
-        if "output_config" in create_kwargs:
-            logger.warning(
-                "messages.create rejected output_config (%s); retrying without it", exc
+    # One attempt: create (with the output_config fallback) → record usage → parse the
+    # forced tool input into the response model.
+    async def _attempt(*, corrective: bool) -> T:
+        kwargs = dict(create_kwargs)
+        if corrective:
+            # Retried after a transient structured-output slip (the model emitted a
+            # field outside the tool schema or skipped a required one). Reinforce the
+            # contract so the second attempt recovers instead of falling back to a stub.
+            kwargs["system"] = (
+                str(kwargs["system"])
+                + "\n\nIMPORTANT: Reply by calling the tool with ONLY the fields defined "
+                "in its input schema — include every required field and add no extra fields."
             )
-            create_kwargs.pop("output_config", None)
-            response = await client.messages.create(**create_kwargs)
-        else:
-            raise
+        started = time.perf_counter()
+        try:
+            response = await client.messages.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if "output_config" in kwargs:
+                logger.warning(
+                    "messages.create rejected output_config (%s); retrying without it", exc
+                )
+                kwargs.pop("output_config", None)
+                response = await client.messages.create(**kwargs)
+            else:
+                raise
 
-    # Every LLM / forced-tool call is logged at INFO with cost + latency so the
-    # operational narrative shows model usage without needing Langfuse enabled.
-    usage = getattr(response, "usage", None)
-    # Record token usage into the active per-estimate accumulator (no-op when none
-    # is bound — e.g. tests, the stub path, pre-submission agents).
-    from orchestrator.usage import record_usage
+        # Every LLM / forced-tool call is logged at INFO with cost + latency so the
+        # operational narrative shows model usage without needing Langfuse enabled.
+        # Both attempts cost tokens, so usage is recorded on each.
+        usage = getattr(response, "usage", None)
+        from orchestrator.usage import record_usage
 
-    record_usage(
-        model=use_model,
-        input_tokens=getattr(usage, "input_tokens", 0) or 0,
-        output_tokens=getattr(usage, "output_tokens", 0) or 0,
-        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-    )
-    logger.info(
-        "llm call ✓ model=%s tool=%s latency=%dms stop=%s "
-        "tokens(in/out/cache_read)=%s/%s/%s",
-        use_model,
-        tool_name,
-        int((time.perf_counter() - started) * 1000),
-        response.stop_reason,
-        getattr(usage, "input_tokens", None),
-        getattr(usage, "output_tokens", None),
-        getattr(usage, "cache_read_input_tokens", None),
-    )
+        record_usage(
+            model=use_model,
+            input_tokens=getattr(usage, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage, "output_tokens", 0) or 0,
+            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        )
+        logger.info(
+            "llm call ✓ model=%s tool=%s latency=%dms stop=%s "
+            "tokens(in/out/cache_read)=%s/%s/%s",
+            use_model,
+            tool_name,
+            int((time.perf_counter() - started) * 1000),
+            response.stop_reason,
+            getattr(usage, "input_tokens", None),
+            getattr(usage, "output_tokens", None),
+            getattr(usage, "cache_read_input_tokens", None),
+        )
 
-    for block in response.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == tool_name:
-            return response_model.model_validate(block.input)
+        for block in response.content:
+            if getattr(block, "type", None) == "tool_use" and block.name == tool_name:
+                return response_model.model_validate(block.input)
 
-    raise RuntimeError(
-        f"Claude did not return tool_use for {tool_name}. "
-        f"Stop reason: {response.stop_reason}. Content types: "
-        f"{[getattr(b, 'type', '?') for b in response.content]}"
-    )
+        raise RuntimeError(
+            f"Claude did not return tool_use for {tool_name}. "
+            f"Stop reason: {response.stop_reason}. Content types: "
+            f"{[getattr(b, 'type', '?') for b in response.content]}"
+        )
+
+    # One-shot retry on a transient structured-output failure — a tool input that
+    # fails Pydantic validation (e.g. an extra field under extra="forbid"), or no
+    # tool_use block at all. The model usually recovers on a second, more-strongly
+    # instructed attempt; only a double failure propagates (twins then fall back to a
+    # stub). Real API errors from messages.create surface immediately, not here.
+    try:
+        return await _attempt(corrective=False)
+    except (ValidationError, RuntimeError) as exc:
+        logger.warning(
+            "structured output for tool %s failed (%s); retrying once", tool_name, exc
+        )
+        return await _attempt(corrective=True)
 
 
 @traced(name="claude-mcp-research", as_type="generation")

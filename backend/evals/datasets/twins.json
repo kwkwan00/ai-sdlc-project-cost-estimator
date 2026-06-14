@@ -85,11 +85,11 @@
       "raw_input": "HIPAA patient scheduling portal. Greenfield, agentic dev + agentic review tooling. Security-sensitive (PHI). 4 integrations.",
       "parsed_context": {"industry_hint": "healthcare", "summary": "PHI-handling portal needing rigorous review."},
       "stage2": {"industry": "healthcare", "project_type": "greenfield", "regulatory_requirements": ["HIPAA"], "integration_count": 4},
-      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"code_review": "agentic"}}
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"development": "agentic", "code_review": "agentic"}}
     },
     "expected_output": "A Fagan-inspection code-review estimate that scales review/rework hours to the dev volume and elevates rigor for PHI/security-sensitive code; both scenario ranges; review-rate and rework breakdown; junior reviewers capped; role-hours present.",
-    "gold": {"target_manual_ml": 130, "target_ai_ml": 101},
-    "notes": "Code review twin uses Fagan. Targets from planning-outline lines 1992/2012-2013 (Code Review: manual mid 130, AI mid 101). Wide-tolerance drift detector."
+    "gold": {"target_manual_ml": 125, "target_ai_ml": 113},
+    "notes": "Code review twin uses Fagan. Targets are a Sonnet-regime drift-detection baseline (median of fresh runs with the agentic-dev context), not the outline's hand-tuned numbers. Wide-tolerance drift detector."
   },
   {
     "id": "twin-deployment-healthcare",
@@ -174,7 +174,7 @@
       "raw_input": "Fintech KYC onboarding app. Greenfield, agentic dev + agentic review. Handles PII and payment data; SOC 2 + PCI-DSS. Risk-scoring logic must be reviewed carefully.",
       "parsed_context": {"industry_hint": "fintech", "summary": "PII/payment data; high review rigor."},
       "stage2": {"industry": "fintech", "project_type": "greenfield", "regulatory_requirements": ["SOC 2", "PCI-DSS"], "integration_count": 4},
-      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"code_review": "agentic"}}
+      "stage3": {"codebase_context": "greenfield", "ai_tooling": {"development": "agentic", "code_review": "agentic"}}
     },
     "expected_output": "A Fagan code-review estimate elevating rigor for payment/PII and risk-scoring code; review-rate + rework breakdown; junior reviewers capped; both scenario ranges; role-hours present.",
     "notes": "Code review twin, fintech."

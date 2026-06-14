@@ -79,6 +79,13 @@ integrations/features, regulatory regimes not mentioned, or quantities (screen c
 integration counts) not implied by the description. A high score means every material
 claim is grounded; a low score means the output invents facts the context does not support.
 
+NOTE on the AI reduction guardrail: a twin's `effective_ai_reduction_pct` is a
+POST-SCALING system value. The proposed reduction is clamped into the guardrail band,
+then the system scales it down by codebase context and team seniority, so the effective
+value may legitimately fall BELOW the band's `min_pct` (even go negative). Do NOT treat
+`effective_ai_reduction_pct` being below the guardrail minimum as a violation,
+contradiction, or unfaithful claim — that is expected, correct behavior.
+
 Steps:
 1. Enumerate the output's material claims/assumptions/numbers.
 2. For each, mark whether the grounding context supports it (supported_claims) or it is
