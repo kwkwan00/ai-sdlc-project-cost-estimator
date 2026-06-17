@@ -184,3 +184,18 @@ class AiReductionBand(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class StaffingCoefficient(Base):
+    """Tunable team-scaling coefficient (Brooks coordination overhead + the diminishing-returns
+    exponent), keyed by name. Admin-editable so the staffing model can be retuned without a
+    deploy; ``orchestrator/staffing.py::DEFAULT_STAFFING_COEFFS`` holds the same defaults as a
+    fallback when this table is empty/unavailable."""
+
+    __tablename__ = "staffing_coefficients"
+
+    coefficient: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[float] = mapped_column(Float)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

@@ -8,20 +8,27 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from models.project_schema import RoleRoster
 from models.twin_outputs import (
-    Assumption,
     Gap,
     Phase,
     PhaseEstimate,
-    Risk,
+    RiskInputList,
 )
-from orchestrator.role_attribution import attribute_roles
+from orchestrator.montecarlo import (
+    DEFAULT_DRAWS,
+    Range3,
+    ReductionSampler,
+    propagate_phase,
+    resolve_size_band,
+)
 
-from ._twin_base import make_twin_nodes
-from .discovery_analyst import pert_range
+from ._twin_base import assemble_phase_estimate, make_twin_nodes, risk_specs_from
 
 logger = logging.getLogger(__name__)
 
-RESPONSIVE_MODIFIER = 1.35
+RESPONSIVE_MODIFIER = 1.15
+
+# Bounds the continuous iteration-factor driver (matches the field's ge/le).
+_IF_LO, _IF_HI = 1.0, 2.5
 
 
 class UXSCPInputs(BaseModel):
@@ -40,8 +47,15 @@ class UXSCPInputs(BaseModel):
 
     is_responsive: bool = False
 
+    # Monte Carlo uncertainty (optional). The least-certain size driver here is the
+    # continuous iteration factor (design rounds); the LLM may give an ~80% band for
+    # it, or a fallback coefficient-of-variation. No `reduction_range`: UX does not
+    # propose an AI reduction (it spreads the guardrail band instead).
+    iteration_factor_range: Range3 | None = None
+    estimate_cov: float | None = Field(default=None, ge=0, le=0.6)
+
     assumptions: list[str] = Field(default_factory=list, max_length=6)
-    risks: list[str] = Field(default_factory=list, max_length=5)
+    risks: RiskInputList = Field(default_factory=list, max_length=5)
     gaps: list[Gap] = Field(default_factory=list, max_length=4)
     confidence: float = Field(ge=0, le=1)
     notes: str = ""
@@ -68,29 +82,54 @@ def compute_scp_hours(inputs: UXSCPInputs) -> tuple[float, dict]:
     }
 
 
-def build_phase_estimate(
-    inputs: UXSCPInputs, *, effective_reduction: float, roster: RoleRoster
-) -> PhaseEstimate:
-    manual_mid, breakdown = compute_scp_hours(inputs)
-    ai_mid = manual_mid * (1 - effective_reduction)
+def _uncertain_fields_ux(inputs: UXSCPInputs) -> dict[str, tuple[float, float, float]]:
+    """Resolve the size band onto the continuous iteration factor (the least-certain
+    driver), clamped to its [1.0, 2.5] bounds. Mirrors ``_uncertain_fields_dev``."""
+    band = resolve_size_band(
+        point_value=inputs.iteration_factor,
+        explicit=inputs.iteration_factor_range,
+        estimate_cov=inputs.estimate_cov,
+        confidence=inputs.confidence,
+        lo_bound=_IF_LO,
+        hi_bound=_IF_HI,
+    )
+    return {"iteration_factor": band} if band else {}
 
-    return PhaseEstimate(
+
+def build_phase_estimate(
+    inputs: UXSCPInputs,
+    *,
+    effective_reduction: float,
+    roster: RoleRoster,
+    rng,
+    reduction_sampler: ReductionSampler,
+) -> PhaseEstimate:
+    point_mid, breakdown = compute_scp_hours(inputs)
+    manual_mc, ai_mc = propagate_phase(
+        inputs,
+        compute_scp_hours,
+        size_fields=_uncertain_fields_ux(inputs),
+        reduction_sampler=reduction_sampler,
+        risk_specs=risk_specs_from(inputs.risks),
+        eff_point=effective_reduction,
+        n_draws=DEFAULT_DRAWS,
+        rng=rng,
+    )
+    ai_mid = point_mid * (1 - effective_reduction)
+
+    return assemble_phase_estimate(
         phase=Phase.UX_DESIGN,
         twin_name="ux_design_strategist",
         algorithm="SCP",
-        ai_assisted_hours=pert_range(ai_mid),
-        manual_only_hours=pert_range(manual_mid),
-        ai_assisted_role_hours=attribute_roles(ai_mid, roster, Phase.UX_DESIGN),
-        manual_only_role_hours=attribute_roles(manual_mid, roster, Phase.UX_DESIGN),
-        assumptions=[Assumption(text=a, impact_hours=manual_mid * 0.1) for a in inputs.assumptions],
-        risks=[
-            Risk(description=r, likelihood=0.4, impact_hours_low=manual_mid * 0.1, impact_hours_high=manual_mid * 0.3)
-            for r in inputs.risks
-        ],
-        gaps=inputs.gaps,
-        confidence=inputs.confidence,
+        point_mid=point_mid,
+        ai_mid=ai_mid,
+        manual_mc=manual_mc,
+        ai_mc=ai_mc,
+        roster=roster,
+        inputs=inputs,
         breakdown=breakdown,
-        effective_ai_reduction_pct=round(effective_reduction * 100, 1),
+        effective_reduction=effective_reduction,
+        assumption_impact_factor=0.1,
         notes=inputs.notes.strip(),
     )
 

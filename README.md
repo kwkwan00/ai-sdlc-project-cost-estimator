@@ -22,7 +22,9 @@ All three are best-effort: the backend keeps running when any of them is unavail
 
 - [What it does](#what-it-does)
 - [The six twins](#the-six-twins)
+- [Monte Carlo uncertainty](#monte-carlo-uncertainty)
 - [Orchestrator architecture](#orchestrator-architecture)
+- [Team-scaling model](#team-scaling-model)
 - [Tech stack](#tech-stack)
 - [Repository layout](#repository-layout)
 - [Quickstart — local development](#quickstart--local-development)
@@ -48,7 +50,7 @@ Given a free-text project description (Stage 1) and optional context / maturity 
 2. **Interrupt** — the orchestrator dedupes overlapping gaps into 5–10 clarifying questions and pauses the graph (Stage 4).
 3. **Pass 2** — once the user answers (or skips with defaults), all six twins re-run with the new context.
 4. **Synthesize** — aggregates per-phase outputs into a `DualScenarioEstimate`: total hours, $ cost, duration band, weekly burn, headcount by role, **AI hours/cost saved** (manual − AI), and the **LLM usage/cost** of producing the estimate (per-model token + dollar breakdown).
-5. **Review** (Stage 5) — frontend renders per-phase bars, a toggle between AI-assisted and manual-only views, a role-attributed cost table, graphical algorithm breakdowns, a confidence meter, an AI-assistance-savings section, and an LLM cost/usage modal.
+5. **Review** (Stage 5) — frontend renders per-phase bars, a toggle between AI-assisted and manual-only views, a role-attributed cost table, graphical algorithm breakdowns, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" readout + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout), an AI-assistance-savings section, and an LLM cost/usage modal.
 
 Before submission, two pre-submission agents help fill the wizard: a **prefill** agent normalizes the Stage 1 free text into a Stage 2 context, and a **roster** agent proposes the team roster. On Stage 3 submit, a **tooling classifier** turns the user's freeform AI-tooling description into per-phase tooling levels (researching unfamiliar tools via a self-hosted docs-mcp-server). Past estimates are listed on the landing page and can be redisplayed.
 
@@ -74,7 +76,7 @@ Each twin:
 3. Calls Claude via `orchestrator/llm.py::call_structured(...)`, which exposes a Pydantic response model as a single tool and **forces** `tool_choice` to it. The tool input is validated back into the model — far more reliable than free-text JSON.
 4. Runs the deterministic algorithm in Python over the LLM-extracted inputs.
 5. Derives the AI-assisted hours from the manual baseline by applying the **AI-reduction guardrail bands** (`orchestrator/ai_acceleration.py::effective_ai_reduction(...)`) — the twin's *proposed* reduction is clamped into the per-(phase, tooling) band, then moderated by codebase context + team seniority, with a small verification penalty that can push the net reduction slightly negative. The realized reduction is recorded on the estimate as `effective_ai_reduction_pct`.
-6. Wraps the mid number in a PERT range, splits hours across roles via the shared `role_attribution.attribute_roles(...)`, and records the algorithm intermediates in a structured `breakdown: dict[str, float]` (not in prose `notes`).
+6. Wraps the mid number in a **Monte Carlo distribution** (`orchestrator/montecarlo.py`) instead of a fixed ±factor band — `optimistic`/`pessimistic` become P10/P90, with the deterministic mid kept as `most_likely` (see [Monte Carlo uncertainty](#monte-carlo-uncertainty)). It then splits hours across roles via the shared `role_attribution.attribute_roles(...)` (off the deterministic mid, so role hours sum to `most_likely`), and records the algorithm intermediates in a structured `breakdown: dict[str, float]` (not in prose `notes`).
 
 The shared shape lives in `backend/orchestrator/nodes/_twin_base.py`. When adding or modifying a twin, the differences should live in the prompt file + post-processing math, **not** in the plumbing.
 
@@ -96,6 +98,10 @@ The QA twin uniquely recommends one of three test strategies. All three plan tot
 
 Selection is rule-based (`auto_select_plan(has_ai, has_reg)`) but the twin may override; both are logged.
 
+### Development self-consistency
+
+COCOMO's most-likely is a *product* of several independently LLM-sampled drivers (SLOC × effort multipliers × scale factors), so the Development phase is the one estimate whose run-to-run number swings widely (~±30%) — and the frontier twin model ignores `temperature`, so it can't be pinned to greedy decoding. The Development twin therefore opts into **Pass-2 self-consistency**: it fires **K=5** independent `call_structured` calls concurrently (`asyncio.gather`) and folds them by the **median** of each numeric driver (carried on the median-hours sample), cutting the run-to-run noise to ~±15% without imposing any anchor. The other five twins run a single Pass-2 call. The plumbing is generic (`make_twin_nodes(ensemble_k=…, ensemble_aggregate_fn=…)` in `_twin_base.py`); only Development enables it. As a cheap guard against gross sizing errors, `consistency_check` also cross-checks the realized SLOC against an independent screen/integration estimate and emits a warning when they diverge badly (it never changes the numbers).
+
 ### Pre-submission and support agents
 
 Alongside the six estimation twins, the backend runs four lighter LLM helpers (each pins its own model tier — see [Configuration](#configuration)):
@@ -106,6 +112,38 @@ Alongside the six estimation twins, the backend runs four lighter LLM helpers (e
 - **Question consolidator** (inside `orchestrator/nodes/merge_pass1.py`, Haiku) — semantic dedup of the twins' overlapping clarifying questions, with a deterministic topic-dedup fallback when unset/unreachable.
 
 Their prompts live in `backend/orchestrator/prompts/` alongside the six twins: `prefill_agent.md`, `roster_agent.md`, `tooling_classifier.md`, `question_consolidator.md`.
+
+---
+
+## Monte Carlo uncertainty
+
+Each twin's three-point `HourRange` is no longer a fixed ±factor PERT band around the mid. `orchestrator/montecarlo.py` runs a Monte Carlo layer (default **2,000 draws**, `MC_DRAWS`-overridable) that propagates **three uncertainty sources** through the **unchanged** deterministic `compute_*` algorithm, per draw `i`:
+
+```
+base_i   = compute_*(sampled size drivers)            # 1. input-size uncertainty (nonlinear)
+r_i      = reduction_sampler(rng)                      # 2. AI-effectiveness uncertainty
+risk_i   = Σ_k Bernoulli(p_k) · PERT(low_k, high_k)    # 3. discrete risk events
+manual_i = base_i + risk_i
+ai_i     = base_i · (1 − r_i) + risk_i                 # risks hit both scenarios undiscounted
+```
+
+1. **Input-size** — the twin's LLM proposes a `low/high` interval (`montecarlo.Range3`) on its dominant driver (SLOC/KSLOC for COCOMO, FP for TPA, `cmp_score`, productivity, UX iteration factor, …) plus an `estimate_cov` fallback. Each draw perturbs that field via Beta-PERT and **re-runs the same `compute_*`** — so the nonlinearity (e.g. COCOMO's `KSLOC^E`) is captured, not linearized.
+2. **AI-effectiveness** — the LLM's *proposed* reduction is sampled (from an LLM `reduction_range`, a default spread, or — for Discovery/UX, which don't propose one — the guardrail band itself), and `ai_acceleration.effective_ai_reduction(...)` is **re-run on every draw** so the clamp + codebase·seniority moderation + verification penalty are honored each time.
+3. **Discrete risks** — the LLM now proposes structured `RiskInput {description, probability, impact_hours_low/high}` items, fired as independent Bernoulli events that add sampled hours to **both** scenarios undiscounted (so risks lift the *mean*, not the mode).
+
+Load-bearing **invariants** (kept stable so the rest of the system and the eval rubrics don't break):
+
+- The **modal draw** is "no risk fires + point reduction", so `most_likely` stays the exact deterministic mid; the band only widens to bracket it (it is never clamped away). `result_to_hour_range` expands optimistic/pessimistic to P10/P90 around the mode without moving it.
+- `ai.most_likely == manual.most_likely × (1 − r)` holds exactly, and role hours sum to `most_likely` (attribution still runs off the deterministic mid).
+- All new fields are **Optional** → persisted envelopes and the deterministic stub/legacy path remain backward-compatible (stub ranges carry no `std`, so they keep the old behavior end-to-end).
+
+The module is **pure stdlib** (`random` + `statistics` + `math`; no numpy/scipy): Beta-PERT via `random.betavariate`, RNG seeded per `(estimate_id, phase, pass)` so streams are reproducible and phase-independent (safe under the parallel twin fan-out). `HourRange` gained `std`, `mean`, and a full `percentiles` vector (`{p5,p10,p25,p50,p75,p90,p95}`); `RiskInputList` tolerates a JSON-string `risks` array (a forced-tool-use quirk) instead of stubbing the whole phase.
+
+**Project total** — `synthesize_estimate` now treats per-phase distributions as **independent** and variance-combines them (sum the means, root-sum-square the stds, then a guarded method-of-moments lognormal fit yields P10/P90 + the percentile fan), giving a correct, **narrower** project band than the old comonotonic sum. The comonotonic per-percentile sum is kept as the stub/legacy fallback when any phase lacks `std`.
+
+**Frontend** — the review page renders a "Confidence" section: nested-confidence-band fan charts (`components/FanChart.tsx`, math in `lib/fan-chart.ts`), an "80% confident: X–Y h" readout from P10–P90, and a "P(AI saves time): NN%" overlap statistic. All three degrade cleanly to the three-point triangle when an estimate carries no percentiles.
+
+**Eval** — `evals/rubrics.py`'s `algorithm_conformance` was reworked for the MC ranges (it now asserts the `most_likely` identity + `ai ≤ manual` sign at each percentile when `r ≥ 0`; the old per-percentile `ai == manual×(1−r)` equality is dropped, since sampling adds variance the comonotonic identity can't model), and a new `interval_calibration` rubric scores whether a known actual lands inside the predicted `[optimistic, pessimistic]` band.
 
 ---
 
@@ -129,9 +167,18 @@ Key mechanics:
 - The graph pauses at `await_user_answers` via LangGraph's `interrupt()`. The HTTP layer resumes it with `Command(resume={"answers": ...})` after Stage 4.
 - `parse_input` calls Claude to convert raw text into a structured `parsed_context`. It has an **LLM-free fallback** (`_fallback_context`) so the graph still runs without an `ANTHROPIC_API_KEY` (smoke tests rely on this).
 - `commercial_processing` looks up per-role rates from the user's `Stage2Context.roster` (by `role_id`) to produce per-scenario dollar totals.
-- `synthesize_estimate` aggregates PERT ranges across phases, computes `ai_hours_saved_pert = manual.pert_mean − ai.pert_mean`, derives headcount + duration band against the target timeline (or a default 5-person team if none was given), and rolls up a weekly burn rate.
+- `synthesize_estimate` aggregates the per-phase ranges across phases (variance-combining the Monte Carlo distributions as independent — see [Monte Carlo uncertainty](#monte-carlo-uncertainty)), computes `ai_hours_saved_pert = manual.pert_mean − ai.pert_mean`, derives headcount + duration band against the target timeline (or, with no target, from the throughput-optimal team — see the team-scaling model below), and rolls up a weekly burn rate. It also applies the **team-scaling model** at the project level (see [Team-scaling model](#team-scaling-model)).
 
 Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins share **only** what they read from state.
+
+### Team-scaling model
+
+Project-level staffing reality is modeled in `orchestrator/staffing.py` (pure stdlib) and applied by `synthesize_estimate` — the six twins stay independent. Two effects act on team size `n` (= Σ headcount):
+
+- **Brooks coordination overhead** `o(n)` (`coordination_overhead(n)`) — capacity lost to the growing number of communication links, capped. `(1 + o(n))` inflates **both** total cost and duration.
+- **Diminishing returns** `n^β` (β < 1) — imperfect partitionability. `team_throughput(n) = n^β·(1 − o(n))` shapes the no-target duration curve and the recommended team size (`optimal_team_size(...)`, the "sweet spot"), but does **not** inflate cost — the per-algorithm effort already embeds a normal team's productivity (COCOMO's scale exponent is itself a diseconomy term), so a second cost penalty would double-count.
+
+Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhead_cap: 0.40, diminishing_returns_exponent: 0.90}` are **DB-tunable** via the `staffing_coefficients` table (admin endpoints `GET`/`PUT /admin/staffing-coefficients`, edited from `/settings`). Per-role headcount, weekly burn, hours, and role-hours are unchanged; `DualScenarioEstimate` gains `brooks_overhead_pct`, `staffing_efficiency_pct`, `team_size`, and `optimal_team_size`, which the review page surfaces as a "Coordination overhead (+X%)" cost row + a scaling-efficiency readout with an over/under-staffing flag (`frontend/lib/staffing.ts`).
 
 ---
 
@@ -180,14 +227,15 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 │
 ├── backend/
 │   ├── main.py                # FastAPI app: draft/prefill, draft/classify-tooling,
-│   │                          #   draft/roster/agui, admin/reduction-bands,
-│   │                          #   /estimates(+history,+stream,+answers), /health
+│   │                          #   draft/roster/agui, admin/reduction-bands, admin/staffing-coefficients,
+│   │                          #   /estimates(+history,+stream,+answers,+delete), /health
 │   ├── config.py              # pydantic-settings, reads ../.env or .env
 │   ├── prefill.py             # Stage 1 → Stage 2 prefill agent (Haiku)
 │   ├── roster_agent.py        # team-roster proposal agent (Sonnet)
 │   ├── roster_agui.py         # AG-UI endpoint wrapping the roster agent
 │   ├── tooling_classifier.py  # freeform AI-tooling → per-phase levels (+docs-mcp research)
 │   ├── reduction_bands_admin.py # GET/PUT /admin/reduction-bands handlers
+│   ├── staffing_admin.py      # GET/PUT /admin/staffing-coefficients handlers
 │   ├── pyproject.toml         # uv-managed deps
 │   ├── Dockerfile             # python:3.12-slim + uv, non-root, HEALTHCHECK /health
 │   │
@@ -195,6 +243,8 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 │   │   ├── graph.py           # StateGraph topology
 │   │   ├── llm.py             # call_structured(...) — forced tool-use → Pydantic; per-agent model resolution
 │   │   ├── ai_acceleration.py # AI-reduction guardrail bands + effective_ai_reduction()
+│   │   ├── montecarlo.py      # Monte Carlo uncertainty propagation (pure stdlib Beta-PERT)
+│   │   ├── staffing.py        # team-scaling model: Brooks coordination + diminishing returns (pure stdlib)
 │   │   ├── usage.py           # per-run Anthropic token-usage capture + cost estimation
 │   │   ├── role_attribution.py# shared role-split with phase-specific overrides
 │   │   ├── smoke.py           # CLI: `uv run python -m orchestrator.smoke [--no-llm]`
@@ -217,21 +267,21 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 │   │
 │   ├── models/
 │   │   ├── estimation_state.py  # LangGraph EstimationState TypedDict (incl. reduction_bands, calibration_examples)
-│   │   ├── twin_outputs.py      # Phase, PhaseEstimate (breakdown, effective_ai_reduction_pct), HourRange, DualScenarioEstimate, LlmUsage, ...
+│   │   ├── twin_outputs.py      # Phase, PhaseEstimate, HourRange (+std/mean/percentiles), RiskInput(List), DualScenarioEstimate (+ brooks_overhead_pct/staffing_efficiency_pct/team_size/optimal_team_size), LlmUsage, ...
 │   │   └── project_schema.py    # CreateEstimateRequest, EstimateEnvelope, Stage2Context (roster), Stage3Context (codebase + AI-tooling), CodebaseContext, AiToolingLevel
 │   │
 │   ├── db/
 │   │   ├── neo4j_adapter.py   # driver + make_checkpointer (InMemorySaver in MVP) + save_estimate_envelope
 │   │   ├── postgres_adapter.py# async engine + session_scope() — no-ops when DSN unset
-│   │   ├── orm_models.py      # SQLAlchemy models: EstimateHistory (+envelope_json), PhaseHistory, CalibrationAggregate, AiReductionBand
-│   │   ├── repositories.py    # save_estimate_history, list_estimate_history, get_estimate_envelope, refresh_calibration_for_phase, get_calibration*, reduction-band reads/writes
+│   │   ├── orm_models.py      # SQLAlchemy models: EstimateHistory (+envelope_json), PhaseHistory, CalibrationAggregate, AiReductionBand, StaffingCoefficient
+│   │   ├── repositories/      # history, calibration, bands, staffing repos (save/list/get + delete, refresh_calibration_for_phase, get_calibration*, reduction-band + staffing-coefficient reads/writes)
 │   │   ├── migrate.py         # programmatic `alembic upgrade head` for the FastAPI lifespan
 │   │   └── qdrant_adapter.py  # client init (no ingestion in MVP)
 │   │
 │   ├── alembic/               # async migrations (env.py reads settings.resolved_postgres_dsn)
 │   │   ├── env.py
 │   │   ├── script.py.mako
-│   │   └── versions/          # 0001 history+calibration … 0006 (reduction bands, envelope_json, nullable raw_input)
+│   │   └── versions/          # 0001 history+calibration … 0009 (reduction bands, envelope_json, nullable raw_input, band retunes, staffing_coefficients)
 │   ├── alembic.ini
 │   │
 │   ├── observability/
@@ -239,22 +289,23 @@ Phase 1 explicitly excludes A2A peer-to-peer cross-phase signaling — twins sha
 │   │   ├── logging_config.py  # configure_logging() — root log level + format
 │   │   └── request_logging.py # ASGI middleware: method / path / status / latency per request
 │   │
-│   └── tests/                 # pytest, asyncio auto-mode (~280 tests)
+│   └── tests/                 # pytest, asyncio auto-mode (~470 tests)
 │
 └── frontend/
     ├── app/
     │   ├── layout.tsx / page.tsx / providers.tsx   # landing page lists + redisplays past estimates
-    │   ├── settings/page.tsx  # edit the AI-reduction guardrail bands (gear icon)
+    │   ├── settings/page.tsx  # edit AI-reduction bands + team-scaling coefficients (gear icon)
     │   ├── globals.css        # html { font-size: 14px } — global UI scale
     │   └── estimate/
     │       ├── new/                          # Stage 1
     │       ├── draft/{create,context,maturity}/  # Stages 2-3 wizard (client-side, pre-submit)
     │       └── [id]/{questions,review}/      # Stages 4-5 (server-driven)
     ├── components/            # PhaseBar, DualScenarioToggle, RoleRosterEditor, StageProgress,
-    │                          #   ConfidenceMeter, AlgorithmBreakdownChart, AlgorithmTooltip/Badge,
-    │                          #   AiSavingsSection, BreakdownView, Modal, RosterRationaleModal, FieldHint
+    │                          #   ConfidenceMeter, FanChart (Monte Carlo), AlgorithmBreakdownChart,
+    │                          #   AlgorithmTooltip/Badge, AiSavingsSection, BreakdownView, Modal,
+    │                          #   Tabs (review-page panels), RosterRationaleModal, FieldHint
     ├── lib/                   # schemas (Zod), api-client (fetch + SSE), wizard-store, types, format,
-    │                          #   algorithms, breakdown, review-ui, estimate-status, roster-agui
+    │                          #   algorithms, breakdown, fan-chart (MC math), staffing (team-scaling), review-ui, estimate-status, roster-agui
     ├── instrumentation.ts     # Next.js startup hook — logs `✓ Frontend ready ...`
     ├── next.config.mjs        # output: "standalone"
     ├── vitest.config.ts       # globs: lib/**, components/**, instrumentation.test.ts
@@ -350,6 +401,8 @@ All settings are read by `backend/config.py` (pydantic-settings) from `.env`. Th
 | `ANTHROPIC_MODEL_ROSTER` | no | `claude-sonnet-4-6` | Team-roster proposal agent (knowledge-heavy → Sonnet). |
 | `ANTHROPIC_MODEL_MERGE` | no | `claude-haiku-4-5` | Clarifying-question consolidation in `merge_pass1` (cheap → Haiku; deterministic fallback). |
 | `ANTHROPIC_MODEL_TOOLING` | no | `claude-sonnet-4-6` | AI-tooling classifier (broad tool knowledge → Sonnet). |
+| `OPENAI_API_KEY` | no | `""` | Authenticates the eval harness LLM-as-judge (`make evals`). Not used by the production estimator. Also satisfies the docs-mcp-server embeddings provider when scraping. |
+| `OPENAI_MODEL_EVAL` | no | `gpt-5.5` | Default judge model for the eval harness's LLM rubrics. Override per run with `--judge-model` (an Anthropic id routes to the `call_structured` fallback). |
 | `DOCS_MCP_URL` | no | `http://localhost:6280/mcp` | Self-hosted docs-mcp-server the tooling classifier consults (MCP over streamable HTTP). Blank disables lookups (unknown tools → `none`). Compose overrides this to the in-network hostname. |
 | `DOCS_MCP_AUTH_TOKEN` | no | `""` | Optional bearer token for docs-mcp-server. |
 | `DOCS_MCP_RESEARCH_TIMEOUT_S` | no | `25.0` | Hard ceiling on the docs-mcp search lookup (it runs in the Stage 3 submit path). On timeout, unknown tools → `none`. |
@@ -393,9 +446,12 @@ Graceful degradation is intentional — every external dependency (Anthropic, Ne
 | `POST` | `/estimates/draft/roster/agui` | Pre-submission: AG-UI agent run that proposes the Stage 2 team roster (streams a `STATE_SNAPSHOT`). |
 | `GET` | `/admin/reduction-bands` | Read the effective AI-reduction guardrail bands (code defaults merged with DB overrides) as editable percentages — backs the Settings screen. |
 | `PUT` | `/admin/reduction-bands` | Persist edited reduction bands. No-ops (response `editable: false`) when Postgres is disabled. |
+| `GET` | `/admin/staffing-coefficients` | Read the effective team-scaling coefficients (Brooks's Law + diminishing returns; code defaults merged with DB overrides) — backs the Settings screen. |
+| `PUT` | `/admin/staffing-coefficients` | Persist edited staffing coefficients. No-ops (response `editable: false`) when Postgres is disabled. |
 | `POST` | `/estimates` | Start a new estimation. Body: `CreateEstimateRequest { project_name?, raw_input, stage2?, stage3? }`. Returns the envelope with status `pending`; Pass 1 runs as a background task. |
-| `GET` | `/estimates/history` | Recent persisted estimates (newest first) for the dashboard history list. Empty when Postgres is disabled. |
+| `GET` | `/estimates/history` | Paginated persisted estimates (newest first) for the dashboard history list. Query: `?limit=&offset=`; returns `{ items, total }`. Empty when Postgres is disabled. |
 | `GET` | `/estimates/{id}` | Fetch the current envelope (status, pass1/pass2 estimates, clarifying questions, final). **Authoritative source of truth.** On in-memory cache miss it falls back to the persisted `envelope_json` (when Postgres is connected) so completed estimates redisplay after a restart / in a fresh session. |
+| `DELETE` | `/estimates/{id}` | Delete an estimate — removes it from the in-memory registries and Postgres history (+ phase rows). Idempotent → `204`. |
 | `GET` | `/estimates/{id}/stream` | **SSE** event stream — emits `status` / `questions` / `final` / `error` as the graph progresses. Best-effort, via a per-estimate fan-out broker with a replay buffer: late / reconnecting / multiple concurrent subscribers all receive the backlog (no event stealing). Closes after `final` or `error`. |
 | `POST` | `/estimates/{id}/answers` | Submit Stage 4 answers and resume the graph into Pass 2. Body: `{ answers: { question_id: text }, skip_remaining?: bool }`. Returns 409 if status ≠ `awaiting_answers`. |
 | `GET` | `/health` | `{ "status": "ok", "service": "ai-sdlc-estimator" }`. |
@@ -415,9 +471,9 @@ OpenAPI docs are served at `http://localhost:8000/docs` once the backend is up.
 | `/estimate/draft/context` | 2. Project context | MVP subset of planning outline §4.2 — industry, project type, screen count, integrations, engagement model, **and the team roster** (description + category + seniority + rate + percentage per role). The `<RoleRosterEditor>` lives here, with a separate "Auto-adjust to 100%" button (no auto-rebalance on blur). A prefill/roster agent can pre-populate both. Client-side state in `lib/wizard-store.ts`. |
 | `/estimate/draft/maturity` | 3. AI tooling & codebase | A **freeform AI-tooling description** text field (classified into per-phase tooling levels on submit via `POST /estimates/draft/classify-tooling`) plus a codebase-context selector (greenfield / brownfield small / large-unfamiliar / large-familiar). The old per-phase L0–L4 maturity sliders are gone. Team composition lives in Stage 2. |
 | `/estimate/[id]/questions` | 4. Clarifying questions | Renders questions returned by Pass 1; POSTs answers to resume Pass 2. |
-| `/estimate/[id]/review` | 5. Review | Per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, algorithm tooltips, an AI-assistance-savings section, risks/assumptions in modals off the phase cards, and an LLM cost/token-usage modal. Copy-as-markdown. |
+| `/estimate/[id]/review` | 5. Review | Organized into three tabs (`<Tabs>`) — **Cost breakdown**, **AI assistance**, **Risk & uncertainty** — so it reads as three focused views (only the active panel is mounted). Across them: per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout via `lib/staffing.ts`), algorithm tooltips, an AI-assistance-savings section, risks/assumptions in modals off the phase cards, and an LLM cost/token-usage modal. Copy-as-markdown. |
 
-The landing page at `/` lists historical estimates pulled from the backend and redisplays the review page for completed ones. A gear icon opens `/settings`, which edits the AI-reduction guardrail bands (`GET`/`PUT /admin/reduction-bands`).
+The landing page at `/` lists historical estimates pulled from the backend and redisplays the review page for completed ones. A gear icon opens `/settings`, which edits the AI-reduction guardrail bands (`GET`/`PUT /admin/reduction-bands`) and the team-scaling (Brooks's Law + diminishing-returns) coefficients (`GET`/`PUT /admin/staffing-coefficients`).
 
 Global font scale: `app/globals.css` sets `html { font-size: 14px; }` so all Tailwind rem-based utilities shrink uniformly. Change it in one place to rescale the whole UI.
 
@@ -432,7 +488,7 @@ Global font scale: `app/globals.css` sets `html { font-size: 14px; }` so all Tai
 - **CMP (Deployment)** — Configuration Management Points across environments × integration count × infra complexity.
 - **TPA (QA)** — `dynamic_tp = FP · DF · (QD/24)` + `static_tp = FP · QI / 500`. Selected plan (A / B / C) drives the base + per-TP factor.
 
-Every twin produces a manual baseline, wraps the manual mid in a PERT three-point range, and derives the AI-assisted mid by applying the **AI-reduction guardrail bands** — the twin's proposed reduction clamped into its `(phase, tooling)` band, moderated by codebase context + team seniority, minus a verification penalty (floored at −0.15). See [AI-reduction guardrail bands](#ai-reduction-guardrail-bands) above. The realized fraction is recorded as `effective_ai_reduction_pct`, and algorithm intermediates land in the structured `breakdown`.
+Every twin produces a manual baseline, derives the AI-assisted mid by applying the **AI-reduction guardrail bands** — the twin's proposed reduction clamped into its `(phase, tooling)` band, moderated by codebase context + team seniority, minus a verification penalty (floored at −0.15) — then propagates input-size, AI-effectiveness, and discrete-risk uncertainty through the algorithm with a **Monte Carlo** pass to produce the P10/P90 band (see [Monte Carlo uncertainty](#monte-carlo-uncertainty)). See [AI-reduction guardrail bands](#ai-reduction-guardrail-bands) above. The realized fraction is recorded as `effective_ai_reduction_pct`, and algorithm intermediates land in the structured `breakdown`.
 
 ---
 
@@ -481,8 +537,9 @@ The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remov
 
 - **LangGraph checkpointer** — `db/neo4j_adapter.py::make_checkpointer()` returns `langgraph.checkpoint.memory.InMemorySaver` in MVP. State survives within a process (so `interrupt()` works) but **not** across restarts. A real Neo4j-backed `BaseCheckpointSaver` is a Phase-3 swap at this exact call site.
 - **Neo4j estimate snapshots** — `save_estimate_envelope(...)` writes one `Estimate` node + N `Phase` nodes via idempotent Cypher `MERGE`. Called at status transitions in `main.py`. **Silently no-ops** when Neo4j is unavailable.
-- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` (including the full `envelope_json` for verbatim redisplay) and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, **codebase-context**) aggregates in `calibration_aggregates`. The codebase-context code (0–3, `-1` = "any") rides in the column historically named `maturity_level` — it no longer holds an AI-maturity level. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. `list_estimate_history(...)` / `get_estimate_envelope(...)` back the history list and the redisplay-after-restart fallback. **Silently no-ops** when Postgres is unavailable. Alembic migrations (`0001`–`0006`) run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
+- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` (including the full `envelope_json` for verbatim redisplay) and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, **codebase-context**) aggregates in `calibration_aggregates`. The codebase-context code (0–3, `-1` = "any") rides in the column historically named `maturity_level` — it no longer holds an AI-maturity level. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. `list_estimate_history(...)` / `get_estimate_envelope(...)` back the history list and the redisplay-after-restart fallback. **Silently no-ops** when Postgres is unavailable. Alembic migrations (`0001`–`0009`) run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
 - **AI-reduction bands** — the admin-tunable `ai_reduction_bands` table holds the per-(phase, tooling) guardrail bands, merged with the in-code defaults and loaded into graph state by `parse_input`. Editable from the `/settings` screen via `GET`/`PUT /admin/reduction-bands`.
+- **Staffing coefficients** — the admin-tunable `staffing_coefficients` table holds the team-scaling parameters (Brooks's Law coordination + diminishing returns), merged with the in-code `DEFAULT_STAFFING_COEFFS` fallback. Read/written by `get_staffing_coefficients` / `upsert_staffing_coefficients` (never-raise) and editable from the `/settings` screen via `GET`/`PUT /admin/staffing-coefficients`.
 - **LLM usage/cost** — `orchestrator/usage.py` captures each Anthropic call's token usage into a per-estimate accumulator (bound around the Pass 1/Pass 2 run), then summarizes it into `DualScenarioEstimate.llm_usage` (per-model token + dollar breakdown) — the meta-cost of producing the estimate, surfaced in the review page's LLM cost modal. Best-effort: a no-op when no accumulator is bound.
 - **Langfuse** — `@traced(name=..., as_type=...)` decorates LLM calls and graph nodes. With keys absent, it installs a no-op decorator that **preserves `inspect.iscoroutinefunction`** — important because LangGraph inspects node fns to decide sync vs async dispatch. Self-hosted via docker-compose but **gated behind the `langfuse` compose profile** (off by default; enable with `COMPOSE_PROFILES=langfuse`): a `langfuse-web` (UI on `http://localhost:3100`) + `langfuse-worker` + ClickHouse + Redis + MinIO stack, sharing the project's Postgres for metadata under a separate `langfuse` database. The estimator backend points at `http://langfuse-web:3000` inside the compose network; on the host (`make be`) it uses whatever `LANGFUSE_HOST` is set to (`.env.example` ships `http://localhost:3100`).
 - **docs-mcp-server** — a co-located compose service (host port `6280`) the tooling classifier queries (and optionally scrapes-then-indexes) to research unfamiliar AI tools. Degrades gracefully: when unreachable or timed out, unknown tools stay `none`.
@@ -492,7 +549,7 @@ The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remov
 
 ## Testing
 
-Backend (~280 tests, pytest with asyncio auto-mode):
+Backend (~470 tests, pytest with asyncio auto-mode):
 
 ```bash
 cd backend && uv run pytest                              # full suite
@@ -525,6 +582,15 @@ cd frontend && npm run build           # produces .next/standalone for Docker
 
 `vitest.config.ts` only globs `lib/**/*.test.ts`, `components/**/*.test.ts`, and `instrumentation.test.ts` — add new test paths to the `include` array or they won't run.
 
+Eval harness (`backend/evals/`) — the deterministic rubrics (`algorithm_conformance`, `interval_calibration`) need no LLM, but the **LLM-as-judge** rubrics (`faithfulness`, `plan_quality`, `summarization`) default to **OpenAI GPT-5.5**. `evals/judge.py::judge_structured` is provider-aware: `gpt`/`o`-series models use the OpenAI SDK's structured-output `chat.completions.parse`, while `claude-*` models fall back to the production `orchestrator.llm.call_structured`. Grading the Anthropic twins with a different provider reduces same-model self-preference bias.
+
+```bash
+make evals                                             # full harness (default judge gpt-5.5)
+cd backend && uv run python -m evals.run --judge-model claude-sonnet-4-6   # Anthropic judge
+```
+
+Set `OPENAI_API_KEY` + `OPENAI_MODEL_EVAL` (default `gpt-5.5`) for the judge, or pass `--judge-model` to override per run.
+
 Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ Frontend ready ...`); operators grep for these in container logs. Don't change the format without updating those tests.
 
 ---
@@ -537,6 +603,8 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 - Two-pass orchestration with LangGraph `interrupt()` for clarifying questions
 - All six twin algorithms (UCP, SCP, COCOMO II, Fagan, CMP, TPA + 3-plan QA)
 - AI-reduction guardrail bands (admin-tunable per phase × tooling) replacing the old maturity caps
+- Monte Carlo uncertainty propagation per phase (input-size + AI-effectiveness + discrete risks) with variance-combined project totals + fan-chart visualization (pure stdlib, no numpy)
+- Project-level team-scaling model (Brooks's Law coordination overhead + diminishing returns, admin-tunable) feeding cost, duration, and a recommended team size
 - Freeform AI-tooling classification with docs-mcp-server research, plus the prefill + roster pre-submission agents
 - Dual-scenario aggregation (AI-assisted vs. manual-only) end-to-end
 - LLM cost / token-usage tracking surfaced on the estimate

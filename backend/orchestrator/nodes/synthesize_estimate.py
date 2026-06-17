@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 from collections import defaultdict
 
+from db.repositories import get_staffing_coefficients
 from models.estimation_state import EstimationState
 from models.project_schema import CustomRole, RoleRoster
 from models.twin_outputs import (
@@ -14,20 +17,162 @@ from models.twin_outputs import (
     RoleHeadcount,
 )
 from observability.langfuse_wrapper import traced
+from orchestrator.staffing import (
+    coordination_overhead,
+    optimal_team_size,
+    staffing_efficiency,
+    team_throughput,
+)
 
 logger = logging.getLogger(__name__)
 
-# Effective work hours per person per week (40 - meetings / context switching).
-WORK_HOURS_PER_WEEK = 32
+# Work hours per person per week. Matches the EFFORT basis: COCOMO emits hours at 152/PM
+# (8h/day × 19 days), so headcount capacity must use the same full work-week (8h/day × 5).
+# A lower "productive" number here would double-count meeting overhead and over-count headcount.
+WORK_HOURS_PER_WEEK = 40
+
+_EPS = 1e-9
+
+# Default cross-phase correlation: phases partially co-move (shared scope drives
+# several phases together). Read at call time via _phase_correlation() so the
+# PHASE_CORRELATION env var can override it without re-importing the module.
+PHASE_CORRELATION = 0.3
 
 
-def _sum_range(phases: list[PhaseEstimate], ai: bool) -> HourRange:
+def _phase_correlation() -> float:
+    """Cross-phase correlation ρ ∈ [0, 1] used to combine per-phase std's.
+
+    Phases partially co-move (a larger-than-expected scope drives several phases —
+    discovery, dev, QA — up together), so the project-total spread sits between two
+    extremes: ρ=0 treats phases as INDEPENDENT (variances add in quadrature, today's
+    behavior) and ρ=1 treats them as COMONOTONIC (perfectly correlated; std's add
+    linearly). Default 0.3 (mild positive co-movement); override with the
+    ``PHASE_CORRELATION`` env var. Clamped to [0, 1]."""
+    try:
+        rho = float(os.getenv("PHASE_CORRELATION", str(PHASE_CORRELATION)))
+    except ValueError:
+        return PHASE_CORRELATION
+    return min(1.0, max(0.0, rho))
+# Standard-normal quantiles for the fan-chart percentiles, hard-coded so the
+# project-total lognormal fit needs no scipy. Keys mirror HourRange.percentiles
+# and the per-phase Monte Carlo output (montecarlo._PCTS).
+_Z: dict[str, float] = {
+    "p5": -1.6449,
+    "p10": -1.2816,
+    "p25": -0.6745,
+    "p50": 0.0,
+    "p75": 0.6745,
+    "p90": 1.2816,
+    "p95": 1.6449,
+}
+
+
+def _lognormal_band(
+    mean: float, std: float, anchor: float
+) -> tuple[float, float, dict[str, float] | None]:
+    """Fit a lognormal to ``(mean, std)`` and return ``(optimistic, pessimistic,
+    percentiles)`` for the project total — the P10/P90 fan-chart band.
+
+    ``anchor`` is the deterministic most-likely total used to keep the band sane
+    in the degenerate guards. Pure stdlib (``math``), no scipy. Guards:
+
+    - ``mean <= 1e-9``  → no usable lognormal; return a symmetric ±std band around
+      the anchor (clamped at 0), percentiles ``None``.
+    - ``cv^2 <= 1e-9``  → effectively zero spread; collapse to the point
+      (lo = hi = anchor), percentiles ``None``.
+    - otherwise         → method-of-moments lognormal: ``sigma = sqrt(log1p(cv^2))``,
+      ``mu = log(mean) - 0.5*sigma^2``, ``band(z) = exp(mu + z*sigma)``; optimistic
+      is P10, pessimistic is P90, and the full ``_Z`` vector is materialized.
+    """
+    if mean <= 1e-9:
+        lo = max(0.0, anchor - std)
+        hi = anchor + std
+        return lo, hi, None
+
+    cv2 = (std / mean) ** 2
+    if cv2 <= 1e-9:
+        return anchor, anchor, None
+
+    sigma = math.sqrt(math.log1p(cv2))
+    mu = math.log(mean) - 0.5 * sigma * sigma
+
+    def band(z: float) -> float:
+        return math.exp(mu + z * sigma)
+
+    percentiles = {name: band(z) for name, z in _Z.items()}
+    return band(_Z["p10"]), band(_Z["p90"]), percentiles
+
+
+def _combine_std(stds: list[float], rho: float) -> float:
+    """Combine per-phase standard deviations under a uniform pairwise correlation ρ.
+
+    A correlation-ρ portfolio variance is ``Σ std_i² + ρ·Σ_{i≠j} std_i·std_j``, which
+    factors into the convex blend
+
+        total_std = sqrt( (1−ρ)·Σ std_i²  +  ρ·(Σ std_i)² ).
+
+    ρ=0 → INDEPENDENCE (variances add in quadrature, ``sqrt(Σ std_i²)``); ρ=1 →
+    COMONOTONIC (perfect correlation, std's add linearly, ``Σ std_i``). The blend is
+    monotonic in ρ, so any 0<ρ<1 lands strictly between the two extremes."""
+    sum_sq = sum(s * s for s in stds)
+    sum_lin = sum(stds)
+    var = (1.0 - rho) * sum_sq + rho * sum_lin * sum_lin
+    return math.sqrt(max(0.0, var))
+
+
+def _combine_range(
+    phases: list[PhaseEstimate], ai: bool, *, rho: float | None = None
+) -> HourRange:
+    """Combine the per-phase hour ranges into the project total.
+
+    ``most_likely`` is ALWAYS the comonotonic sum of the per-phase deterministic
+    mids (Σ most_likely). For the band:
+
+    - **Monte Carlo path** (every phase range carries ``std``): sum the means and
+      blend the per-phase std's under a cross-phase correlation ρ (see
+      ``_combine_std``) — ``total_std = sqrt((1−ρ)·Σstd_i² + ρ·(Σstd_i)²)`` — then
+      derive optimistic(P10)/pessimistic(P90) + the fan-chart ``percentiles`` from a
+      guarded lognormal fit of the combined ``(mean, std)``. ρ defaults to
+      ``_phase_correlation()`` (``PHASE_CORRELATION``, env-overridable). ρ=0 is the
+      pure independence combine (variances add in quadrature → narrower than the
+      comonotonic sum); ρ=1 is the comonotonic linear-std sum; 0<ρ<1 sits between.
+    - **Stub / legacy path** (any phase range lacks ``std``): fall back to the EXACT
+      comonotonic sum of each percentile (Σ optimistic, Σ most_likely, Σ
+      pessimistic), with ``std``/``mean``/``percentiles`` left ``None``. Guarantees
+      no behavior change on the deterministic stub path.
+    """
     if not phases:
         return HourRange(optimistic=0, most_likely=0, pessimistic=0)
-    o = sum((p.ai_assisted_hours.optimistic if ai else p.manual_only_hours.optimistic) for p in phases)
-    m = sum((p.ai_assisted_hours.most_likely if ai else p.manual_only_hours.most_likely) for p in phases)
-    pess = sum((p.ai_assisted_hours.pessimistic if ai else p.manual_only_hours.pessimistic) for p in phases)
-    return HourRange(optimistic=o, most_likely=m, pessimistic=pess)
+
+    rho = _phase_correlation() if rho is None else min(1.0, max(0.0, rho))
+    ranges = [(p.ai_assisted_hours if ai else p.manual_only_hours) for p in phases]
+    total_ml = sum(r.most_likely for r in ranges)
+
+    if all(r.std is not None for r in ranges):
+        # Variances combine under cross-phase correlation ρ (ρ=0 → independence).
+        total_mean = sum((r.mean if r.mean is not None else r.pert_mean) for r in ranges)
+        total_std = _combine_std([r.std or 0.0 for r in ranges], rho)
+        optimistic, pessimistic, percentiles = _lognormal_band(total_mean, total_std, total_ml)
+        # Keep the deterministic mid inside the band (mirrors result_to_hour_range
+        # so HourRange's ordering-coercion can't silently demote total_ml).
+        most_likely = min(max(total_ml, optimistic), pessimistic)
+        return HourRange(
+            optimistic=max(0.0, optimistic),
+            most_likely=max(0.0, most_likely),
+            pessimistic=max(0.0, pessimistic),
+            std=max(0.0, total_std),
+            mean=max(0.0, total_mean),
+            percentiles=(
+                {k: max(0.0, v) for k, v in percentiles.items()}
+                if percentiles is not None
+                else None
+            ),
+        )
+
+    # Stub / legacy: comonotonic sum (exact prior behavior).
+    o = sum(r.optimistic for r in ranges)
+    pess = sum(r.pessimistic for r in ranges)
+    return HourRange(optimistic=o, most_likely=total_ml, pessimistic=pess)
 
 
 def _sum_hours_by_role(phases: list[PhaseEstimate], ai: bool) -> dict[str, float]:
@@ -38,6 +183,35 @@ def _sum_hours_by_role(phases: list[PhaseEstimate], ai: bool) -> dict[str, float
         for rh in rows:
             totals[rh.role_id] += rh.hours
     return dict(totals)
+
+
+def _distribute_team(
+    total: int, hours_by_role: dict[str, float], roles: list[CustomRole]
+) -> dict[str, int]:
+    """Distribute a total team size across the roster by effort share: every role with work gets
+    at least one person, and the remainder goes to the highest-effort roles (largest remainder).
+    Bumps ``total`` up to the number of active roles if needed, so no working role is left
+    unstaffed. Returns ``{role_id: headcount}`` summing to ``max(total, #active roles)``."""
+    alloc: dict[str, int] = {r.role_id: 0 for r in roles}
+    active = [r for r in roles if hours_by_role.get(r.role_id, 0.0) > 0]
+    if not active or total <= 0:
+        return alloc
+    total = max(total, len(active))
+    for r in active:
+        alloc[r.role_id] = 1
+    remainder = total - len(active)
+    if remainder > 0:
+        total_hours = sum(hours_by_role.get(r.role_id, 0.0) for r in active) or 1.0
+        ideals = [
+            (r.role_id, remainder * hours_by_role.get(r.role_id, 0.0) / total_hours)
+            for r in active
+        ]
+        for rid, ideal in ideals:
+            alloc[rid] += int(ideal)
+        leftover = remainder - sum(int(ideal) for _, ideal in ideals)
+        for rid, _ in sorted(ideals, key=lambda x: x[1] - int(x[1]), reverse=True)[:leftover]:
+            alloc[rid] += 1
+    return alloc
 
 
 @traced(name="synthesize_estimate")
@@ -51,8 +225,8 @@ async def synthesize_estimate(state: EstimationState) -> dict:
 
     target_weeks = (stage2.target_timeline_weeks if stage2 and stage2.target_timeline_weeks else 0)
 
-    ai_range = _sum_range(pass2, ai=True)
-    manual_range = _sum_range(pass2, ai=False)
+    ai_range = _combine_range(pass2, ai=True)
+    manual_range = _combine_range(pass2, ai=False)
 
     ai_hours_by_role = _sum_hours_by_role(pass2, ai=True)
     manual_hours_by_role = _sum_hours_by_role(pass2, ai=False)
@@ -78,6 +252,14 @@ async def synthesize_estimate(state: EstimationState) -> dict:
     headcount_rows: list[RoleHeadcount] = []
     weekly_burn = 0.0
 
+    # Team-scaling (Brooks's Law + diminishing returns), applied at the project level so the six
+    # twins stay independent. `opt` is the recommended team size (scaled to project effort); it is
+    # the no-target team, while in the target regime team_size is the deadline-derived headcount.
+    # Either way, team_size, the headcount table, the Brooks overhead, the burn, and the duration
+    # all describe ONE coherent team (set per regime below).
+    coeffs = await get_staffing_coefficients()
+    opt = optimal_team_size(ai_range.most_likely, WORK_HOURS_PER_WEEK, coeffs)
+
     if target_weeks > 0:
         capacity = target_weeks * WORK_HOURS_PER_WEEK
         for r in roster.roles:
@@ -87,20 +269,36 @@ async def synthesize_estimate(state: EstimationState) -> dict:
             else:
                 # Ceiling so we always have enough capacity to deliver in the
                 # target window. Minimum of 1 if the role has any work at all.
-                hc = max(1, int((role_hours / capacity) + 0.99))
+                hc = max(1, math.ceil(role_hours / capacity))
             headcount_rows.append(_row(r, hc))
             weekly_burn += hc * WORK_HOURS_PER_WEEK * rate_by_role.get(r.role_id, 0.0)
 
-        duration_low = max(1.0, target_weeks * 0.85)
-        duration_high = target_weeks * 1.25
+        team_size = sum(r.headcount for r in headcount_rows)
+        overhead = coordination_overhead(team_size, coeffs)
+        # Brooks: coordination overhead stretches the target window.
+        duration_low = max(1.0, target_weeks * 0.85) * (1.0 + overhead)
+        duration_high = target_weeks * 1.25 * (1.0 + overhead)
     else:
-        # No target: derive duration assuming a default 5-person team.
-        default_team_capacity = 5 * WORK_HOURS_PER_WEEK
-        duration_low = ai_range.optimistic / default_team_capacity if default_team_capacity else 0
-        duration_high = ai_range.pessimistic / default_team_capacity if default_team_capacity else 0
+        # No target: staff the recommended team `opt`, DISTRIBUTED across the roster by effort
+        # share (≥ 1 per active role), and derive the duration from that same team's throughput.
+        # team_size = Σ headcount, so the table / overhead / burn / duration all describe ONE team
+        # (no phantom team-size decoupled from the displayed headcount).
+        alloc = _distribute_team(opt, ai_hours_by_role, roster.roles)
         for r in roster.roles:
-            role_hours = ai_hours_by_role.get(r.role_id, 0.0)
-            headcount_rows.append(_row(r, 1 if role_hours > 0 else 0))
+            hc = alloc.get(r.role_id, 0)
+            headcount_rows.append(_row(r, hc))
+            weekly_burn += hc * WORK_HOURS_PER_WEEK * rate_by_role.get(r.role_id, 0.0)
+        team_size = sum(r.headcount for r in headcount_rows)
+        overhead = coordination_overhead(team_size, coeffs)
+        weekly_throughput = team_throughput(team_size, coeffs) * WORK_HOURS_PER_WEEK
+        duration_low = ai_range.optimistic / weekly_throughput if weekly_throughput > 0 else 0.0
+        duration_high = ai_range.pessimistic / weekly_throughput if weekly_throughput > 0 else 0.0
+
+    # Brooks coordination tax on cost (both scenarios); `commercial_processing` kept the base
+    # labor cost. Diminishing returns does NOT inflate cost — the algorithm estimates already
+    # embed a normal team's productivity (see orchestrator/staffing.py).
+    total_cost_ai *= 1.0 + overhead
+    total_cost_manual *= 1.0 + overhead
 
     avg_confidence = (
         sum(p.confidence for p in pass2) / len(pass2) if pass2 else 0.0
@@ -117,14 +315,18 @@ async def synthesize_estimate(state: EstimationState) -> dict:
         duration_weeks_high=duration_high,
         headcount_by_role=headcount_rows,
         weekly_burn_rate_usd=weekly_burn,
+        brooks_overhead_pct=round(overhead * 100.0, 1),
+        staffing_efficiency_pct=round(staffing_efficiency(team_size, coeffs) * 100.0, 1),
+        team_size=team_size,
+        optimal_team_size=opt,
         total_cost_ai_assisted_usd=total_cost_ai,
         total_cost_manual_only_usd=total_cost_manual,
         consistency_warnings=consistency_warnings,
     )
     logger.info(
-        "synthesize_estimate complete: ai_assisted=%.0fh manual_only=%.0fh (PERT) across %d phase(s); %d role(s) in headcount",
-        ai_range.pert_mean,
-        manual_range.pert_mean,
+        "synthesize_estimate complete: ai_assisted=%.0fh manual_only=%.0fh (most likely) across %d phase(s); %d role(s) in headcount",
+        ai_range.most_likely,
+        manual_range.most_likely,
         len(pass2),
         len(headcount_rows),
     )

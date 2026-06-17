@@ -14,27 +14,31 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from models.project_schema import RoleRoster
 from models.twin_outputs import (
-    Assumption,
     Gap,
     Phase,
     PhaseEstimate,
-    Risk,
+    RiskInputList,
 )
-from orchestrator.role_attribution import attribute_roles
+from orchestrator.montecarlo import (
+    DEFAULT_DRAWS,
+    Range3,
+    ReductionSampler,
+    propagate_phase,
+    resolve_size_band,
+)
 
-from ._twin_base import make_twin_nodes
-from .discovery_analyst import pert_range
+from ._twin_base import assemble_phase_estimate, make_twin_nodes, risk_specs_from
 
 logger = logging.getLogger(__name__)
 
 # Plan baselines per planning outline §3.6.
 PLAN_A_HARNESS_BASE = 352  # eval harness build
-PLAN_B_TEAM_BASE = 656     # dedicated QA team baseline
+PLAN_B_TEAM_BASE = 480     # dedicated QA team baseline
 PLAN_C_HARNESS_BASE = 312  # reduced harness in hybrid
-PLAN_C_TEAM_BASE = 320     # reduced QA team in hybrid
+PLAN_C_TEAM_BASE = 208     # reduced QA team in hybrid (312 + 208 = 520 combined floor)
 
 PLAN_A_TP_FACTOR = 0.5
-PLAN_B_TP_FACTOR = 1.5
+PLAN_B_TP_FACTOR = 1.25
 PLAN_C_TP_FACTOR = 0.35
 
 
@@ -52,15 +56,23 @@ class QATPAInputs(BaseModel):
     qd_score: float = Field(default=12.0, ge=0, le=24, description="Sum of 4 dynamic chars, each 0-6")
     qi_score: float = Field(default=48.0, ge=0, le=96, description="Sum of 6 static chars, each 0 or 16")
 
-    supplementary_hours: float = Field(default=150.0, ge=0, le=600)
+    supplementary_hours: float = Field(default=90.0, ge=0, le=600)
 
     has_ai_features: bool = False
     has_regulatory_requirements: bool = False
     recommended_plan: QAPlan = QAPlan.PLAN_A
     ai_reduction_pct: float = Field(default=0.0, ge=0, le=30)
 
+    # Monte Carlo uncertainty (optional). The dominant size driver is the function-point
+    # count (it flows through compute_test_points → the plan totals); the LLM may give an
+    # ~80% band for it, a fallback CoV, and/or a low/high band on the AI reduction it
+    # proposes.
+    fp_range: Range3 | None = None
+    reduction_range: Range3 | None = None
+    estimate_cov: float | None = Field(default=None, ge=0, le=0.6)
+
     assumptions: list[str] = Field(default_factory=list, max_length=6)
-    risks: list[str] = Field(default_factory=list, max_length=5)
+    risks: RiskInputList = Field(default_factory=list, max_length=5)
     gaps: list[Gap] = Field(default_factory=list, max_length=4)
     confidence: float = Field(ge=0, le=1)
     notes: str = ""
@@ -85,6 +97,25 @@ def compute_plan_hours(total_tp: float, supplementary: float) -> dict[QAPlan, fl
     }
 
 
+def compute_qa_hours(inputs: QATPAInputs) -> tuple[float, dict]:
+    """Single-callable adapter for ``propagate_phase``: run TPA → plan hours and return
+    ``(hours_for_recommended_plan, breakdown)``.
+
+    The Monte Carlo layer perturbs ``total_function_points`` and re-runs this per draw
+    (2000×), so it does NO logging and NO plan-selection side effects — it just reads
+    ``inputs.recommended_plan`` (already sanity-checked once in ``build_phase_estimate``)
+    and selects that plan's total. The breakdown carries the TP components plus all three
+    plan totals for transparency."""
+    total_tp, tp_breakdown = compute_test_points(inputs)
+    plans = compute_plan_hours(total_tp, inputs.supplementary_hours)
+    return plans[inputs.recommended_plan], {
+        **tp_breakdown,
+        "plan_a_hours": round(plans[QAPlan.PLAN_A], 1),
+        "plan_b_hours": round(plans[QAPlan.PLAN_B], 1),
+        "plan_c_hours": round(plans[QAPlan.PLAN_C], 1),
+    }
+
+
 def auto_select_plan(has_ai: bool, has_reg: bool) -> QAPlan:
     if has_ai and has_reg:
         return QAPlan.PLAN_C
@@ -95,13 +126,29 @@ def auto_select_plan(has_ai: bool, has_reg: bool) -> QAPlan:
     return QAPlan.PLAN_A
 
 
-def build_phase_estimate(
-    inputs: QATPAInputs, *, effective_reduction: float, roster: RoleRoster
-) -> PhaseEstimate:
-    total_tp, tp_breakdown = compute_test_points(inputs)
-    plans = compute_plan_hours(total_tp, inputs.supplementary_hours)
+def _uncertain_fields_qa(inputs: QATPAInputs) -> dict[str, tuple[float, float, float]]:
+    """Resolve the size band onto the function-point count (it flows through
+    compute_test_points → plan totals). No bounds beyond the field's ``ge=0``.
+    Mirrors ``_uncertain_fields_dev``."""
+    band = resolve_size_band(
+        point_value=inputs.total_function_points,
+        explicit=inputs.fp_range,
+        estimate_cov=inputs.estimate_cov,
+        confidence=inputs.confidence,
+    )
+    return {"total_function_points": band} if band else {}
 
-    # Sanity-check the recommended plan against the rules.
+
+def build_phase_estimate(
+    inputs: QATPAInputs,
+    *,
+    effective_reduction: float,
+    roster: RoleRoster,
+    rng,
+    reduction_sampler: ReductionSampler,
+) -> PhaseEstimate:
+    # Sanity-check the recommended plan against the rules (logged ONCE here, never in
+    # the per-draw compute_qa_hours wrapper).
     auto_pick = auto_select_plan(inputs.has_ai_features, inputs.has_regulatory_requirements)
     selected = inputs.recommended_plan
     if selected != auto_pick:
@@ -111,34 +158,34 @@ def build_phase_estimate(
             auto_pick.value,
         )
 
-    manual_mid = plans[selected]
-    ai_mid = manual_mid * (1 - effective_reduction)
+    point_mid, breakdown = compute_qa_hours(inputs)
+    manual_mc, ai_mc = propagate_phase(
+        inputs,
+        compute_qa_hours,
+        size_fields=_uncertain_fields_qa(inputs),
+        reduction_sampler=reduction_sampler,
+        risk_specs=risk_specs_from(inputs.risks),
+        eff_point=effective_reduction,
+        n_draws=DEFAULT_DRAWS,
+        rng=rng,
+    )
+    ai_mid = point_mid * (1 - effective_reduction)
 
-    breakdown = {
-        **tp_breakdown,
-        "plan_a_hours": round(plans[QAPlan.PLAN_A], 1),
-        "plan_b_hours": round(plans[QAPlan.PLAN_B], 1),
-        "plan_c_hours": round(plans[QAPlan.PLAN_C], 1),
-    }
     notes = f"Selected plan {selected.value} (eval harness / QA team / hybrid). {inputs.notes}".strip()
 
-    return PhaseEstimate(
+    return assemble_phase_estimate(
         phase=Phase.QA_TESTING,
         twin_name="qa_testing_strategist",
         algorithm=f"TPA_Plan_{selected.value}",
-        ai_assisted_hours=pert_range(ai_mid),
-        manual_only_hours=pert_range(manual_mid),
-        ai_assisted_role_hours=attribute_roles(ai_mid, roster, Phase.QA_TESTING),
-        manual_only_role_hours=attribute_roles(manual_mid, roster, Phase.QA_TESTING),
-        assumptions=[Assumption(text=a, impact_hours=manual_mid * 0.05) for a in inputs.assumptions],
-        risks=[
-            Risk(description=r, likelihood=0.4, impact_hours_low=manual_mid * 0.05, impact_hours_high=manual_mid * 0.2)
-            for r in inputs.risks
-        ],
-        gaps=inputs.gaps,
-        confidence=inputs.confidence,
+        point_mid=point_mid,
+        ai_mid=ai_mid,
+        manual_mc=manual_mc,
+        ai_mc=ai_mc,
+        roster=roster,
+        inputs=inputs,
         breakdown=breakdown,
-        effective_ai_reduction_pct=round(effective_reduction * 100, 1),
+        effective_reduction=effective_reduction,
+        assumption_impact_factor=0.05,
         notes=notes,
     )
 

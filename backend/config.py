@@ -36,10 +36,14 @@ class Settings(BaseSettings):
     anthropic_model_tooling: str = Field(
         default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_TOOLING"
     )
-    # LLM-as-judge model for the evals harness (backend/evals/). The judge wants a
-    # strong model — defaults to Sonnet, overridable via `python -m evals.run
-    # --judge-model`. Independent of ANTHROPIC_MODEL so judging doesn't inherit the
-    # twins' model.
+    # LLM-as-judge for the evals harness (backend/evals/) defaults to OpenAI GPT-5.5 —
+    # the judge is intentionally a DIFFERENT provider from the Anthropic twins it
+    # grades (less same-model self-preference bias). `OPENAI_API_KEY` authenticates it;
+    # `OPENAI_MODEL_EVAL` (or `python -m evals.run --judge-model`) overrides the model.
+    # Passing an Anthropic `--judge-model claude-*` still works — the judge falls back
+    # to call_structured, and `anthropic_model_eval` is that fallback's default.
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
+    openai_model_eval: str = Field(default="gpt-5.5", alias="OPENAI_MODEL_EVAL")
     anthropic_model_eval: str = Field(
         default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_EVAL"
     )

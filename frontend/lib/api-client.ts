@@ -98,10 +98,34 @@ export interface EstimateHistoryItem {
   updated_at: string | null;
 }
 
-/** Recent persisted estimates for the dashboard history list. Empty when the
- *  backend has no Postgres history configured. */
-export async function listEstimateHistory(): Promise<EstimateHistoryItem[]> {
-  return jsonFetch("/estimates/history");
+/** One page of recent persisted estimates: the rows for the requested slice plus
+ *  `total`, the full row count, so the dashboard can render page controls. */
+export interface EstimateHistoryPage {
+  items: EstimateHistoryItem[];
+  total: number;
+}
+
+/** A page of recent persisted estimates for the dashboard history list, newest
+ *  first. Returns an empty page (total 0) when the backend has no Postgres history
+ *  configured. */
+export async function listEstimateHistory(
+  params: { limit?: number; offset?: number } = {},
+): Promise<EstimateHistoryPage> {
+  const { limit = 10, offset = 0 } = params;
+  const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  return jsonFetch(`/estimates/history?${qs}`);
+}
+
+/** Delete an estimate — removes its persisted history (+ phase rows) and any
+ *  in-memory state. Idempotent: deleting a missing estimate still resolves. Uses a
+ *  raw fetch (not jsonFetch) because the 204 response carries no JSON body. */
+export async function deleteEstimate(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/estimates/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    throw new Error(`${res.status} ${res.statusText}`);
+  }
 }
 
 export interface ReductionBandRow {
@@ -134,6 +158,34 @@ export async function saveReductionBands(
   return jsonFetch("/admin/reduction-bands", {
     method: "PUT",
     body: JSON.stringify({ bands }),
+  });
+}
+
+export interface StaffingCoefficientRow {
+  key: string;
+  value: number;
+  default_value: number;
+  min_value: number;
+  max_value: number;
+  is_override: boolean;
+}
+
+export interface StaffingCoefficientsResponse {
+  editable: boolean;
+  coefficients: StaffingCoefficientRow[];
+}
+
+/** Team-scaling (Brooks's Law + diminishing returns) coefficients for the Settings screen. */
+export async function getStaffingCoefficients(): Promise<StaffingCoefficientsResponse> {
+  return jsonFetch("/admin/staffing-coefficients");
+}
+
+export async function saveStaffingCoefficients(
+  coefficients: { key: string; value: number }[]
+): Promise<StaffingCoefficientsResponse> {
+  return jsonFetch("/admin/staffing-coefficients", {
+    method: "PUT",
+    body: JSON.stringify({ coefficients }),
   });
 }
 

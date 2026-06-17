@@ -6,12 +6,30 @@ JSON-serializable (no arbitrary Python types in fields).
 
 from __future__ import annotations
 
+import json
 import logging
 from enum import Enum
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_json_list(v: Any) -> Any:
+    """Tolerate a forced-tool-use field whose array value arrives as a JSON STRING.
+
+    Claude occasionally serializes a list-of-objects tool field (e.g. `risks`) as a
+    stringified JSON array instead of a real array. Parse it back into a list so the
+    twin doesn't fall back to a stub. Anything else is returned untouched for normal
+    validation."""
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+        except (ValueError, TypeError):
+            return v
+        return parsed
+    return v
 
 
 class Phase(str, Enum):
@@ -89,9 +107,16 @@ class HourRange(BaseModel):
     """Three-point PERT estimate."""
 
     model_config = ConfigDict(extra="forbid")
-    optimistic: float = Field(ge=0, description="Best-case hours")
-    most_likely: float = Field(ge=0, description="Most-likely hours (mid)")
-    pessimistic: float = Field(ge=0, description="Worst-case hours")
+    optimistic: float = Field(ge=0, description="Best-case hours (P10 when Monte-Carlo-derived)")
+    most_likely: float = Field(ge=0, description="Most-likely hours (deterministic mid / mode)")
+    pessimistic: float = Field(ge=0, description="Worst-case hours (P90 when Monte-Carlo-derived)")
+    # Monte Carlo extras (None for legacy / stub / pre-MC ranges → backward-compatible
+    # with persisted envelopes). `std` is the sample standard deviation of this
+    # scenario's hours (used by synthesize_estimate's variance-combine); `percentiles`
+    # is the full {p5,p10,p25,p50,p75,p90,p95} vector that feeds the review fan chart.
+    std: float | None = Field(default=None, ge=0)
+    mean: float | None = Field(default=None, ge=0)
+    percentiles: dict[str, float] | None = Field(default=None)
 
     @model_validator(mode="after")
     def _coerce_pert_ordering(self) -> HourRange:
@@ -149,6 +174,26 @@ class Risk(BaseModel):
     likelihood: float = Field(ge=0, le=1, description="0..1 probability")
     impact_hours_low: float = Field(ge=0)
     impact_hours_high: float = Field(ge=0)
+
+
+class RiskInput(BaseModel):
+    """LLM-proposed risk on a twin's `*Inputs` (forced tool-use). Each risk is a
+    discrete event the Monte Carlo layer fires with `probability`, adding sampled
+    incremental hours in [impact_hours_low, impact_hours_high] to BOTH scenarios.
+    Maps 1:1 to the output `Risk` (probability → likelihood). Size impacts as the
+    INCREMENTAL hours if the risk materializes; do not also pad the base estimate
+    for them (avoid double-counting with EAF / conservative-bias)."""
+
+    model_config = ConfigDict(extra="forbid")
+    description: str = Field(min_length=1, max_length=300)
+    probability: float = Field(ge=0, le=1, description="0..1 chance this risk materializes")
+    impact_hours_low: float = Field(ge=0, description="Added hours if it fires (low)")
+    impact_hours_high: float = Field(ge=0, description="Added hours if it fires (high)")
+
+
+# The twins' `risks` field type: a list of RiskInput that also tolerates a JSON-string
+# array from the LLM (a forced-tool-use quirk) instead of stubbing the whole phase.
+RiskInputList = Annotated[list[RiskInput], BeforeValidator(_coerce_json_list)]
 
 
 class Gap(BaseModel):
@@ -261,6 +306,12 @@ class DualScenarioEstimate(BaseModel):
 
     headcount_by_role: list[RoleHeadcount] = Field(default_factory=list)
     weekly_burn_rate_usd: float = 0.0
+    # Team-scaling (Brooks's Law + diminishing returns) outputs — see orchestrator/staffing.py.
+    # Defaulted so persisted pre-feature envelopes deserialize cleanly.
+    brooks_overhead_pct: float = 0.0      # coordination overhead applied to cost + schedule
+    staffing_efficiency_pct: float = 0.0  # realized fraction of ideal linear team scaling
+    team_size: int = 0                    # headcount the overhead/efficiency were computed on
+    optimal_team_size: int = 0            # the Brooks/diminishing-returns "sweet spot"
     total_cost_ai_assisted_usd: float = 0.0
     total_cost_manual_only_usd: float = 0.0
     # Meta-cost: Anthropic tokens + $ spent producing this estimate. Empty/zero

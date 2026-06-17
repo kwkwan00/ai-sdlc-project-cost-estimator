@@ -24,6 +24,7 @@ dependencies = [
     "alembic>=1.13",
     "greenlet>=3.0",
     "mcp>=1.12",
+    "openai>=2.41.1",
 ]
 
 [dependency-groups]

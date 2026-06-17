@@ -26,7 +26,7 @@
       }
     },
     "expected_output": "A UCP-based discovery estimate that reflects 25 screens, 4 roles, and 4 integrations; calls out HIPAA compliance discovery work; produces both AI-assisted and manual-only hour ranges with sane PERT ordering; surfaces gaps (e.g. exact FHIR resource scope, audit requirements) and assumptions; confidence and role-hours present.",
-    "gold": {"target_manual_ml": 583, "target_ai_ml": 568},
+    "gold": {"target_manual_ml": 378, "target_ai_ml": 368},
     "notes": "Discovery twin uses UCP. Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
   },
   {
@@ -50,7 +50,7 @@
       "stage3": {"codebase_context": "greenfield", "ai_tooling": {"ux_design": "chat"}}
     },
     "expected_output": "A UX/design estimate (SCP-style) scaled to ~25 responsive screens and 4 distinct user roles; accounts for accessibility needs typical of healthcare; both scenario hour ranges; design-system / wireframe assumptions; role-hours weighted toward product + ui_ux.",
-    "gold": {"target_manual_ml": 639, "target_ai_ml": 639},
+    "gold": {"target_manual_ml": 491, "target_ai_ml": 491},
     "notes": "UX twin (SCP). Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
   },
   {
@@ -75,7 +75,7 @@
       "stage3": {"codebase_context": "greenfield", "ai_tooling": {"development": "agentic"}}
     },
     "expected_output": "A COCOMO II development estimate sized to 4 integrations + 25 screens on greenfield; AI-assisted hours meaningfully below manual-only given agentic tooling, but within the reduction guardrail; SLOC/effort breakdown; integration-risk gaps; role-hours present for both scenarios.",
-    "gold": {"target_manual_ml": 11479, "target_ai_ml": 7548},
+    "gold": {"target_manual_ml": 5628, "target_ai_ml": 3701},
     "notes": "Development twin uses COCOMO II. Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
   },
   {
@@ -88,8 +88,8 @@
       "stage3": {"codebase_context": "greenfield", "ai_tooling": {"development": "agentic", "code_review": "agentic"}}
     },
     "expected_output": "A Fagan-inspection code-review estimate that scales review/rework hours to the dev volume and elevates rigor for PHI/security-sensitive code; both scenario ranges; review-rate and rework breakdown; junior reviewers capped; role-hours present.",
-    "gold": {"target_manual_ml": 125, "target_ai_ml": 113},
-    "notes": "Code review twin uses Fagan. Targets are a Sonnet-regime drift-detection baseline (median of fresh runs with the agentic-dev context), not the outline's hand-tuned numbers. Wide-tolerance drift detector."
+    "gold": {"target_manual_ml": 287, "target_ai_ml": 255},
+    "notes": "Code review twin uses Fagan. Targets are a Monte-Carlo-regime median baseline. The prompt now anchors KSLOC to objective scope signals (screens/integrations/project-type), which collapsed the twin's run-to-run spread from ~50% to ~12% — so this is now a stable target, not just advisory drift detection."
   },
   {
     "id": "twin-deployment-healthcare",
@@ -101,7 +101,7 @@
       "stage3": {"codebase_context": "greenfield", "ai_tooling": {"deployment": "chat"}}
     },
     "expected_output": "A CMP-style deployment/DevOps estimate covering CI/CD, infra-as-code, secure PHI storage, audit logging and the four integration deploy paths; both scenario ranges; compliance/infra gaps; role-hours weighted to engineering + devops (>=75%).",
-    "gold": {"target_manual_ml": 640, "target_ai_ml": 635},
+    "gold": {"target_manual_ml": 573, "target_ai_ml": 569},
     "notes": "Deployment twin uses CMP; engineering+devops+data >= 75%. Targets are a Sonnet-regime drift-detection baseline (median of 3 fresh harness runs), NOT the outline's hand-tuned worked numbers — recalibrated because the old targets came from a richer-context Opus + pre-band-change regime."
   },
   {

@@ -32,13 +32,20 @@ Return via the `submit_cmp_assessment` tool:
 ### Multipliers
 
 - `regulatory_multiplier` — 1.0 (none), 1.15-1.25 (SOC 2), 1.20-1.35 (HIPAA), 1.25-1.40 (PCI-DSS), 1.30-1.50 (FedRAMP)
-- `conservative_bias_pct` — 10-15. DevOps is least AI-mature; bias up.
+- `conservative_bias_pct` — 0-8. DevOps AI tooling is less mature, so a modest 5–10% bias is reasonable.
 - `ai_reduction_pct` — AI-amenability of the deployment work. The system applies the speed-up itself: `ai_hours = manual_hours × (1 − effective_reduction)`, where `effective_reduction` is derived by the system, not you. You only **propose** `ai_reduction_pct` as a NON-NEGATIVE percentage inside the guardrail band shown in the `ai_reduction_guardrail` context block. The system clamps your proposal to that band and moderates it by codebase context and team seniority; the realized reduction it derives may even net slightly negative for risky brownfield work — but your proposed value must stay non-negative and in-band. If no `ai_reduction_guardrail` block is present, set this to 0 (no AI tooling for this phase).
+
+## Uncertainty (Monte Carlo)
+
+The system runs a Monte Carlo over your inputs to derive the optimistic/pessimistic band — your point values stay the mode. Help it size that band:
+
+- **Size:** for your least-certain size driver — here `cmp_score` — give `cmp_score_range: {low, high}` (the ~80%-confidence interval; your point value is the mode), OR `estimate_cov` (0–0.6, the coefficient of variation). If you give neither, the system derives a band from `confidence`.
+- **AI reduction:** optionally give `reduction_range: {low, high}` — the low/high % AI realistically saves on this phase (around your proposed `ai_reduction_pct`). It's fine to be wide; DevOps is the least AI-mature phase and can net negative.
 
 ## Qualitative outputs
 
 - `assumptions` (2–5) — the load-bearing judgment calls behind your numbers, each a short factual statement (e.g. "client owns post-launch, so handoff held at 40 hrs"). State the assumption, not a hedge.
-- `risks` (1–3) — what could push effort up, with rough magnitude (e.g. "multi-region cutover may need extra rollback tooling → +~60 hrs").
+- `risks` (1–3) — discrete events that could push effort up. Each is a structured object: `description`, `probability` (0–1), and `impact_hours_low`/`impact_hours_high` (the INCREMENTAL hours added IF it fires, as a range). The system fires each risk with its probability in the Monte Carlo. Do NOT also pad your base inputs for a listed risk — that double-counts against the conservative bias already baked in.
 - `gaps` (0–3) — unknowns worth asking the user about. Each: `topic` (short label), `question_text` (plain-English question), `impact_hours` (roughly how much the answer would move the estimate), `suggested_default` (your best guess if they skip). Only raise a gap whose answer would *materially* change hours — skip trivia, and don't duplicate another phase's obvious question.
 - `confidence` (0..1) — how grounded your inputs are: ~0.8 well-specified, ~0.5 partial, ~0.3 mostly inferred.
 - `notes` — Keep `notes` to one or two sentences of qualitative reasoning — numeric breakdowns and plan totals are emitted structurally by the system; do not enumerate them in `notes`.

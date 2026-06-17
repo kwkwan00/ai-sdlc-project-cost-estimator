@@ -33,11 +33,14 @@ RubricName = Literal[
     "algorithm_conformance",
     "role_attribution_validity",
     "estimate_accuracy",
+    "interval_calibration",
     "extraction_accuracy",
     "staffing_adequacy",
     "classification_accuracy",
     "enum_constraint_adherence",
     "partition_correctness",
+    # Self-consistency rubric (deterministic scorer over N adapter re-runs).
+    "consistency",
 ]
 
 # The ten agents under evaluation: the six estimation twins plus the four
@@ -61,8 +64,12 @@ ALL_AGENTS: tuple[str, ...] = (
 # Applicability matrix. The two RAG retriever metrics (context_precision /
 # contextual_recall) were removed — these are non-retrieval agents. Each agent now
 # gets the high-value correctness checks that actually fit it: the six twins get
-# json_correctness + faithfulness + the four deterministic estimation-correctness
-# rubrics; the pre-/post-estimate agents get their own targeted checks.
+# json_correctness + faithfulness + the deterministic estimation-correctness rubrics
+# (including interval_calibration, which SKIPS on hand-authored cases lacking actuals
+# and SCORES on synthetic cases carrying gold["actual_*_ml"]); the pre-/post-estimate
+# agents get their own targeted checks. The self-consistency rubric (`consistency`)
+# is on the twins + tooling — it re-runs the adapter N times under the runner's
+# repeats knob and is a no-op skip at N=1.
 _TWIN_RUBRICS: list[RubricName] = [
     "json_correctness",
     "faithfulness",
@@ -70,6 +77,8 @@ _TWIN_RUBRICS: list[RubricName] = [
     "algorithm_conformance",
     "role_attribution_validity",
     "estimate_accuracy",
+    "interval_calibration",
+    "consistency",
 ]
 
 
@@ -81,7 +90,7 @@ def _rubrics_for(agent: str) -> list[RubricName]:
     if agent == "roster":
         return ["plan_quality", "faithfulness", "staffing_adequacy"]
     if agent == "tooling":
-        return ["classification_accuracy", "enum_constraint_adherence"]
+        return ["classification_accuracy", "enum_constraint_adherence", "consistency"]
     if agent == "consolidator":
         return ["plan_quality", "partition_correctness"]
     return []
@@ -93,8 +102,10 @@ AGENT_RUBRICS: dict[str, list[RubricName]] = {
 
 # Pass thresholds. The LLM-judged rubrics (faithfulness, plan_quality,
 # summarization) use 0.7. The deterministic correctness rubrics are a hard 1.0
-# (any violation is a fail). estimate_accuracy is banded relative error vs the
-# planning-outline worked example, so it uses 0.7 as a drift detector.
+# (any violation is a fail). estimate_accuracy / interval_calibration are banded
+# relative error vs reference actuals, so they use 0.7 as a drift detector. The
+# self-consistency rubric (`consistency`) measures run-to-run stability and uses 0.7
+# (a noisy agent that swings widely between identical runs fails).
 RUBRIC_THRESHOLDS: dict[RubricName, float] = {
     "faithfulness": 0.7,
     "plan_quality": 0.7,
@@ -104,12 +115,23 @@ RUBRIC_THRESHOLDS: dict[RubricName, float] = {
     "algorithm_conformance": 1.0,
     "role_attribution_validity": 1.0,
     "estimate_accuracy": 0.7,
+    "interval_calibration": 0.7,
     "extraction_accuracy": 1.0,
     "staffing_adequacy": 1.0,
     "classification_accuracy": 1.0,
     "enum_constraint_adherence": 1.0,
     "partition_correctness": 1.0,
+    "consistency": 0.7,
 }
+
+# Rubrics that need MULTIPLE adapter runs of the same case to score. The runner
+# re-runs each such rubric's agent ``repeats`` times and hands the rubric every
+# sample (see ``runner._run_case`` + ``rubrics.score_multi``):
+# - ``consistency`` scores run-to-run stability across the samples.
+# - ``faithfulness`` averages its judge verdict across the samples to damp judge noise.
+# At the default ``repeats == 1`` these collapse to single-sample behavior, so the
+# offline tests and existing runs are unchanged.
+NEEDS_MULTI_SAMPLE: frozenset[RubricName] = frozenset({"consistency", "faithfulness"})
 
 
 class EvalCase(BaseModel):

@@ -29,12 +29,16 @@ from sqlalchemy.ext.asyncio import (
 from db import postgres_adapter
 from db.orm_models import Base, CalibrationAggregate, PhaseHistory
 from db.repositories import (
+    count_estimate_history,
+    delete_estimate_history,
     get_calibration,
     get_calibration_for_all_phases,
     get_estimate_envelope,
+    get_staffing_coefficients,
     list_estimate_history,
     refresh_calibration_for_phase,
     save_estimate_history,
+    upsert_staffing_coefficients,
 )
 from models.project_schema import (
     CodebaseContext,
@@ -76,6 +80,20 @@ async def in_memory_db() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     finally:
         await engine.dispose()
         postgres_adapter._reset_for_tests()
+
+
+def _force_postgres_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the "Postgres disabled" path regardless of the host environment.
+
+    `_reset_for_tests()` alone only clears the cached engine — the next repository
+    call re-reads live settings and would actually connect if a real Postgres happens
+    to be listening on localhost:5432 (so the disabled-path assertions would fail on a
+    dev box / CI runner with Postgres up). Patching `get_sessionmaker` to return None
+    makes `session_scope()` yield None deterministically, exercising the disabled
+    branch every repository function guards with `if session is None`.
+    """
+    postgres_adapter._reset_for_tests()
+    monkeypatch.setattr(postgres_adapter, "get_sessionmaker", lambda: None)
 
 
 def _make_envelope(
@@ -215,10 +233,78 @@ async def test_history_list_and_envelope_roundtrip(in_memory_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_history_helpers_empty_when_disabled() -> None:
-    postgres_adapter._reset_for_tests()
+async def test_history_paging_and_count(in_memory_db) -> None:
+    for i in range(5):
+        await save_estimate_history(
+            _make_envelope(estimate_id=f"e{i}"), stage2=None, stage3=None
+        )
+
+    assert await count_estimate_history() == 5
+
+    first = await list_estimate_history(limit=2, offset=0)
+    second = await list_estimate_history(limit=2, offset=2)
+    third = await list_estimate_history(limit=2, offset=4)
+    assert [len(first), len(second), len(third)] == [2, 2, 1]
+
+    # Pages are disjoint and together cover every persisted row.
+    ids = {r["estimate_id"] for page in (first, second, third) for r in page}
+    assert ids == {f"e{i}" for i in range(5)}
+
+
+@pytest.mark.asyncio
+async def test_delete_estimate_history_removes_rows(in_memory_db) -> None:
+    from sqlalchemy import select
+
+    await save_estimate_history(
+        _make_envelope(estimate_id="to-delete"), stage2=None, stage3=None
+    )
+    assert await count_estimate_history() == 1
+
+    # Deleting an existing estimate removes it (and its phase rows) and reports True.
+    assert await delete_estimate_history("to-delete") is True
+    assert await count_estimate_history() == 0
     assert await list_estimate_history() == []
+    assert await get_estimate_envelope("to-delete") is None
+    async with in_memory_db() as session:
+        result = await session.execute(
+            select(PhaseHistory).where(PhaseHistory.estimate_id == "to-delete")
+        )
+        assert result.scalars().all() == []
+
+    # Deleting a now-missing id is a no-op that reports False.
+    assert await delete_estimate_history("to-delete") is False
+
+
+@pytest.mark.asyncio
+async def test_history_helpers_empty_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_postgres_disabled(monkeypatch)
+    assert await list_estimate_history() == []
+    assert await count_estimate_history() == 0
+    assert await delete_estimate_history("anything") is False
     assert await get_estimate_envelope("anything") is None
+
+
+@pytest.mark.asyncio
+async def test_staffing_coefficients_roundtrip(in_memory_db) -> None:
+    # Empty table → no overrides (callers fall back to code defaults).
+    assert await get_staffing_coefficients() == {}
+    assert (
+        await upsert_staffing_coefficients([("link_cost", 0.1), ("overhead_cap", 0.5)])
+        is True
+    )
+    assert await get_staffing_coefficients() == {"link_cost": 0.1, "overhead_cap": 0.5}
+    # Upsert updates an existing key in place.
+    assert await upsert_staffing_coefficients([("link_cost", 0.2)]) is True
+    assert (await get_staffing_coefficients())["link_cost"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_staffing_coefficients_empty_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_postgres_disabled(monkeypatch)
+    assert await get_staffing_coefficients() == {}
+    assert await upsert_staffing_coefficients([("link_cost", 0.1)]) is False
 
 
 @pytest.mark.asyncio
@@ -251,13 +337,13 @@ async def test_save_estimate_history_is_idempotent_on_id(in_memory_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_save_estimate_history_noops_when_postgres_disabled() -> None:
+async def test_save_estimate_history_noops_when_postgres_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """When session_scope yields None, save_estimate_history must not raise."""
-    postgres_adapter._reset_for_tests()
-    # No engine has been installed; the adapter will try to build one and fail
-    # gracefully because there's no DSN in test env.
+    _force_postgres_disabled(monkeypatch)
     env = _make_envelope()
-    # Should complete cleanly (no raise) even with no DB available.
+    # Should complete cleanly (no raise) when Postgres is disabled.
     await save_estimate_history(env, stage2=None, stage3=None)
 
 
@@ -368,9 +454,11 @@ async def test_refresh_calibration_aggregates_by_dimension(in_memory_db) -> None
 
 
 @pytest.mark.asyncio
-async def test_refresh_calibration_returns_zero_when_disabled() -> None:
+async def test_refresh_calibration_returns_zero_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """When Postgres isn't installed, refresh must no-op without crashing."""
-    postgres_adapter._reset_for_tests()
+    _force_postgres_disabled(monkeypatch)
     written = await refresh_calibration_for_phase("discovery")
     assert written == 0
 
@@ -416,8 +504,10 @@ async def test_get_calibration_prefers_most_specific_match(in_memory_db) -> None
 
 
 @pytest.mark.asyncio
-async def test_get_calibration_returns_empty_when_disabled() -> None:
-    postgres_adapter._reset_for_tests()
+async def test_get_calibration_returns_empty_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_postgres_disabled(monkeypatch)
     rows = await get_calibration("development", industry="fintech")
     assert rows == []
 
@@ -488,10 +578,10 @@ async def test_get_reduction_bands_returns_nested_dict(in_memory_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_reduction_bands_empty_when_disabled() -> None:
+async def test_get_reduction_bands_empty_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     from db.repositories import get_reduction_bands
 
-    postgres_adapter._reset_for_tests()
+    _force_postgres_disabled(monkeypatch)
     assert await get_reduction_bands() == {}
 
 
@@ -515,10 +605,12 @@ async def test_upsert_reduction_bands_inserts_then_updates(in_memory_db) -> None
 
 
 @pytest.mark.asyncio
-async def test_upsert_reduction_bands_returns_false_when_disabled() -> None:
+async def test_upsert_reduction_bands_returns_false_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from db.repositories import upsert_reduction_bands
 
-    postgres_adapter._reset_for_tests()
+    _force_postgres_disabled(monkeypatch)
     assert await upsert_reduction_bands([("development", "agentic", 0.1, 0.2)]) is False
 
 

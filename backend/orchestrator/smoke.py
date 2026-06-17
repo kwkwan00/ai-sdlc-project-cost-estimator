@@ -86,18 +86,21 @@ async def main(*, use_llm: bool = True) -> None:
 
     logger.info("smoke run complete: estimate_id=%s final estimate produced", estimate_id)
     print("\n=== FINAL ESTIMATE ===")
-    print(f"AI-assisted hours: {fe.total_ai_assisted_hours.pert_mean:.0f} (PERT)")
-    print(f"Manual-only hours: {fe.total_manual_only_hours.pert_mean:.0f} (PERT)")
-    print(f"AI hours saved:    {fe.ai_hours_saved_pert:.0f}")
+    print(f"AI-assisted hours: {fe.total_ai_assisted_hours.most_likely:.0f} (most likely)")
+    print(f"Manual-only hours: {fe.total_manual_only_hours.most_likely:.0f} (most likely)")
+    print(
+        f"AI hours saved:    "
+        f"{fe.total_manual_only_hours.most_likely - fe.total_ai_assisted_hours.most_likely:.0f}"
+    )
     print(f"AI cost saved:     ${fe.ai_cost_saved_usd:,.0f}")
     print(f"Cost (AI):         ${fe.total_cost_ai_assisted_usd:,.0f}")
     print(f"Cost (manual):     ${fe.total_cost_manual_only_usd:,.0f}")
     print(f"Confidence:        {fe.confidence:.0%}")
     print(f"Duration:          {fe.duration_weeks_low:.0f}-{fe.duration_weeks_high:.0f} weeks")
     print(f"Headcount:         {fe.headcount_by_role}")
-    print("\nPer-phase (PERT mid hours):")
+    print("\nPer-phase (most-likely hours):")
     for p in fe.phases:
-        print(f"  {p.phase.value:18s}  AI: {p.ai_assisted_hours.pert_mean:>6.0f}h    manual: {p.manual_only_hours.pert_mean:>6.0f}h    [{p.algorithm}]")
+        print(f"  {p.phase.value:18s}  AI: {p.ai_assisted_hours.most_likely:>6.0f}h    manual: {p.manual_only_hours.most_likely:>6.0f}h    [{p.algorithm}]")
 
 
 if __name__ == "__main__":

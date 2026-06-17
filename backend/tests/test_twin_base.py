@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from models.project_schema import RoleRoster
 from models.twin_outputs import Phase
-from orchestrator.nodes._twin_base import build_twin_user_prompt, stub_phase_estimate
+from orchestrator.nodes._twin_base import (
+    assemble_phase_estimate,
+    build_twin_user_prompt,
+    risk_specs_from,
+    risks_from_inputs,
+    stub_phase_estimate,
+)
 
 
 def test_stub_phase_estimate_round_trips_through_pydantic() -> None:
@@ -116,6 +122,93 @@ def test_build_twin_user_prompt_omits_guardrail_when_no_tooling() -> None:
     }
     prompt = build_twin_user_prompt(state, pass_num=1, phase_value="development")
     assert "ai_reduction_guardrail" not in prompt
+
+
+class _FakeRisk:
+    def __init__(self) -> None:
+        self.description = "Schema churn"
+        self.probability = 0.3
+        self.impact_hours_low = 10.0
+        self.impact_hours_high = 40.0
+
+
+def test_risk_specs_from_maps_to_probability_low_high_tuples() -> None:
+    specs = risk_specs_from([_FakeRisk()])
+    assert specs == [(0.3, 10.0, 40.0)]
+
+
+def test_risks_from_inputs_maps_probability_to_likelihood() -> None:
+    risks = risks_from_inputs([_FakeRisk()])
+    assert len(risks) == 1
+    r = risks[0]
+    assert r.description == "Schema churn"
+    assert r.likelihood == 0.3
+    assert r.impact_hours_low == 10.0
+    assert r.impact_hours_high == 40.0
+
+
+class _FakeInputs:
+    def __init__(self) -> None:
+        self.assumptions = ["Stable API"]
+        self.risks = [_FakeRisk()]
+        self.gaps = []
+        self.confidence = 0.7
+        self.notes = "ignored by assemble"
+
+
+def _mc(point: float, p10: float, p90: float):
+    from orchestrator.montecarlo import MCResult
+
+    return MCResult(
+        point=point,
+        p10=p10,
+        p50=point,
+        p90=p90,
+        mean=point,
+        std=0.0,
+        n=1,
+        degenerate=True,
+        percentiles={"p50": point},
+    )
+
+
+def test_assemble_phase_estimate_holds_invariants_and_assumption_factor() -> None:
+    roster = RoleRoster.default()
+    point_mid = 1000.0
+    reduction = 0.25
+    ai_mid = point_mid * (1 - reduction)
+    manual_mc = _mc(point_mid, 800, 1400)
+    ai_mc = _mc(ai_mid, 800 * (1 - reduction), 1400 * (1 - reduction))
+
+    est = assemble_phase_estimate(
+        phase=Phase.DEVELOPMENT,
+        twin_name="development_architect",
+        algorithm="COCOMO_II",
+        point_mid=point_mid,
+        ai_mid=ai_mid,
+        manual_mc=manual_mc,
+        ai_mc=ai_mc,
+        roster=roster,
+        inputs=_FakeInputs(),
+        breakdown={"ksloc": 5.0},
+        effective_reduction=reduction,
+        assumption_impact_factor=0.05,
+        notes="dev notes",
+    )
+
+    # AI mid is exactly manual mid × (1 − reduction).
+    assert abs(est.ai_assisted_hours.most_likely - est.manual_only_hours.most_likely * (1 - reduction)) < 1e-6
+    # Role hours sum to the deterministic mids.
+    assert abs(sum(rh.hours for rh in est.manual_only_role_hours) - point_mid) < 1e-6
+    assert abs(sum(rh.hours for rh in est.ai_assisted_role_hours) - ai_mid) < 1e-6
+    # Per-twin assumption factor is honored (0.05 here).
+    assert est.assumptions[0].impact_hours == point_mid * 0.05
+    # Risk mapping + passthrough fields.
+    assert est.risks[0].likelihood == 0.3
+    assert est.effective_ai_reduction_pct == 25.0
+    assert est.breakdown == {"ksloc": 5.0}
+    assert est.notes == "dev notes"
+    assert est.algorithm == "COCOMO_II"
 
 
 def test_build_twin_user_prompt_pass2_includes_user_answers() -> None:

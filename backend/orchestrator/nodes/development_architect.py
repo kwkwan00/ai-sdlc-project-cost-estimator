@@ -12,22 +12,27 @@ Math is still anchored to COCOMO II's `PM = 2.94 × KSLOC^E × EAF`, then hours 
 from __future__ import annotations
 
 import logging
+import statistics
 from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from models.project_schema import RoleRoster
 from models.twin_outputs import (
-    Assumption,
     Gap,
     Phase,
     PhaseEstimate,
-    Risk,
+    RiskInputList,
 )
-from orchestrator.role_attribution import attribute_roles
+from orchestrator.montecarlo import (
+    DEFAULT_DRAWS,
+    Range3,
+    ReductionSampler,
+    propagate_phase,
+    resolve_size_band,
+)
 
-from ._twin_base import make_twin_nodes
-from .discovery_analyst import pert_range
+from ._twin_base import assemble_phase_estimate, make_twin_nodes, risk_specs_from
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +94,15 @@ class DevCOCOMOInputs(BaseModel):
     infrastructure_leverage_pct: float = Field(default=0.0, ge=0, le=60)
     ai_reduction_pct: float = Field(default=0.0, ge=0, le=60)
 
+    # Monte Carlo uncertainty (all optional): a low/high SLOC interval the propagation
+    # samples (the dominant nonlinear driver), a low/high band on the proposed AI
+    # reduction %, and a fallback coefficient-of-variation when no range is given.
+    sloc_range: Range3 | None = None
+    reduction_range: Range3 | None = None
+    estimate_cov: float | None = Field(default=None, ge=0, le=0.6)
+
     assumptions: list[str] = Field(default_factory=list, max_length=6)
-    risks: list[str] = Field(default_factory=list, max_length=5)
+    risks: RiskInputList = Field(default_factory=list, max_length=5)
     gaps: list[Gap] = Field(default_factory=list, max_length=4)
     confidence: float = Field(ge=0, le=1)
     notes: str = ""
@@ -126,35 +138,92 @@ def compute_cocomo_hours(inputs: DevCOCOMOInputs) -> tuple[float, dict]:
     }
 
 
-def build_phase_estimate(
-    inputs: DevCOCOMOInputs, *, effective_reduction: float, roster: RoleRoster
-) -> PhaseEstimate:
-    manual_mid, breakdown = compute_cocomo_hours(inputs)
-    ai_mid = manual_mid * (1 - effective_reduction)
+def _uncertain_fields_dev(inputs: DevCOCOMOInputs) -> dict[str, tuple[float, float, float]]:
+    """Resolve the SLOC band onto whichever input `resolve_sloc` actually reads
+    (R7): `sloc_estimate` if present, else `function_points` (converting the
+    SLOC-expressed `sloc_range` into FP units via the language ratio), else nothing."""
+    ratio = LANGUAGE_SLOC_PER_FP.get(inputs.primary_language.lower(), 47)
+    if inputs.sloc_estimate is not None and inputs.sloc_estimate > 0:
+        field, point, explicit = "sloc_estimate", inputs.sloc_estimate, inputs.sloc_range
+    elif inputs.function_points and inputs.function_points > 0:
+        field, point = "function_points", inputs.function_points
+        explicit = (
+            Range3(low=inputs.sloc_range.low / ratio, high=inputs.sloc_range.high / ratio)
+            if inputs.sloc_range is not None
+            else None
+        )
+    else:
+        return {}
+    band = resolve_size_band(
+        point_value=point, explicit=explicit, estimate_cov=inputs.estimate_cov, confidence=inputs.confidence
+    )
+    return {field: band} if band else {}
 
-    return PhaseEstimate(
+
+def build_phase_estimate(
+    inputs: DevCOCOMOInputs,
+    *,
+    effective_reduction: float,
+    roster: RoleRoster,
+    rng,
+    reduction_sampler: ReductionSampler,
+) -> PhaseEstimate:
+    point_mid, breakdown = compute_cocomo_hours(inputs)
+    manual_mc, ai_mc = propagate_phase(
+        inputs,
+        compute_cocomo_hours,
+        size_fields=_uncertain_fields_dev(inputs),
+        reduction_sampler=reduction_sampler,
+        risk_specs=risk_specs_from(inputs.risks),
+        eff_point=effective_reduction,
+        n_draws=DEFAULT_DRAWS,
+        rng=rng,
+    )
+    ai_mid = point_mid * (1 - effective_reduction)
+
+    return assemble_phase_estimate(
         phase=Phase.DEVELOPMENT,
         twin_name="development_architect",
         algorithm="COCOMO_II",
-        ai_assisted_hours=pert_range(ai_mid),
-        manual_only_hours=pert_range(manual_mid),
-        ai_assisted_role_hours=attribute_roles(ai_mid, roster, Phase.DEVELOPMENT),
-        manual_only_role_hours=attribute_roles(manual_mid, roster, Phase.DEVELOPMENT),
-        assumptions=[Assumption(text=a, impact_hours=manual_mid * 0.05) for a in inputs.assumptions],
-        risks=[
-            Risk(description=r, likelihood=0.4, impact_hours_low=manual_mid * 0.05, impact_hours_high=manual_mid * 0.2)
-            for r in inputs.risks
-        ],
-        gaps=inputs.gaps,
-        confidence=inputs.confidence,
+        point_mid=point_mid,
+        ai_mid=ai_mid,
+        manual_mc=manual_mc,
+        ai_mc=ai_mc,
+        roster=roster,
+        inputs=inputs,
         breakdown=breakdown,
-        effective_ai_reduction_pct=round(effective_reduction * 100, 1),
+        effective_reduction=effective_reduction,
+        assumption_impact_factor=0.05,
         notes=inputs.notes.strip(),
     )
 
 
 def _proposed_reduction(inputs: DevCOCOMOInputs) -> float:
     return inputs.ai_reduction_pct / 100
+
+
+# Pass-2 self-consistency. COCOMO's most-likely is a PRODUCT of several independently LLM-sampled
+# drivers (SLOC^E · EAF · stack · leverage), so its run-to-run noise compounds — development is the
+# one high-variance twin. Folding K samples by the MEDIAN of each numeric driver shrinks that noise
+# ~1/sqrt(K); the qualitative fields ride on the MEDOID (the sample whose point hours is the median)
+# so assumptions/risks/ranges stay coherent with the chosen sizing.
+_ENSEMBLE_K = 5
+
+
+def _aggregate_cocomo(samples: list[DevCOCOMOInputs]) -> DevCOCOMOInputs:
+    by_hours = sorted(samples, key=lambda s: compute_cocomo_hours(s)[0])
+    medoid = by_hours[len(by_hours) // 2]
+    return medoid.model_copy(
+        update={
+            "sloc_estimate": statistics.median(resolve_sloc(s) for s in samples),
+            "function_points": None,
+            "scale_factor_sum": round(statistics.median(s.scale_factor_sum for s in samples)),
+            "eaf_composite": statistics.median(s.eaf_composite for s in samples),
+            "infrastructure_leverage_pct": statistics.median(
+                s.infrastructure_leverage_pct for s in samples
+            ),
+        }
+    )
 
 
 development_pass1, development_pass2 = make_twin_nodes(
@@ -167,5 +236,7 @@ development_pass1, development_pass2 = make_twin_nodes(
     stub_ai_mid=3400,
     stub_manual_mid=4000,
     proposed_reduction_fn=_proposed_reduction,
+    ensemble_k=_ENSEMBLE_K,
+    ensemble_aggregate_fn=_aggregate_cocomo,
     trace_name="twin.development",
 )

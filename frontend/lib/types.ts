@@ -23,6 +23,12 @@ export interface HourRange {
   optimistic: number;
   most_likely: number;
   pessimistic: number;
+  /** Monte Carlo dispersion (std-dev of the sampled distribution), when available. */
+  std?: number;
+  /** Mean of the sampled distribution, when available. */
+  mean?: number;
+  /** Sampled percentiles keyed "p5".."p95", when the estimate was simulated. */
+  percentiles?: Record<string, number>;
 }
 
 export interface RoleHours {
@@ -113,6 +119,12 @@ export interface DualScenarioEstimate {
   duration_weeks_high: number;
   headcount_by_role: RoleHeadcount[];
   weekly_burn_rate_usd: number;
+  // Team-scaling (Brooks's Law + diminishing returns) outputs — optional so persisted
+  // pre-feature estimates still deserialize.
+  brooks_overhead_pct?: number;
+  staffing_efficiency_pct?: number;
+  team_size?: number;
+  optimal_team_size?: number;
   total_cost_ai_assisted_usd: number;
   total_cost_manual_only_usd: number;
   llm_usage: LlmUsage;

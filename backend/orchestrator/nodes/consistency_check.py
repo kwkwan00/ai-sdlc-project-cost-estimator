@@ -14,6 +14,67 @@ from observability.langfuse_wrapper import traced
 
 logger = logging.getLogger(__name__)
 
+# Net-new SLOC the Development prompt anchors to a screen / integration: (low, high) across the
+# simple→complex tiers. Used only as a GROSS sanity band — the SLACK widens it 50% so normal
+# variation never trips, and we flag only when the twin's realized SLOC lands well outside it.
+_SLOC_PER_SCREEN_LO, _SLOC_PER_SCREEN_HI = 150.0, 700.0
+_SLOC_PER_INTEGRATION_LO, _SLOC_PER_INTEGRATION_HI = 300.0, 800.0
+_SLOC_SANITY_SLACK = 1.5
+
+
+def _screen_count(state: EstimationState) -> int:
+    """Stated screen count — stage2 first, then parsed signals (mirrors the code_review twin)."""
+    stage2 = state.get("stage2")
+    if stage2 is not None and stage2.screen_count_estimate:
+        return stage2.screen_count_estimate
+    parsed = state.get("parsed_context") or {}
+    return int(parsed.get("screen_count_estimate") or 0) if isinstance(parsed, dict) else 0
+
+
+def _integration_count(state: EstimationState) -> int:
+    """Stated integration count — stage2 (count or list), then parsed mentions."""
+    stage2 = state.get("stage2")
+    if stage2 is not None:
+        if stage2.integration_count:
+            return stage2.integration_count
+        if stage2.integration_list:
+            return len(stage2.integration_list)
+    parsed = state.get("parsed_context") or {}
+    return len(parsed.get("integration_mentions") or []) if isinstance(parsed, dict) else 0
+
+
+def _dev_sloc_screen_consistency_warning(
+    pass2: list[PhaseEstimate], state: EstimationState
+) -> str | None:
+    """Cross-check the Development twin's realized SLOC against an independent screen/integration
+    estimate. The twins are independent, so development free-sizes SLOC while code_review sizes the
+    same codebase from screen counts — this catches gross divergence (the classic boilerplate
+    over-count, or a wild undersize). A sanity flag only; it does NOT change the estimate."""
+    dev = next((pe for pe in pass2 if pe.phase == Phase.DEVELOPMENT), None)
+    if dev is None or not dev.breakdown:
+        return None
+    ksloc = dev.breakdown.get("ksloc")
+    screens = _screen_count(state)
+    if not ksloc or screens <= 0:  # no realized SLOC, or no screen signal to check against
+        return None
+    sloc = ksloc * 1000.0
+    integ = _integration_count(state)
+    lo = (screens * _SLOC_PER_SCREEN_LO + integ * _SLOC_PER_INTEGRATION_LO) / _SLOC_SANITY_SLACK
+    hi = (screens * _SLOC_PER_SCREEN_HI + integ * _SLOC_PER_INTEGRATION_HI) * _SLOC_SANITY_SLACK
+    per_screen = sloc / screens
+    if sloc > hi:
+        return (
+            f"Development sized {sloc:,.0f} SLOC (~{per_screen:,.0f}/screen) for {screens} screens "
+            f"+ {integ} integrations — well above the ~700 net-new SLOC/screen ceiling; likely "
+            f"counting framework/boilerplate."
+        )
+    if sloc < lo:
+        return (
+            f"Development sized only {sloc:,.0f} SLOC (~{per_screen:,.0f}/screen) for {screens} "
+            f"screens + {integ} integrations — unusually low; the build may be undersized."
+        )
+    return None
+
 
 def _capers_jones_qa_ratio_warning(pass2: list[PhaseEstimate]) -> str | None:
     """QA effort should typically be 30-40% of total. Flag if way outside that band."""
@@ -36,6 +97,9 @@ async def consistency_check(state: EstimationState) -> dict:
     warnings: list[str] = []
 
     if (w := _capers_jones_qa_ratio_warning(pass2)) is not None:
+        warnings.append(w)
+
+    if (w := _dev_sloc_screen_consistency_warning(pass2, state)) is not None:
         warnings.append(w)
 
     logger.info(

@@ -313,7 +313,7 @@ class _ToolingAdapter:
 
 class _ConsolidatorAdapter:
     async def run(self, case: EvalCase) -> AgentSample:
-        from orchestrator.nodes.merge_pass1 import _consolidate_semantically
+        from orchestrator.nodes.merge_pass1 import _consolidate_with_partition
 
         raw_candidates = case.input.get("candidates", [])
         candidates: list[tuple[Gap, list[Phase]]] = []
@@ -326,12 +326,13 @@ class _ConsolidatorAdapter:
         task_input = "Cluster near-duplicate clarifying questions:\n" + "\n".join(
             f"{i}. {text}" for i, text in enumerate(question_texts)
         )
-        # partition_correctness uses the per-input phase lists to check coverage.
+        # partition_correctness scores the predicted cluster→input-index mapping
+        # EXACTLY vs gold when present; input_phases is the proxy-fallback coverage.
         eval_context: dict[str, Any] = {
             "input_phases": [[p.value for p in phases] for _gap, phases in candidates]
         }
         try:
-            merged = await _consolidate_semantically(candidates)
+            merged, predicted_partition = await _consolidate_with_partition(candidates)
         except Exception as exc:  # noqa: BLE001
             return AgentSample(
                 case_id=case.id,
@@ -343,6 +344,7 @@ class _ConsolidatorAdapter:
                 eval_context=eval_context,
                 error=str(exc),
             )
+        eval_context["predicted_partition"] = predicted_partition
         output_text = "merged questions:\n" + "\n".join(
             f"- {gap.question_text}" for gap, _ in merged
         )

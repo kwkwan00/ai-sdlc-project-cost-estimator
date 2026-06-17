@@ -1,4 +1,4 @@
-"""Rubric scoring — deterministic correctness checks + a few Claude-as-judge rubrics.
+"""Rubric scoring — deterministic correctness checks + a few LLM-as-judge rubrics.
 
 The high-value checks here are DETERMINISTIC (no LLM): they recompute the project's
 own oracles (``orchestrator.ai_acceleration.band_for`` for the AI-reduction bands,
@@ -7,9 +7,10 @@ the dual-scenario hours) and assert the agent's output conforms. Each returns a
 ``RubricScore`` naming the offending value in ``reasoning``.
 
 Three rubrics remain LLM-judged (``faithfulness``, ``plan_quality``,
-``summarization``); they reuse ``orchestrator.llm.call_structured`` — the same
-forced tool-use plumbing the twins use — with a ``_Verdict`` response model. No new
-dependency is introduced.
+``summarization``); they go through ``evals.judge.judge_structured``, which defaults
+to OpenAI GPT-5.5 (a different provider from the Anthropic twins it grades) and parses
+into a ``_Verdict`` response model. Pointing ``--judge-model`` at a ``claude-*`` model
+transparently falls back to ``orchestrator.llm.call_structured``.
 
 ``score(...)`` dispatches by rubric name and never raises: a judge failure is
 captured as a ``RubricScore`` with ``error`` set and ``score=0.0`` so one bad
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import math
+import statistics
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,8 +34,8 @@ from models.twin_outputs import (
     RoleSeniority,
 )
 from orchestrator.ai_acceleration import NEGATIVE_FLOOR, band_for
-from orchestrator.llm import call_structured
 
+from .judge import judge_structured
 from .models import RUBRIC_THRESHOLDS, AgentSample, RubricName, RubricScore
 
 logger = logging.getLogger(__name__)
@@ -66,18 +68,36 @@ class _Verdict(BaseModel):
 # --------------------------------------------------------------------------- #
 
 _FAITHFULNESS_PROMPT = """\
-You are a strict evaluator of an AI agent's FAITHFULNESS to its grounding.
+You are a strict evaluator of an AI ESTIMATION agent's FAITHFULNESS to its grounding.
 
 You are given:
 - TASK INPUT: the task the agent was asked to perform.
 - GROUNDING CONTEXT: the project description + structured context the agent was given.
 - ACTUAL OUTPUT: what the agent produced.
 
-Score, in [0, 1], how well the output's claims, assumptions, and proposed inputs are
-SUPPORTED by the grounding context. Penalize HALLUCINATION: fabricated scope, invented
-integrations/features, regulatory regimes not mentioned, or quantities (screen counts,
-integration counts) not implied by the description. A high score means every material
-claim is grounded; a low score means the output invents facts the context does not support.
+Score, in [0, 1], how well the output's claims and assumptions are SUPPORTED by — or at
+least CONSISTENT with — the grounding context. Penalize genuine HALLUCINATION: scope the
+description does not imply (invented integrations, features, user roles, or regulatory
+regimes), quantities that CONTRADICT the description (e.g. a different screen or integration
+count than stated), or claims presented as established fact that the context does not
+support. A high score means the output stays within the described scope; a low score means
+it invents or contradicts facts.
+
+NOTE on ALGORITHM INTERNALS (do NOT penalize): the agent runs a FORMAL estimation algorithm
+(UCP / SCP / COCOMO II / Fagan / CMP / TPA). Its computed numeric internals — SLOC/FP/KLOC
+conversions, scale factors, EAF, inspection & rework rates, test points, hour ranges
+(optimistic/most-likely/pessimistic), confidence values, and component scores — are DERIVED
+ALGORITHM OUTPUTS, not factual claims about the project. They will not appear verbatim in
+the description and need NOT be "grounded" in it. Do not treat them as fabrications; only
+flag a number if it CONTRADICTS a quantity the context explicitly states.
+
+NOTE on PROPOSED SIZING ASSUMPTIONS (do NOT penalize when reasonable): estimating an
+under-specified project REQUIRES the agent to propose values for missing drivers (e.g. a
+likely tech stack, an assumed screen count when none is given, standard controls for the
+stated regulatory regime). When such a value is REASONABLE for the described scope and is
+framed as an assumption / risk / gap / clarifying question, it is EXPECTED estimation
+behavior, not a hallucination. Only penalize an assumption that CONTRADICTS the context or
+expands scope the description does not imply.
 
 NOTE on the AI reduction guardrail: a twin's `effective_ai_reduction_pct` is a
 POST-SCALING system value. The proposed reduction is clamped into the guardrail band,
@@ -87,10 +107,14 @@ value may legitimately fall BELOW the band's `min_pct` (even go negative). Do NO
 contradiction, or unfaithful claim — that is expected, correct behavior.
 
 Steps:
-1. Enumerate the output's material claims/assumptions/numbers.
-2. For each, mark whether the grounding context supports it (supported_claims) or it is
-   fabricated/contradicted (unsupported_claims).
-3. Reason about the proportion grounded, then assign the score.
+1. Enumerate the output's material claims and assumptions. Set aside derived algorithm
+   internals and `effective_ai_reduction_pct` per the NOTES above — those are not judged
+   for grounding.
+2. For each remaining claim/assumption, mark it SUPPORTED (stated or reasonably implied by
+   the context, or a reasonable framed assumption) or UNSUPPORTED (contradicts the context
+   or invents scope it does not imply).
+3. Score by the proportion supported, weighting genuine scope inventions and contradictions
+   heavily and reasonable framed assumptions not at all.
 
 Reason step-by-step in `reasoning` BEFORE assigning `score`. Submit via the tool.
 """
@@ -360,8 +384,22 @@ def _score_band_adherence(sample: AgentSample) -> RubricScore:
 
 
 def _score_algorithm_conformance(sample: AgentSample) -> RubricScore:
-    """ai_assisted ≈ manual_only × (1 − r) at each PERT point; breakdown finite & ≥0;
-    PERT ordering on both ranges. Score = fraction of checks passing."""
+    """Conformance checks for the Monte-Carlo-derived dual-scenario ranges:
+
+    (i)   ``ai.most_likely ≈ manual.most_likely × (1 − r)`` — the DETERMINISTIC-mid
+          identity still holds exactly (the MC layer only widens the band, it does
+          not move the modal draw);
+    (ii)  PERT ordering on both ranges;
+    (iii) ``breakdown`` values finite & ≥ 0;
+    (iv)  ``ai.pXX ≤ manual.pXX`` (within eps) at optimistic/most_likely/pessimistic
+          when ``r ≥ 0`` — per-draw ``ai ≤ manual`` for non-negative reduction, so it
+          must survive at every reported percentile (sign consistency).
+
+    The OLD per-percentile ``ai == manual×(1-r)`` equality at optimistic/pessimistic
+    is intentionally DROPPED: risk + reduction sampling add variance that the simple
+    comonotonic identity cannot model, so it is no longer a valid invariant.
+    Score = fraction of checks passing.
+    """
     rubric: RubricName = "algorithm_conformance"
     guard = _no_estimate(rubric, sample)
     if guard is not None:
@@ -374,21 +412,18 @@ def _score_algorithm_conformance(sample: AgentSample) -> RubricScore:
 
     ai = obj.ai_assisted_hours
     manual = obj.manual_only_hours
-    for label, a, m in (
-        ("optimistic", ai.optimistic, manual.optimistic),
-        ("most_likely", ai.most_likely, manual.most_likely),
-        ("pessimistic", ai.pessimistic, manual.pessimistic),
-    ):
-        expected = m * (1.0 - r)
-        tol = max(1.0, 0.02 * abs(expected))
-        ok = abs(a - expected) <= tol
-        checks.append(ok)
-        if not ok:
-            failures.append(
-                f"{label}: ai={a} != manual×(1-r)={expected:.2f} (tol {tol:.2f})"
-            )
 
-    # PERT ordering on both ranges.
+    # (i) Deterministic-mid identity — STILL exact.
+    expected_ml = manual.most_likely * (1.0 - r)
+    tol_ml = max(1.0, 0.02 * abs(expected_ml))
+    ok = abs(ai.most_likely - expected_ml) <= tol_ml
+    checks.append(ok)
+    if not ok:
+        failures.append(
+            f"most_likely: ai={ai.most_likely} != manual×(1-r)={expected_ml:.2f} (tol {tol_ml:.2f})"
+        )
+
+    # (ii) PERT ordering on both ranges.
     for name, rng in (("ai_assisted", ai), ("manual_only", manual)):
         ok = rng.optimistic <= rng.most_likely + _EPS <= rng.pessimistic + _EPS and (
             rng.optimistic <= rng.pessimistic + _EPS
@@ -400,12 +435,28 @@ def _score_algorithm_conformance(sample: AgentSample) -> RubricScore:
                 f"o={rng.optimistic} m={rng.most_likely} p={rng.pessimistic}"
             )
 
-    # Breakdown values finite and >= 0.
+    # (iii) Breakdown values finite and >= 0.
     for key, val in obj.breakdown.items():
         ok = math.isfinite(val) and val >= -_EPS
         checks.append(ok)
         if not ok:
             failures.append(f"breakdown[{key}]={val} not finite/non-negative")
+
+    # (iv) Sign consistency: for r >= 0, ai <= manual at each reported percentile.
+    if r >= -_EPS:
+        for label, a, m in (
+            ("optimistic", ai.optimistic, manual.optimistic),
+            ("most_likely", ai.most_likely, manual.most_likely),
+            ("pessimistic", ai.pessimistic, manual.pessimistic),
+        ):
+            tol = max(1.0, 0.02 * abs(m))
+            ok = a <= m + tol
+            checks.append(ok)
+            if not ok:
+                failures.append(
+                    f"{label}: ai={a} > manual={m} but reduction r={r:.4f}>=0 "
+                    f"(AI should not exceed manual; tol {tol:.2f})"
+                )
 
     score = sum(1.0 for c in checks if c) / len(checks) if checks else 1.0
     if failures:
@@ -415,7 +466,11 @@ def _score_algorithm_conformance(sample: AgentSample) -> RubricScore:
             passed=score >= RUBRIC_THRESHOLDS[rubric] - _EPS,
             reasoning="Algorithm-conformance failures: " + "; ".join(failures),
         )
-    return _pass(rubric, "All PERT points satisfy ai≈manual×(1-r); ordering + breakdown valid.")
+    return _pass(
+        rubric,
+        "ai.most_likely≈manual×(1-r); PERT ordering + breakdown valid; "
+        "ai≤manual at every percentile.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -551,6 +606,64 @@ def _score_estimate_accuracy(sample: AgentSample) -> RubricScore:
         score=score,
         passed=score >= RUBRIC_THRESHOLDS[rubric] - _EPS,
         reasoning="Banded accuracy vs targets: " + "; ".join(detail),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# interval_calibration (deterministic, reference-based, twins)
+# --------------------------------------------------------------------------- #
+
+
+def _interval_hit_score(actual: float, lo: float, hi: float) -> float:
+    """1.0 when ``actual`` falls in ``[lo, hi]``; otherwise banded partial credit by
+    relative distance to the NEARER bound (reuses ``_banded_rel_err_score`` so the
+    bands match ``estimate_accuracy``: full credit ≤0.25 rel, zero ≥0.60)."""
+    if lo - _EPS <= actual <= hi + _EPS:
+        return 1.0
+    nearer = lo if abs(actual - lo) <= abs(actual - hi) else hi
+    return _banded_rel_err_score(actual, nearer)
+
+
+def _score_interval_calibration(sample: AgentSample) -> RubricScore:
+    """Does the realized actual land inside the predicted ``[optimistic, pessimistic]``
+    band? Reference-based: reads ``gold["actual_manual_ml"]`` / ``actual_ai_ml`` and
+    checks each against its scenario's band, with banded partial credit by relative
+    distance to the nearer bound. SKIPS when the case carries no such gold."""
+    rubric: RubricName = "interval_calibration"
+    gold = sample.gold or {}
+    actual_manual = gold.get("actual_manual_ml")
+    actual_ai = gold.get("actual_ai_ml")
+    if actual_manual is None and actual_ai is None:
+        return _skip(rubric, "Case carries no interval actuals; skipped.")
+
+    guard = _no_estimate(rubric, sample)
+    if guard is not None:
+        return guard
+    obj: PhaseEstimate = sample.output_obj
+
+    parts: list[float] = []
+    detail: list[str] = []
+    if actual_manual is not None:
+        rng = obj.manual_only_hours
+        s = _interval_hit_score(float(actual_manual), rng.optimistic, rng.pessimistic)
+        parts.append(s)
+        detail.append(
+            f"manual actual={actual_manual} in [{rng.optimistic}, {rng.pessimistic}] -> {s:.2f}"
+        )
+    if actual_ai is not None:
+        rng = obj.ai_assisted_hours
+        s = _interval_hit_score(float(actual_ai), rng.optimistic, rng.pessimistic)
+        parts.append(s)
+        detail.append(
+            f"ai actual={actual_ai} in [{rng.optimistic}, {rng.pessimistic}] -> {s:.2f}"
+        )
+
+    score = sum(parts) / len(parts)
+    return RubricScore(
+        rubric=rubric,
+        score=score,
+        passed=score >= RUBRIC_THRESHOLDS[rubric] - _EPS,
+        reasoning="Interval calibration vs actuals: " + "; ".join(detail),
     )
 
 
@@ -739,26 +852,103 @@ def _score_enum_constraint_adherence(sample: AgentSample) -> RubricScore:
 # --------------------------------------------------------------------------- #
 
 
+def _pairs(cluster: list[int]) -> set[frozenset[int]]:
+    """The set of co-membership pairs within one cluster (singletons contribute none)."""
+    members = sorted(set(cluster))
+    out: set[frozenset[int]] = set()
+    for i in range(len(members)):
+        for j in range(i + 1, len(members)):
+            out.add(frozenset((members[i], members[j])))
+    return out
+
+
+def _pairwise_f1(predicted: list[list[int]], gold: list[list[int]]) -> float:
+    """Pairwise-F1 agreement between two clusterings of the same index universe.
+
+    Treats clustering as the set of same-cluster index PAIRS. F1 of the predicted
+    pair-set vs the gold pair-set: a perfect partition scores 1.0; a *lost* question
+    (a gold pair split apart) drops recall; a *spurious* merge (a pair joined that
+    gold keeps apart) drops precision. The all-singletons edge case (no pairs on
+    either side) is defined as 1.0 (the two clusterings agree: nothing is merged)."""
+    pred_pairs: set[frozenset[int]] = set()
+    for c in predicted:
+        pred_pairs |= _pairs(c)
+    gold_pairs: set[frozenset[int]] = set()
+    for c in gold:
+        gold_pairs |= _pairs(c)
+
+    if not pred_pairs and not gold_pairs:
+        return 1.0  # both all-singletons: they agree (nothing merged)
+    tp = len(pred_pairs & gold_pairs)
+    fp = len(pred_pairs - gold_pairs)
+    fn = len(gold_pairs - pred_pairs)
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    if precision + recall <= _EPS:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def _covers_universe(partition: list[list[int]], n: int) -> bool:
+    """True iff the partition is an exact cover of indices 0..n-1 with no overlaps."""
+    seen: list[int] = [idx for cluster in partition for idx in cluster]
+    return sorted(seen) == list(range(n))
+
+
 def _score_partition_correctness(sample: AgentSample) -> RubricScore:
-    """Proxy partition scoring (the consolidator's output does not expose the
-    cluster→input-index mapping — see report): (a) no input topic/question dropped
-    from the merged set's coverage, and (b) output cluster count == gold count."""
+    """Score the consolidator's predicted clustering against the gold clustering.
+
+    EXACT mode (preferred): when the adapter recorded the cluster→input-index mapping
+    in ``eval_context["predicted_partition"]`` (surfaced by
+    ``merge_pass1._consolidate_with_partition``), score it against ``gold["clusters"]``
+    by pairwise-F1 — a perfect partition is 1.0, a *lost* question (gold pair split)
+    lowers recall, a *spurious* merge (non-gold pair joined) lowers precision. A
+    predicted partition that is not an exact cover of the candidate universe is a hard
+    fail (lost/duplicated indices).
+
+    PROXY fallback: when no predicted partition is available, fall back to the original
+    count + phase-coverage heuristic (output cluster count == gold count and no input
+    phase dropped from the merged set's coverage)."""
     rubric: RubricName = "partition_correctness"
     obj = sample.output_obj
     if sample.error or obj is None:
         return _fail(rubric, f"No structured output to validate (error={sample.error}).")
 
-    # obj is list[tuple[Gap, list[Phase]]] — the merged questions.
-    merged = list(obj)
-    out_count = len(merged)
-
     gold = sample.gold or {}
     clusters = gold.get("clusters")
     if clusters is None:
         return _skip(rubric, "Case carries no gold clustering; skipped.")
-    gold_count = len(clusters)
+    gold_clusters: list[list[int]] = [list(c) for c in clusters]
 
-    # Coverage: every input phase represented in the merged output's phase-union.
+    # obj is list[tuple[Gap, list[Phase]]] — the merged questions.
+    merged = list(obj)
+
+    predicted = sample.eval_context.get("predicted_partition")
+    if isinstance(predicted, list) and predicted is not None:
+        predicted_clusters: list[list[int]] = [list(c) for c in predicted]
+        # Derive the candidate universe from the gold cover (authoritative).
+        universe = sorted({idx for cluster in gold_clusters for idx in cluster})
+        n = (max(universe) + 1) if universe else 0
+        if not _covers_universe(predicted_clusters, n):
+            return _fail(
+                rubric,
+                f"predicted partition {predicted_clusters} is not an exact cover of "
+                f"0..{n - 1} (lost, duplicated, or out-of-range indices).",
+            )
+        score = _pairwise_f1(predicted_clusters, gold_clusters)
+        return RubricScore(
+            rubric=rubric,
+            score=score,
+            passed=score >= RUBRIC_THRESHOLDS[rubric] - _EPS,
+            reasoning=(
+                f"pairwise-F1={score:.3f} for predicted {predicted_clusters} vs gold "
+                f"{gold_clusters} ({len(merged)} merged question(s))."
+            ),
+        )
+
+    # ----- Proxy fallback (no predicted mapping available) ----- #
+    out_count = len(merged)
+    gold_count = len(gold_clusters)
     in_phases: set[str] = set()
     for phase_list in sample.eval_context.get("input_phases", []):
         in_phases.update(phase_list)
@@ -774,11 +964,116 @@ def _score_partition_correctness(sample: AgentSample) -> RubricScore:
         failures.append(f"input phases dropped from coverage: {sorted(dropped)}")
 
     if failures:
-        return _fail(rubric, "Partition failures: " + "; ".join(failures))
+        return _fail(rubric, "Partition failures (proxy): " + "; ".join(failures))
     return _pass(
         rubric,
-        f"output clusters={out_count} == gold={gold_count}; phase coverage preserved.",
+        f"proxy: output clusters={out_count} == gold={gold_count}; phase coverage preserved.",
     )
+
+
+# --------------------------------------------------------------------------- #
+# consistency (deterministic, multi-sample) — twins + tooling
+# --------------------------------------------------------------------------- #
+
+# Coefficient-of-variation band for the twins' run-to-run stability. CoV <= LO is
+# perfectly stable (1.0); CoV >= HI is fully unstable (0.0); linear between. A CoV of
+# ~0.10 (10% swing between identical runs) still scores ~0.83 — tolerant of small
+# Monte-Carlo / sampling jitter while catching genuinely flappy twins.
+_CONSISTENCY_COV_LO = 0.02
+_CONSISTENCY_COV_HI = 0.35
+
+
+def _cov_score(values: list[float]) -> tuple[float, float]:
+    """Return ``(score, cov)`` for a list of run-to-run numeric outputs. ``cov`` is the
+    coefficient of variation (population std / mean); score is 1.0 at ``cov<=LO`` and
+    0.0 at ``cov>=HI``, linear between. A near-zero mean with near-zero spread is
+    treated as perfectly stable."""
+    mean = statistics.fmean(values) if values else 0.0
+    std = statistics.pstdev(values) if len(values) > 1 else 0.0
+    if abs(mean) <= _EPS:
+        return (1.0 if std <= _EPS else 0.0), 0.0
+    cov = std / abs(mean)
+    if cov <= _CONSISTENCY_COV_LO:
+        return 1.0, cov
+    if cov >= _CONSISTENCY_COV_HI:
+        return 0.0, cov
+    return (_CONSISTENCY_COV_HI - cov) / (_CONSISTENCY_COV_HI - _CONSISTENCY_COV_LO), cov
+
+
+def _twin_consistency(samples: list[AgentSample]) -> RubricScore:
+    """Run-to-run stability of a twin's key numeric output: the coefficient of
+    variation of ``manual_only_hours.most_likely`` across the N samples."""
+    rubric: RubricName = "consistency"
+    values: list[float] = []
+    for s in samples:
+        obj = s.output_obj
+        if s.error or obj is None or not isinstance(obj, PhaseEstimate) or s.is_stub:
+            return _fail(
+                rubric,
+                f"A run produced no usable estimate (error={s.error}, stub={s.is_stub}); "
+                "cannot assess consistency.",
+            )
+        values.append(obj.manual_only_hours.most_likely)
+
+    score, cov = _cov_score(values)
+    return RubricScore(
+        rubric=rubric,
+        score=score,
+        passed=score >= RUBRIC_THRESHOLDS[rubric] - _EPS,
+        reasoning=(
+            f"manual_ml across {len(values)} run(s)={[round(v, 1) for v in values]} "
+            f"CoV={cov:.3f} -> {score:.2f}."
+        ),
+    )
+
+
+def _tooling_consistency(samples: list[AgentSample]) -> RubricScore:
+    """Run-to-run per-phase label agreement for the tooling classifier: the fraction
+    of phases on which ALL runs emit the same AiToolingLevel."""
+    rubric: RubricName = "consistency"
+    per_phase: dict[str, set[str]] = {p: set() for p in _TOOLING_PHASES}
+    for s in samples:
+        obj = s.output_obj
+        levels = getattr(obj, "ai_tooling", None) if obj is not None else None
+        if s.error or levels is None:
+            return _fail(
+                rubric,
+                f"A run produced no ai_tooling labels (error={s.error}); "
+                "cannot assess consistency.",
+            )
+        for phase in _TOOLING_PHASES:
+            raw = getattr(levels, phase)
+            per_phase[phase].add(str(getattr(raw, "value", raw)))
+
+    agree = sum(1 for vals in per_phase.values() if len(vals) <= 1)
+    score = agree / len(_TOOLING_PHASES)
+    unstable = sorted(p for p, vals in per_phase.items() if len(vals) > 1)
+    detail = f"{agree}/{len(_TOOLING_PHASES)} phases agree across {len(samples)} run(s)"
+    if unstable:
+        detail += f"; unstable: {unstable}"
+    return RubricScore(
+        rubric=rubric,
+        score=score,
+        passed=score >= RUBRIC_THRESHOLDS[rubric] - _EPS,
+        reasoning=detail + ".",
+    )
+
+
+def _score_consistency(samples: list[AgentSample]) -> RubricScore:
+    """Self-consistency over N adapter re-runs of the same case. SKIPS at N<=1 (nothing
+    to compare). Dispatches twins → CoV of manual_ml; tooling → per-phase label
+    agreement. Other agents are not registered for this rubric."""
+    rubric: RubricName = "consistency"
+    if not samples:
+        return _fail(rubric, "No samples to assess consistency.")
+    if len(samples) <= 1:
+        return _skip(rubric, "Single run (repeats<=1); consistency not measured.")
+
+    agent = samples[0].agent
+    if agent == "tooling":
+        return _tooling_consistency(samples)
+    # Default: treat as a twin (the matrix only assigns consistency to twins + tooling).
+    return _twin_consistency(samples)
 
 
 # --------------------------------------------------------------------------- #
@@ -791,6 +1086,7 @@ _DETERMINISTIC = {
     "algorithm_conformance": _score_algorithm_conformance,
     "role_attribution_validity": _score_role_attribution_validity,
     "estimate_accuracy": _score_estimate_accuracy,
+    "interval_calibration": _score_interval_calibration,
     "extraction_accuracy": _score_extraction_accuracy,
     "staffing_adequacy": _score_staffing_adequacy,
     "classification_accuracy": _score_classification_accuracy,
@@ -799,28 +1095,12 @@ _DETERMINISTIC = {
 }
 
 
-async def score(
-    rubric: RubricName, sample: AgentSample, *, judge_model: str
-) -> RubricScore:
-    """Score one sample against one rubric. Never raises.
-
-    The deterministic rubrics run synchronously (no LLM); the three judge rubrics
-    call ``call_structured``. Any judge exception is captured into the RubricScore.
-    """
-    fn = _DETERMINISTIC.get(rubric)
-    if fn is not None:
-        try:
-            return fn(sample)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("deterministic rubric=%s case=%s raised: %s", rubric, sample.case_id, exc)
-            return RubricScore(
-                rubric=rubric, score=0.0, passed=False, reasoning="", error=str(exc)
-            )
-
+async def _judge_one(rubric: RubricName, sample: AgentSample, *, judge_model: str) -> RubricScore:
+    """One LLM-judge call for a judge rubric → RubricScore. Never raises."""
     threshold = RUBRIC_THRESHOLDS[rubric]
     prompt = _PROMPTS[rubric]
     try:
-        verdict = await call_structured(
+        verdict = await judge_structured(
             system=prompt,
             user=_build_user_message(rubric, sample),
             response_model=_Verdict,
@@ -839,3 +1119,68 @@ async def score(
         passed=verdict.score >= threshold,
         reasoning=verdict.reasoning,
     )
+
+
+async def score(
+    rubric: RubricName, sample: AgentSample, *, judge_model: str
+) -> RubricScore:
+    """Score one sample against one rubric. Never raises.
+
+    The deterministic rubrics run synchronously (no LLM); the three judge rubrics
+    call ``judge_structured``. The multi-sample ``consistency`` rubric cannot be scored
+    from a single sample, so it SKIPS here (the runner routes it through
+    ``score_multi``). Any judge exception is captured into the RubricScore.
+    """
+    if rubric == "consistency":
+        return _score_consistency([sample])
+
+    fn = _DETERMINISTIC.get(rubric)
+    if fn is not None:
+        try:
+            return fn(sample)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("deterministic rubric=%s case=%s raised: %s", rubric, sample.case_id, exc)
+            return RubricScore(
+                rubric=rubric, score=0.0, passed=False, reasoning="", error=str(exc)
+            )
+
+    return await _judge_one(rubric, sample, judge_model=judge_model)
+
+
+async def score_multi(
+    rubric: RubricName, samples: list[AgentSample], *, judge_model: str
+) -> RubricScore:
+    """Score a rubric that consumes MULTIPLE re-runs of the same case. Never raises.
+
+    Used by the runner only for rubrics in ``models.NEEDS_MULTI_SAMPLE``:
+    - ``consistency`` — deterministic run-to-run stability over the samples.
+    - ``faithfulness`` — average the judge verdict over the samples to damp judge noise
+      (one judge call per sample; the mean score is reported, ``passed`` against the
+      threshold). Falls back to the single-sample behavior when ``len(samples)==1``.
+
+    Any other rubric (or an empty list) falls back to single-sample ``score`` on the
+    first sample, so this is always safe to call.
+    """
+    if not samples:
+        return RubricScore(
+            rubric=rubric, score=0.0, passed=False, reasoning="No samples to score."
+        )
+    if rubric == "consistency":
+        return _score_consistency(samples)
+    if rubric == "faithfulness":
+        verdicts = [await _judge_one(rubric, s, judge_model=judge_model) for s in samples]
+        scored = [v for v in verdicts if v.error is None]
+        if not scored:
+            return verdicts[0]  # propagate the (captured) judge error
+        mean_score = statistics.fmean(v.score for v in scored)
+        return RubricScore(
+            rubric=rubric,
+            score=mean_score,
+            passed=mean_score >= RUBRIC_THRESHOLDS[rubric],
+            reasoning=(
+                f"faithfulness averaged over {len(scored)}/{len(samples)} run(s): "
+                f"scores={[round(v.score, 3) for v in scored]} mean={mean_score:.3f}."
+            ),
+        )
+    # Not a multi-sample rubric — score the first sample.
+    return await score(rubric, samples[0], judge_model=judge_model)

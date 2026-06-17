@@ -3,6 +3,7 @@
 import {
   BarChart,
   Bar,
+  ErrorBar,
   XAxis,
   YAxis,
   Tooltip,
@@ -11,6 +12,7 @@ import {
   CartesianGrid,
 } from "recharts";
 
+import { hasPercentiles } from "@/lib/fan-chart";
 import { PHASE_LABELS, type PhaseEstimate } from "@/lib/types";
 
 interface Props {
@@ -21,12 +23,20 @@ interface Props {
 export function PhaseBar({ phases, mode }: Props) {
   const data = phases.map((p) => {
     const range = mode === "ai_assisted" ? p.ai_assisted_hours : p.manual_only_hours;
+    // P10–P90 whisker, when the range was simulated. ErrorBar offsets are relative
+    // to the segment's cumulative value (most_likely), so [mid−p10, p90−mid] draws
+    // a band from P10 to P90 around the most-likely tick. Undefined → no whisker.
+    const ml = Math.round(range.most_likely);
+    const whisker: [number, number] | undefined = hasPercentiles(range)
+      ? [ml - range.percentiles.p10, range.percentiles.p90 - ml]
+      : undefined;
     return {
       name: PHASE_LABELS[p.phase],
       optimistic: Math.round(range.optimistic),
-      most_likely: Math.round(range.most_likely - range.optimistic),
-      pessimistic: Math.round(range.pessimistic - range.most_likely),
+      most_likely: ml - Math.round(range.optimistic),
+      pessimistic: Math.round(range.pessimistic) - ml,
       total: Math.round(range.pessimistic),
+      whisker,
     };
   });
 
@@ -40,7 +50,17 @@ export function PhaseBar({ phases, mode }: Props) {
           <Tooltip formatter={(value: number) => `${value} h`} />
           <Legend />
           <Bar dataKey="optimistic" stackId="a" fill="#a5b4fc" name="Optimistic" />
-          <Bar dataKey="most_likely" stackId="a" fill="#6366f1" name="→ Most likely" />
+          <Bar dataKey="most_likely" stackId="a" fill="#6366f1" name="→ Most likely">
+            {/* P10–P90 whisker around the most-likely tick (simulated ranges only;
+                undefined offsets render nothing). */}
+            <ErrorBar
+              dataKey="whisker"
+              direction="x"
+              width={4}
+              strokeWidth={1.5}
+              stroke="#1e1b4b"
+            />
+          </Bar>
           <Bar dataKey="pessimistic" stackId="a" fill="#312e81" name="→ Pessimistic" />
         </BarChart>
       </ResponsiveContainer>

@@ -1,8 +1,10 @@
 """LLM-evaluation harness.
 
-A custom Claude-as-judge harness (no deepeval/ragas/promptfoo) that evaluates
-every LLM agent in the estimator against five rubric judges, reusing the existing
-``orchestrator.llm.call_structured`` plumbing for all judge calls.
+A custom LLM-as-judge harness (no deepeval/ragas/promptfoo) that evaluates every LLM
+agent in the estimator against a mix of deterministic and LLM-judged rubrics. The
+LLM judge defaults to OpenAI GPT-5.5 (``evals.judge.judge_structured``) — a different
+provider from the Anthropic twins it grades — and falls back to
+``orchestrator.llm.call_structured`` when pointed at a ``claude-*`` model.
 
 Entry points:
 - ``evals.runner.run_evals`` — programmatic batch run.

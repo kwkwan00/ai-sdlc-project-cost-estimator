@@ -7,6 +7,7 @@ the `parsed_context` field on EstimationState and is injected into every twin's 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -111,8 +112,9 @@ async def parse_input(state: EstimationState) -> dict:
     # (used by the smoke harness and tests so they can skip the LLM call).
     existing = state.get("parsed_context") or {}
     if existing:
-        calibration = await _load_calibration(state)
-        bands = await _load_reduction_bands()
+        calibration, bands = await asyncio.gather(
+            _load_calibration(state), _load_reduction_bands()
+        )
         logger.debug("parse_input: pre-populated context; %d calibration row(s) loaded", len(calibration))
         return {
             "parsed_context": existing,
@@ -135,8 +137,10 @@ async def parse_input(state: EstimationState) -> dict:
     # Calibration runs after parse so Stage-2-less requests still benefit from
     # the LLM-extracted industry / project_type hints.
     state_after = {**state, "parsed_context": parsed_dict}
-    calibration = await _load_calibration(state_after)  # type: ignore[arg-type]
-    bands = await _load_reduction_bands()
+    calibration, bands = await asyncio.gather(
+        _load_calibration(state_after),  # type: ignore[arg-type]
+        _load_reduction_bands(),
+    )
     logger.debug("parse_input: %d calibration row(s) loaded", len(calibration))
     return {
         "parsed_context": parsed_dict,

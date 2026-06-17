@@ -56,6 +56,11 @@ def downgrade() -> None:
             existing_nullable=False,
             server_default="0",
         )
+    # Rows written after 0006 stopped populating raw_input (superseded by
+    # envelope_json), so they hold NULL. Backfill them to '' before re-imposing
+    # NOT NULL — otherwise the alter_column below fails on Postgres (and any other
+    # engine that validates NOT NULL against existing data).
+    op.execute("UPDATE estimate_history SET raw_input = '' WHERE raw_input IS NULL")
     with op.batch_alter_table("estimate_history") as batch_op:
         batch_op.alter_column(
             "raw_input",

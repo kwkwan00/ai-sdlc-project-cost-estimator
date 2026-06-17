@@ -15,8 +15,8 @@ total_tp   = dynamic_tp + static_tp
 
 # By plan:
 plan_A = 352 (harness build) + total_tp × 0.5  (automated tests) + supplementary
-plan_B = 656 (team baseline) + total_tp × 1.5  (manual tests)    + supplementary
-plan_C = 312 (reduced harness) + total_tp × 0.35 + 320 (reduced team) + supplementary
+plan_B = 480 (team baseline) + total_tp × 1.25 (manual tests)    + supplementary
+plan_C = 312 (reduced harness) + total_tp × 0.35 + 208 (reduced team) + supplementary
 
 hours_manual = plan[recommended_plan]
 hours_ai     = hours_manual × (1 − effective_reduction)   # effective_reduction derived by the system
@@ -35,7 +35,7 @@ Return via the `submit_tpa_assessment` tool:
 
 ### Supplementary
 
-- `supplementary_hours` — performance + security + UAT + exploratory. Typical 100-300.
+- `supplementary_hours` — performance + security + UAT + exploratory. Typical 40-150.
 
 ### Plan selection
 
@@ -51,10 +51,17 @@ Return via the `submit_tpa_assessment` tool:
 
 - `ai_reduction_pct` — AI-amenability of the testing work. The system applies the speed-up itself: `ai_hours = manual_hours × (1 − effective_reduction)`, where `effective_reduction` is derived by the system, not you. You only **propose** `ai_reduction_pct` as a NON-NEGATIVE percentage inside the guardrail band shown in the `ai_reduction_guardrail` context block. The system clamps your proposal to that band and moderates it by codebase context and team seniority; the realized reduction it derives may even net slightly negative for risky brownfield work — but your proposed value must stay non-negative and in-band. If no `ai_reduction_guardrail` block is present, set this to 0 (no AI tooling for this phase).
 
+## Uncertainty (Monte Carlo)
+
+The system runs a Monte Carlo over your inputs to derive the optimistic/pessimistic band — your point values stay the mode. Help it size that band:
+
+- **Size:** for your least-certain size driver — here `total_function_points` (it flows through TPA into every plan total) — give `fp_range: {low, high}` (the ~80%-confidence interval; your point value is the mode), OR `estimate_cov` (0–0.6, the coefficient of variation). If you give neither, the system derives a band from `confidence`.
+- **AI reduction:** optionally give `reduction_range: {low, high}` — the low/high % AI realistically saves on this phase (around your proposed `ai_reduction_pct`). It's fine to be wide; AI sometimes nets negative.
+
 ## Qualitative outputs
 
 - `assumptions` (2–5) — the load-bearing judgment calls behind your numbers, each a short factual statement (e.g. "FP count taken from the Development twin's sizing"). State the assumption, not a hedge.
-- `risks` (1–3) — what could push effort up, with rough magnitude (e.g. "security/UAT scope may grow under regulatory review → +~80 hrs").
+- `risks` (1–3) — discrete events that could push effort up. Each is a structured object: `description`, `probability` (0–1), and `impact_hours_low`/`impact_hours_high` (the INCREMENTAL hours added IF it fires, as a range). The system fires each risk with its probability in the Monte Carlo. Do NOT also pad your base inputs for a listed risk — that double-counts against the conservative bias already baked in.
 - `gaps` (0–3) — unknowns worth asking the user about. Each: `topic` (short label), `question_text` (plain-English question), `impact_hours` (roughly how much the answer would move the estimate), `suggested_default` (your best guess if they skip). Only raise a gap whose answer would *materially* change hours — skip trivia, and don't duplicate another phase's obvious question.
 - `confidence` (0..1) — how grounded your inputs are: ~0.8 well-specified, ~0.5 partial, ~0.3 mostly inferred.
 - `notes` — Keep `notes` to one or two sentences of qualitative reasoning — numeric breakdowns and plan totals are emitted structurally by the system; do not enumerate them in `notes`.

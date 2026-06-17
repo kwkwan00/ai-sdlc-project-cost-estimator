@@ -2,7 +2,7 @@
 
 MVP note: LangGraph does not yet ship an official Neo4j checkpointer in core.
 We use `InMemorySaver` for the in-process graph state and persist a denormalized
-copy of the final estimate (plus per-phase nodes) to Neo4j via `save_estimate()`
+copy of the final estimate (plus per-phase nodes) to Neo4j via `save_estimate_envelope()`
 for the calibration / history features. This lets us swap in a real
 `Neo4jCheckpointSaver` later without changing call sites.
 """

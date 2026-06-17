@@ -9,10 +9,17 @@ import { AlgorithmBreakdownChart } from "@/components/AlgorithmBreakdownChart";
 import { BreakdownView } from "@/components/BreakdownView";
 import { ConfidenceMeter } from "@/components/ConfidenceMeter";
 import { DualScenarioToggle } from "@/components/DualScenarioToggle";
+import { FanChart } from "@/components/FanChart";
 import { Modal } from "@/components/Modal";
 import { PhaseBar } from "@/components/PhaseBar";
+import { RiskRegister } from "@/components/RiskRegister";
 import { StageProgress } from "@/components/StageProgress";
+import { Tabs } from "@/components/Tabs";
+import { TornadoChart } from "@/components/TornadoChart";
 import { getEstimate } from "@/lib/api-client";
+import { confidenceLabel, pAiSavesTime } from "@/lib/fan-chart";
+import { expectedRiskHours, sortRisks } from "@/lib/risk";
+import { staffingSummary } from "@/lib/staffing";
 import {
   formatHours,
   formatPct,
@@ -71,6 +78,14 @@ export default function ReviewPage({ params }: PageProps) {
   });
   const totalHours = mode === "ai_assisted" ? totals.aiHours : totals.manualHours;
   const totalCost = mode === "ai_assisted" ? totals.aiCost : totals.manualCost;
+  // Base (pre-coordination-overhead) labor = Σ per-role costs; the staffing model's Brooks
+  // overhead is the gap up to the inflated project total (rendered as its own table row).
+  const baseRoleCost = fe.headcount_by_role.reduce(
+    (s, r) =>
+      s + (mode === "ai_assisted" ? r.ai_assisted_cost_usd : r.manual_only_cost_usd),
+    0,
+  );
+  const staffing = staffingSummary(fe);
   // Sum of per-phase most-likely hours (for each phase's "share of effort" bar).
   const phaseHoursTotal = fe.phases.reduce(
     (sum, p) =>
@@ -81,6 +96,261 @@ export default function ReviewPage({ params }: PageProps) {
     0,
   );
   const phaseModal = openPhase !== null ? fe.phases[openPhase] : null;
+  // Confidence section: fan chart of the current scenario's project total, an 80%
+  // interval readout, and P(AI saves time) (null → percentiles absent, so hidden).
+  const pSaves = pAiSavesTime(
+    fe.total_ai_assisted_hours,
+    fe.total_manual_only_hours,
+  );
+  const totalRisks = fe.phases.reduce((n, p) => n + p.risks.length, 0);
+
+  // The page is organized into tabs so it reads as three focused views rather than
+  // one long scroll. Each panel below is plain JSX that closes over the locals above
+  // (mode, fe, setOpenPhase, …); only the active panel is mounted (see <Tabs>).
+
+  // Tab 1 — the phase-by-phase estimate and the staffing/cost rollup.
+  const breakdownPanel = (
+    <>
+      <section className="card space-y-4">
+        <h2 className="section-title">Per-phase breakdown</h2>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-wide muted mb-1">
+              Hours range per phase
+            </p>
+            <PhaseBar phases={fe.phases} mode={mode} />
+          </div>
+          <div>
+            <p className="text-xs uppercase tracking-wide muted mb-1">
+              Effort share by algorithm
+            </p>
+            <AlgorithmBreakdownChart phases={fe.phases} mode={mode} />
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {fe.phases.map((p, idx) => {
+            const r =
+              mode === "ai_assisted" ? p.ai_assisted_hours : p.manual_only_hours;
+            const share = sharePct(r.most_likely, phaseHoursTotal);
+            const color = algorithmColor(p.algorithm);
+            return (
+              <div
+                key={p.phase}
+                className="rounded-lg border border-slate-200 p-3 space-y-2"
+                style={{ borderLeft: `3px solid ${color}` }}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm font-medium leading-snug">
+                    {PHASE_LABELS[p.phase]}
+                  </span>
+                  <AlgorithmBadge algorithm={p.algorithm} />
+                </div>
+                <div>
+                  <p className="text-xl font-semibold">
+                    {formatHours(r.most_likely)}
+                  </p>
+                  <p className="text-xs muted">
+                    {formatHours(r.optimistic)} – {formatHours(r.pessimistic)}
+                  </p>
+                </div>
+                {/* Compact per-phase fan chart for the selected scenario — its own
+                    P5–P95 / P10–P90 bands, colored to match the algorithm. */}
+                <div className="-mx-1">
+                  <FanChart range={r} label={PHASE_LABELS[p.phase]} color={color} />
+                </div>
+                <div>
+                  <div className="flex justify-between text-[10px] muted">
+                    <span>Share of effort</span>
+                    <span>{share}%</span>
+                  </div>
+                  <div className="mt-0.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-200">
+                    <div
+                      className="h-full rounded-full"
+                      style={{ width: `${share}%`, backgroundColor: color }}
+                    />
+                  </div>
+                </div>
+                <ConfidenceMeter value={p.confidence} />
+                <button
+                  type="button"
+                  onClick={() => setOpenPhase(idx)}
+                  className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700"
+                >
+                  Assumptions &amp; risks
+                  <span className="text-slate-400">
+                    ({p.assumptions.length} · {p.risks.length})
+                  </span>
+                  <span aria-hidden="true">→</span>
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <section className="card space-y-3">
+        <h2 className="section-title">Staffing &amp; cost per role</h2>
+        <p className="text-xs muted">
+          Hours and labor cost per role for the{" "}
+          {mode === "ai_assisted" ? "AI-assisted" : "manual-only"} scenario.
+        </p>
+        {fe.headcount_by_role.length === 0 ? (
+          <p className="text-sm muted">No roster supplied; staffing not computed.</p>
+        ) : (
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="text-left text-xs uppercase muted">
+                <th className="py-2">Role</th>
+                <th className="py-2">Heads</th>
+                <th className="py-2">Hours</th>
+                <th className="py-2">Rate</th>
+                <th className="py-2">Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              {fe.headcount_by_role.map((row) => {
+                const hours =
+                  mode === "ai_assisted"
+                    ? row.ai_assisted_hours
+                    : row.manual_only_hours;
+                const cost =
+                  mode === "ai_assisted"
+                    ? row.ai_assisted_cost_usd
+                    : row.manual_only_cost_usd;
+                return (
+                  <tr key={row.role_id} className="border-t border-slate-100 align-top">
+                    <td className="py-2">
+                      <div className="font-medium">{row.role_description}</div>
+                      <div className="text-[10px] uppercase tracking-wide text-slate-400">
+                        {ROLE_CATEGORY_LABELS[row.category]} /{" "}
+                        {ROLE_SENIORITY_LABELS[row.seniority]}
+                      </div>
+                    </td>
+                    <td className="py-2">{row.headcount}</td>
+                    <td className="py-2">{formatHours(hours)}</td>
+                    <td className="py-2 text-slate-500">
+                      {formatUSD(row.rate_per_hour)}/h
+                    </td>
+                    <td className="py-2 font-semibold">{formatUSD(cost)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            <tfoot>
+              {staffing.present && staffing.overheadPct > 0 && (
+                <tr className="border-t border-slate-100 text-slate-500">
+                  <td className="py-2" colSpan={4}>
+                    Coordination overhead (+{staffing.overheadPct}%)
+                  </td>
+                  <td className="py-2">
+                    {formatUSD(Math.max(0, totalCost - baseRoleCost))}
+                  </td>
+                </tr>
+              )}
+              <tr className="border-t border-slate-200 font-semibold">
+                <td className="py-2">Total</td>
+                <td className="py-2">
+                  {fe.headcount_by_role.reduce((s, r) => s + r.headcount, 0)}
+                </td>
+                <td className="py-2" />
+                <td className="py-2" />
+                <td className="py-2">{formatUSD(totalCost)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        )}
+        <p className="text-xs muted">
+          Weekly burn: {formatUSD(fe.weekly_burn_rate_usd)}
+        </p>
+        {staffing.present && (
+          <p className="text-xs muted">
+            {staffing.label}
+            {staffing.staffing !== "balanced" && (
+              <span
+                className={
+                  staffing.staffing === "overstaffed"
+                    ? "text-amber-600"
+                    : "text-slate-500"
+                }
+              >
+                {" "}
+                · {staffing.teamSize} assigned ({staffing.staffing})
+              </span>
+            )}
+          </p>
+        )}
+      </section>
+    </>
+  );
+
+  // Tab 2 — the AI-assistance explanation (where/how AI reduces the manual effort).
+  const aiPanel = <AiSavingsSection fe={fe} />;
+
+  // Tab 3 — uncertainty: the Monte Carlo confidence band, what drives the spread,
+  // and the cross-phase risk register.
+  const riskPanel = (
+    <>
+      <section className="card space-y-4">
+        <div className="flex items-end justify-between flex-wrap gap-2">
+          <div>
+            <h2 className="section-title">Confidence</h2>
+            <p className="text-xs muted">
+              Monte Carlo distribution of total{" "}
+              {mode === "ai_assisted" ? "AI-assisted" : "manual-only"} hours — the
+              dark band is the 80% interval (P10–P90), the light band P5–P95, and
+              the dashed line the most-likely estimate.
+            </p>
+          </div>
+          {pSaves !== null && (
+            <div className="text-right">
+              <p className="text-2xl font-semibold text-emerald-600">
+                {formatPct(pSaves)}
+              </p>
+              <p className="text-[10px] uppercase tracking-wide muted">
+                P(AI saves time)
+              </p>
+            </div>
+          )}
+        </div>
+        <FanChart
+          range={totalRange}
+          label={mode === "ai_assisted" ? "AI-assisted" : "Manual-only"}
+          color={mode === "ai_assisted" ? "#6366f1" : "#64748b"}
+          heightClass="h-72"
+        />
+        <p className="text-sm font-medium text-slate-700">
+          {confidenceLabel(totalRange)}
+        </p>
+      </section>
+
+      <section className="card space-y-4">
+        <div>
+          <h2 className="section-title">What drives the uncertainty</h2>
+          <p className="text-xs muted">
+            Phases ranked by the width of their{" "}
+            {mode === "ai_assisted" ? "AI-assisted" : "manual-only"} estimate range
+            (P10–P90 when simulated, else optimistic–pessimistic). The widest band —
+            at the top — is where extra discovery would tighten the total estimate
+            the most.
+          </p>
+        </div>
+        <TornadoChart phases={fe.phases} mode={mode} />
+      </section>
+
+      {totalRisks > 0 && (
+        <section className="card space-y-3">
+          <div>
+            <h2 className="section-title">Risk register</h2>
+            <p className="text-xs muted">
+              Every phase&apos;s risks, ranked by expected impact (likelihood ×
+              midpoint of the impact range). Scenario-agnostic.
+            </p>
+          </div>
+          <RiskRegister phases={fe.phases} />
+        </section>
+      )}
+    </>
+  );
 
   return (
     <div className="space-y-6">
@@ -146,145 +416,45 @@ export default function ReviewPage({ params }: PageProps) {
         </div>
       </section>
 
-      <section className="card space-y-4">
-        <h2 className="section-title">Per-phase breakdown</h2>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div>
-            <p className="text-xs uppercase tracking-wide muted mb-1">
-              Hours range per phase
-            </p>
-            <PhaseBar phases={fe.phases} mode={mode} />
-          </div>
-          <div>
-            <p className="text-xs uppercase tracking-wide muted mb-1">
-              Effort share by algorithm
-            </p>
-            <AlgorithmBreakdownChart phases={fe.phases} mode={mode} />
-          </div>
+      {/* First-class uncertainty headline: the 80% interval and P(AI saves time)
+          surfaced up top, not buried in the Confidence section below. */}
+      <section className="card flex flex-wrap items-center justify-between gap-4 border-l-4 border-l-brand-500 bg-brand-50/40">
+        <div>
+          <p className="text-[11px] uppercase tracking-wide muted">
+            80% confident ({mode === "ai_assisted" ? "AI-assisted" : "manual-only"})
+          </p>
+          <p className="text-2xl font-semibold text-slate-900">
+            {confidenceLabel(totalRange).replace(/^.*?:\s*/, "")}
+          </p>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-          {fe.phases.map((p, idx) => {
-            const r =
-              mode === "ai_assisted" ? p.ai_assisted_hours : p.manual_only_hours;
-            const share = sharePct(r.most_likely, phaseHoursTotal);
-            const color = algorithmColor(p.algorithm);
-            return (
-              <div
-                key={p.phase}
-                className="rounded-lg border border-slate-200 p-3 space-y-2"
-                style={{ borderLeft: `3px solid ${color}` }}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-sm font-medium leading-snug">
-                    {PHASE_LABELS[p.phase]}
-                  </span>
-                  <AlgorithmBadge algorithm={p.algorithm} />
-                </div>
-                <div>
-                  <p className="text-xl font-semibold">
-                    {formatHours(r.most_likely)}
-                  </p>
-                  <p className="text-xs muted">
-                    {formatHours(r.optimistic)} – {formatHours(r.pessimistic)}
-                  </p>
-                </div>
-                <div>
-                  <div className="flex justify-between text-[10px] muted">
-                    <span>Share of effort</span>
-                    <span>{share}%</span>
-                  </div>
-                  <div className="mt-0.5 h-1.5 w-full overflow-hidden rounded-full bg-slate-200">
-                    <div
-                      className="h-full rounded-full"
-                      style={{ width: `${share}%`, backgroundColor: color }}
-                    />
-                  </div>
-                </div>
-                <ConfidenceMeter value={p.confidence} />
-                <button
-                  type="button"
-                  onClick={() => setOpenPhase(idx)}
-                  className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700"
-                >
-                  Assumptions &amp; risks
-                  <span className="text-slate-400">
-                    ({p.assumptions.length} · {p.risks.length})
-                  </span>
-                  <span aria-hidden="true">→</span>
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      </section>
-
-      <AiSavingsSection fe={fe} />
-
-      <section className="card space-y-3">
-        <h2 className="section-title">Staffing &amp; cost per role</h2>
-        <p className="text-xs muted">
-          Hours and labor cost per role for the{" "}
-          {mode === "ai_assisted" ? "AI-assisted" : "manual-only"} scenario.
-        </p>
-        {fe.headcount_by_role.length === 0 ? (
-          <p className="text-sm muted">No roster supplied; staffing not computed.</p>
-        ) : (
-          <table className="min-w-full text-sm">
-            <thead>
-              <tr className="text-left text-xs uppercase muted">
-                <th className="py-2">Role</th>
-                <th className="py-2">Heads</th>
-                <th className="py-2">Hours</th>
-                <th className="py-2">Rate</th>
-                <th className="py-2">Cost</th>
-              </tr>
-            </thead>
-            <tbody>
-              {fe.headcount_by_role.map((row) => {
-                const hours =
-                  mode === "ai_assisted"
-                    ? row.ai_assisted_hours
-                    : row.manual_only_hours;
-                const cost =
-                  mode === "ai_assisted"
-                    ? row.ai_assisted_cost_usd
-                    : row.manual_only_cost_usd;
-                return (
-                  <tr key={row.role_id} className="border-t border-slate-100 align-top">
-                    <td className="py-2">
-                      <div className="font-medium">{row.role_description}</div>
-                      <div className="text-[10px] uppercase tracking-wide text-slate-400">
-                        {ROLE_CATEGORY_LABELS[row.category]} /{" "}
-                        {ROLE_SENIORITY_LABELS[row.seniority]}
-                      </div>
-                    </td>
-                    <td className="py-2">{row.headcount}</td>
-                    <td className="py-2">{formatHours(hours)}</td>
-                    <td className="py-2 text-slate-500">
-                      {formatUSD(row.rate_per_hour)}/h
-                    </td>
-                    <td className="py-2 font-semibold">{formatUSD(cost)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-            <tfoot>
-              <tr className="border-t border-slate-200 font-semibold">
-                <td className="py-2">Total</td>
-                <td className="py-2">
-                  {fe.headcount_by_role.reduce((s, r) => s + r.headcount, 0)}
-                </td>
-                <td className="py-2" />
-                <td className="py-2" />
-                <td className="py-2">{formatUSD(totalCost)}</td>
-              </tr>
-            </tfoot>
-          </table>
+        {pSaves !== null && (
+          <div className="text-right">
+            <p className="text-[11px] uppercase tracking-wide muted">
+              P(AI saves time)
+            </p>
+            <p className="text-2xl font-semibold text-emerald-600">
+              {formatPct(pSaves)}
+            </p>
+          </div>
         )}
-        <p className="text-xs muted">
-          Weekly burn: {formatUSD(fe.weekly_burn_rate_usd)}
-        </p>
       </section>
+
+      <Tabs
+        tabs={[
+          {
+            id: "breakdown",
+            label: "Cost breakdown",
+            content: breakdownPanel,
+          },
+          { id: "ai", label: "AI assistance", content: aiPanel },
+          {
+            id: "risk",
+            label: "Risk & uncertainty",
+            badge: totalRisks > 0 ? totalRisks : undefined,
+            content: riskPanel,
+          },
+        ]}
+      />
 
       {fe.llm_usage && fe.llm_usage.call_count > 0 && (
         <Modal
@@ -381,9 +551,17 @@ export default function ReviewPage({ params }: PageProps) {
                 {phaseModal.risks.length === 0 ? (
                   <p className="text-xs muted">None noted.</p>
                 ) : (
-                  <ul className="list-disc pl-5 space-y-1">
-                    {phaseModal.risks.map((r, i) => (
-                      <li key={i}>{r.description}</li>
+                  <ul className="space-y-2">
+                    {sortRisks(phaseModal.risks).map((r, i) => (
+                      <li key={i} className="leading-snug">
+                        <span>{r.description}</span>
+                        <span className="mt-0.5 block text-[10px] uppercase tracking-wide text-slate-400">
+                          {formatPct(r.likelihood)} likely ·{" "}
+                          {formatHours(r.impact_hours_low)}–
+                          {formatHours(r.impact_hours_high)} impact · exp{" "}
+                          {formatHours(expectedRiskHours(r))}
+                        </span>
+                      </li>
                     ))}
                   </ul>
                 )}

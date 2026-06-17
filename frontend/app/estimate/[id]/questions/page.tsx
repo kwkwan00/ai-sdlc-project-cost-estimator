@@ -7,10 +7,19 @@ import { use, useEffect, useState } from "react";
 import { StageProgress } from "@/components/StageProgress";
 import { getEstimate, submitAnswers } from "@/lib/api-client";
 import { questionsPollInterval } from "@/lib/estimate-status";
+import { rankQuestions, totalImpact, voiLabel } from "@/lib/voi";
 
 interface PageProps {
   params: Promise<{ id: string }>;
 }
+
+/** Badge tint per VoI tier — warmer = higher information value. */
+const VOI_TONE: Record<"high" | "medium" | "low" | "none", string> = {
+  high: "bg-amber-100 text-amber-800",
+  medium: "bg-brand-50 text-brand-700",
+  low: "bg-slate-100 text-slate-600",
+  none: "bg-slate-100 text-slate-400",
+};
 
 export default function QuestionsPage({ params }: PageProps) {
   const { id } = use(params);
@@ -90,25 +99,49 @@ export default function QuestionsPage({ params }: PageProps) {
           {data.clarifying_questions.length === 0 ? (
             <p className="muted">No questions — pass 1 produced no gaps.</p>
           ) : (
-            data.clarifying_questions.map((q) => (
-              <div key={q.id}>
-                <div className="flex items-baseline justify-between gap-3">
-                  <label className="label">{q.text}</label>
-                  <span className="text-xs muted">
-                    impact ≈ {Math.round(q.impact_hours)}h
-                  </span>
-                </div>
-                <input
-                  type="text"
-                  className="input mt-1"
-                  placeholder={`Default: ${q.suggested_default}`}
-                  value={answers[q.id] || ""}
-                  onChange={(e) =>
-                    setAnswers({ ...answers, [q.id]: e.target.value })
-                  }
-                />
-              </div>
-            ))
+            (() => {
+              const ranked = rankQuestions(data.clarifying_questions);
+              const total = totalImpact(ranked);
+              return (
+                <>
+                  <p className="rounded-md bg-brand-50 px-3 py-2 text-xs text-brand-700">
+                    Ordered by potential impact — answer the highest-impact
+                    questions first to tighten the estimate. The badge shows roughly
+                    how many hours each gap could shift the estimate (a relative
+                    value-of-information proxy, not a precise figure).
+                  </p>
+                  {ranked.map((q) => {
+                    const badge = voiLabel(q, total);
+                    return (
+                      <div key={q.id}>
+                        <div className="flex items-baseline justify-between gap-3">
+                          <label className="label">{q.text}</label>
+                          <span
+                            title={
+                              badge.sharePct !== undefined
+                                ? `~${badge.sharePct}% of the total flagged impact`
+                                : undefined
+                            }
+                            className={`shrink-0 whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] font-medium ${VOI_TONE[badge.level]}`}
+                          >
+                            {badge.text}
+                          </span>
+                        </div>
+                        <input
+                          type="text"
+                          className="input mt-1"
+                          placeholder={`Default: ${q.suggested_default}`}
+                          value={answers[q.id] || ""}
+                          onChange={(e) =>
+                            setAnswers({ ...answers, [q.id]: e.target.value })
+                          }
+                        />
+                      </div>
+                    );
+                  })}
+                </>
+              );
+            })()
           )}
           <div className="flex items-center justify-end gap-3 pt-2">
             <button

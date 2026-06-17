@@ -77,8 +77,8 @@ Return a single integer `efactor` = sum of the 8 ratings (max 40).
 
 ### Project type signal
 
-- `phase_ratio_hint`: 0.05–0.15. Use 0.07 (greenfield web), 0.08 (default), 0.10 (regulated), 0.12 (legacy replacement).
-- `productivity_factor`: 18–32 hours/UCP (typically 20–28). Pick higher for regulated / complex domains.
+- `phase_ratio_hint`: 0.05–0.15. Use 0.07 (greenfield web), 0.08 (default), 0.08 (regulated), 0.12 (legacy replacement).
+- `productivity_factor`: 18–32 hours/UCP (typically 20–28). Use the midpoint; reserve the top of the range only for genuinely novel domains.
 
 ## Worked example (abbreviated)
 
@@ -88,10 +88,16 @@ Return a single integer `efactor` = sum of the 8 ratings (max 40).
 > `stakeholder_group_count` 2, `decision_maker_accessibility` `readily_available`,
 > `alignment_difficulty` `pre_aligned`; `phase_ratio_hint` 0.08, `productivity_factor` 22.
 
+## Uncertainty (Monte Carlo)
+
+The system runs a Monte Carlo over your inputs to derive the optimistic/pessimistic band — your point values stay the mode. Help it size that band:
+
+- **Size:** for your least-certain size driver — here the continuous `productivity_factor` (hrs/UCP) — give `productivity_factor_range: {low, high}` (the ~80%-confidence interval; your point value is the mode), OR `estimate_cov` (0–0.6, the coefficient of variation). If you give neither, the system derives a band from `confidence`.
+
 ## Qualitative outputs
 
 - `assumptions` (2–5) — the load-bearing judgment calls behind your numbers, each a short factual statement (e.g. "6 use cases inferred from the stated scope"). State the assumption, not a hedge.
-- `risks` (1–3) — what could push effort up, with rough magnitude (e.g. "stakeholder count may be higher → +~30 hrs").
+- `risks` (1–3) — discrete events that could push effort up. Each is a structured object: `description`, `probability` (0–1), and `impact_hours_low`/`impact_hours_high` (the INCREMENTAL hours added IF it fires, as a range). The system fires each risk with its probability in the Monte Carlo. Do NOT also pad your base inputs for a listed risk — that double-counts against the conservative bias already baked in.
 - `gaps` (0–3) — unknowns worth asking the user about. Each: `topic` (short label), `question_text` (plain-English question), `impact_hours` (roughly how much the answer would move the estimate), `suggested_default` (your best guess if they skip). Only raise a gap whose answer would *materially* change hours — skip trivia, and don't duplicate another phase's obvious question.
 - `confidence` (0..1) — how grounded your inputs are: ~0.8 well-specified, ~0.5 partial, ~0.3 mostly inferred.
 - `notes` — Keep `notes` to one or two sentences of qualitative reasoning — numeric component breakdowns are emitted structurally by the system; do not enumerate them in `notes`.

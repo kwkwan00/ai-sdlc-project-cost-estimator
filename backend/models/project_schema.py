@@ -218,7 +218,11 @@ class Stage3Context(BaseModel):
 class CreateEstimateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_name: str | None = None
-    raw_input: str = Field(min_length=10, description="Stage 1: unstructured project description")
+    raw_input: str = Field(
+        min_length=10,
+        max_length=20000,
+        description="Stage 1: unstructured project description",
+    )
     stage2: Stage2Context | None = None
     stage3: Stage3Context | None = None
 

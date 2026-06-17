@@ -104,14 +104,32 @@ def _validate_partition(clusters: list[_GapCluster], n: int) -> bool:
     return len(seen) == n
 
 
-async def _consolidate_semantically(
+def _identity_partition(n: int) -> list[list[int]]:
+    """The no-op clustering: every candidate is its own singleton cluster."""
+    return [[i] for i in range(n)]
+
+
+async def _consolidate_with_partition(
     candidates: list[tuple[Gap, list[Phase]]],
-) -> list[tuple[Gap, list[Phase]]]:
-    """LLM pass that clusters near-duplicate questions; returns `candidates` on failure."""
+) -> tuple[list[tuple[Gap, list[Phase]]], list[list[int]]]:
+    """LLM pass that clusters near-duplicate questions.
+
+    Returns ``(merged, partition)`` where ``partition[k]`` is the list of input
+    candidate indices that output cluster ``k`` merged. The mapping is normally
+    consumed internally by ``_merge_cluster`` and discarded; surfacing it here lets
+    the eval harness score the predicted clustering EXACTLY against a gold partition
+    (see ``evals/rubrics.py::partition_correctness``) without changing runtime
+    behavior — ``_consolidate_semantically`` still returns just the merged list.
+
+    On any degrade path (too few candidates, no API key, LLM error, or a returned
+    non-partition) it falls back to the topic-dedup ``candidates`` unchanged, paired
+    with the identity partition so callers always get a well-formed mapping.
+    """
     if len(candidates) < _MIN_CANDIDATES_FOR_LLM:
-        return candidates
+        return candidates, _identity_partition(len(candidates))
     if not get_settings().anthropic_api_key:
-        return candidates  # keep the node runnable without Anthropic access
+        # keep the node runnable without Anthropic access
+        return candidates, _identity_partition(len(candidates))
 
     listing = "\n".join(
         f"{i}. [topic: {gap.topic}] {gap.question_text}"
@@ -127,7 +145,7 @@ async def _consolidate_semantically(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("question consolidation failed (%s); using topic-dedup only", exc)
-        return candidates
+        return candidates, _identity_partition(len(candidates))
 
     if not _validate_partition(result.clusters, len(candidates)):
         logger.warning(
@@ -136,8 +154,9 @@ async def _consolidate_semantically(
             len(result.clusters),
             len(candidates),
         )
-        return candidates
+        return candidates, _identity_partition(len(candidates))
 
+    partition = [list(cluster.member_indices) for cluster in result.clusters]
     consolidated = [
         _merge_cluster([candidates[i] for i in cluster.member_indices], cluster.merged_question)
         for cluster in result.clusters
@@ -147,7 +166,20 @@ async def _consolidate_semantically(
         len(candidates),
         len(consolidated),
     )
-    return consolidated
+    return consolidated, partition
+
+
+async def _consolidate_semantically(
+    candidates: list[tuple[Gap, list[Phase]]],
+) -> list[tuple[Gap, list[Phase]]]:
+    """LLM pass that clusters near-duplicate questions; returns `candidates` on failure.
+
+    Thin wrapper over ``_consolidate_with_partition`` that drops the cluster→input
+    index mapping — the runtime graph only needs the merged questions. The mapping
+    is exposed via ``_consolidate_with_partition`` for the eval adapter.
+    """
+    merged, _partition = await _consolidate_with_partition(candidates)
+    return merged
 
 
 @traced(name="merge_pass1")
