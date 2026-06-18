@@ -14,6 +14,7 @@ import asyncio
 import logging
 import random
 from collections.abc import Awaitable, Callable
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,14 @@ from models.twin_outputs import (
 from observability.langfuse_wrapper import traced
 from orchestrator.ai_acceleration import band_for, effective_ai_reduction
 from orchestrator.llm import call_structured, render_context_block
-from orchestrator.montecarlo import Range3, ReductionSampler, make_rng, sample_pert
+from orchestrator.montecarlo import (
+    DEFAULT_DRAWS,
+    Range3,
+    ReductionSampler,
+    make_rng,
+    propagate_phase,
+    sample_pert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +48,13 @@ PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 _PHASE_VALUES = {p.value for p in Phase}
 
 
+@cache
 def load_prompt(name: str) -> str:
-    """Load a twin's system prompt from prompts/<name>.md."""
+    """Load a twin's system prompt from prompts/<name>.md.
+
+    Prompts are static at runtime, so each file is read once per process and the
+    result is cached by ``name`` (avoids a blocking ``read_text`` on every one of
+    the 12+ twin invocations per estimate)."""
     return (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
 
 
@@ -232,16 +245,91 @@ def assemble_phase_estimate(
     )
 
 
+def build_phase_from_compute(
+    inputs: Any,
+    *,
+    phase: Phase,
+    twin_name: str,
+    algorithm: str,
+    compute_fn: Callable[[Any], tuple[float, dict]],
+    size_fields: dict[str, tuple[float, float, float]],
+    effective_reduction: float,
+    roster: RoleRoster,
+    rng: random.Random,
+    reduction_sampler: ReductionSampler,
+    assumption_impact_factor: float,
+    notes: str,
+) -> PhaseEstimate:
+    """Run a twin's compute → Monte-Carlo propagation → final-estimate assembly.
+
+    Hoists the body that was byte-identical across all six twins' ``build_phase_estimate``:
+    compute the deterministic point hours + breakdown, propagate the three uncertainty sources
+    (input-size band, AI-reduction sampler, discrete risks) through the SAME ``compute_fn`` via
+    ``propagate_phase``, derive the AI-assisted mid by the point reduction
+    (``ai_mid = point_mid × (1 − effective_reduction)``), and hand both ``MCResult``s to
+    ``assemble_phase_estimate``. A twin supplies only its labels, its ``compute_fn`` + resolved
+    ``size_fields`` (the method-aware dev/qa twins pick these before calling), its per-twin
+    ``assumption_impact_factor``, and its ``notes``. The load-bearing invariants documented on
+    ``assemble_phase_estimate`` hold unchanged because the inputs are computed exactly as before.
+    """
+    point_mid, breakdown = compute_fn(inputs)
+    manual_mc, ai_mc = propagate_phase(
+        inputs,
+        compute_fn,
+        size_fields=size_fields,
+        reduction_sampler=reduction_sampler,
+        risk_specs=risk_specs_from(inputs.risks),
+        eff_point=effective_reduction,
+        n_draws=DEFAULT_DRAWS,
+        rng=rng,
+    )
+    ai_mid = point_mid * (1 - effective_reduction)
+    return assemble_phase_estimate(
+        phase=phase,
+        twin_name=twin_name,
+        algorithm=algorithm,
+        point_mid=point_mid,
+        ai_mid=ai_mid,
+        manual_mc=manual_mc,
+        ai_mc=ai_mc,
+        roster=roster,
+        inputs=inputs,
+        breakdown=breakdown,
+        effective_reduction=effective_reduction,
+        assumption_impact_factor=assumption_impact_factor,
+        notes=notes,
+    )
+
+
 def roster_for(state: EstimationState) -> RoleRoster:
     """Pull the roster from Stage 2; fall back to the default if absent."""
     stage2 = state.get("stage2")
     return stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
 
 
+def rate_by_role(roster: RoleRoster) -> dict[str, float]:
+    """Map each roster role's ``role_id`` to its ``rate_per_hour`` (the per-role rate
+    lookup the commercial/synthesize tail nodes use for costing)."""
+    return {r.role_id: r.rate_per_hour for r in roster.roles}
+
+
 def tooling_for(stage3: Stage3Context, phase: Phase) -> AiToolingLevel:
     """The Stage-3 AI tooling level for a phase. Phase values map 1:1 onto the
     PhaseToolingLevels field names, so resolve by the phase's string value."""
     return getattr(stage3.ai_tooling, phase.value)
+
+
+# AI-effectiveness MC prior shape (skewed/heavier-tailed — "Option 1"). Empirically (METR 2025)
+# realized AI speedup is dispersed with a heavy DOWNSIDE: the upside is bounded by the automatable
+# share, while debugging / review / rework give a long tail toward zero (or net-negative). So the
+# per-draw *proposed* reduction is sampled from a deliberately LEFT-SKEWED, flatter Beta-PERT rather
+# than a tight near-symmetric bump — the default spread reaches farther BELOW the proposed point
+# than above it, and a lower shape parameter fattens the tails. This widens the band and gives the
+# pessimistic (more-AI-hours) side more weight. The deterministic point reduction is UNCHANGED, so
+# `most_likely` and the `ai == manual·(1−r_point)` identity hold exactly — only the band is reshaped.
+_REDUCTION_PERT_LAMBDA = 2.5  # < 4 (classic PERT) → flatter, heavier-tailed
+_REDUCTION_DOWNSIDE = 0.70    # default spread reaches 0.70·mode BELOW the proposed point …
+_REDUCTION_UPSIDE = 0.30      # … but only 0.30·mode above it (bounded upside) → left-skew
 
 
 def make_reduction_sampler(
@@ -254,11 +342,12 @@ def make_reduction_sampler(
     ``montecarlo.propagate_phase``.
 
     It samples the *proposed* reduction — from the twin's ``reduction_range`` (a %
-    band), or a default spread around the proposed point, or (for Discovery/UX, which
-    don't propose one) the guardrail band itself — then re-runs the deterministic
-    ``effective_ai_reduction`` so the clamp / codebase·seniority moderation / penalty
-    nonlinearity is honored on every draw. Returns a constant 0 when the phase has no
-    AI-tooling band (no reduction, no spread)."""
+    band), or a left-skewed default spread around the proposed point (heavier downside,
+    see ``_REDUCTION_*``), or (for Discovery/UX, which don't propose one) the guardrail
+    band itself — then re-runs the deterministic ``effective_ai_reduction`` so the clamp /
+    codebase·seniority moderation / penalty nonlinearity is honored on every draw. The
+    Beta-PERT uses a reduced shape (``_REDUCTION_PERT_LAMBDA``) so the band is flatter and
+    heavier-tailed. Returns a constant 0 when the phase has no AI-tooling band."""
     phase = reduction_ctx["phase"]
     tooling = reduction_ctx["tooling"]
     lo, hi = band_for(phase, tooling, reduction_ctx.get("bands"))
@@ -269,7 +358,9 @@ def make_reduction_sampler(
         if reduction_range is not None:
             p_lo, p_hi = reduction_range.low / 100.0, reduction_range.high / 100.0
         else:
-            p_lo, p_hi = mode * 0.55, mode * 1.6  # ~CoV 0.3 default spread
+            # Left-skewed default spread: extend farther below the point than above it, so the
+            # realized band leans toward the pessimistic (lower-reduction) outcomes.
+            p_lo, p_hi = mode * (1.0 - _REDUCTION_DOWNSIDE), mode * (1.0 + _REDUCTION_UPSIDE)
     else:
         mode = (lo + hi) / 2.0  # Discovery/UX: spread the proposal over the band
         p_lo, p_hi = lo, hi
@@ -277,7 +368,7 @@ def make_reduction_sampler(
     p_hi = max(p_hi, mode)
 
     def _sampler(rng: random.Random) -> float:
-        proposed = sample_pert(p_lo, mode, p_hi, rng)
+        proposed = sample_pert(p_lo, mode, p_hi, rng, lam=_REDUCTION_PERT_LAMBDA)
         return effective_ai_reduction(proposed_reduction=proposed, **reduction_ctx)
 
     return _sampler
@@ -311,6 +402,8 @@ async def run_twin[T: BaseModel](
     proposed_reduction_fn: ProposedReductionFn | None = None,
     ensemble_k: int = 1,
     ensemble_aggregate_fn: EnsembleAggregateFn | None = None,
+    sizing_method_key: str | None = None,
+    sizing_method_default: str = "",
 ) -> PhaseEstimate:
     """Shared twin execution: prologue → LLM call → effective reduction →
     twin-specific ``build_fn`` → log, with a deterministic stub fallback.
@@ -371,12 +464,18 @@ async def run_twin[T: BaseModel](
             proposed_point=proposed_point,
             reduction_range=getattr(inputs, "reduction_range", None),
         )
+        extra_build_kwargs: dict[str, Any] = {}
+        if sizing_method_key is not None:
+            extra_build_kwargs["sizing_method"] = state.get(
+                sizing_method_key, sizing_method_default
+            )
         est = build_fn(
             inputs,
             effective_reduction=eff,
             roster=roster,
             rng=rng,
             reduction_sampler=reduction_sampler,
+            **extra_build_kwargs,
         )
         logger.info(
             "%s twin done: pass=%s ai_ml=%.0fh manual_ml=%.0fh",
@@ -406,6 +505,8 @@ def make_twin_nodes[T: BaseModel](
     proposed_reduction_fn: ProposedReductionFn | None = None,
     ensemble_k: int = 1,
     ensemble_aggregate_fn: EnsembleAggregateFn | None = None,
+    sizing_method_key: str | None = None,
+    sizing_method_default: str = "",
     trace_name: str,
 ) -> tuple[
     Callable[[EstimationState], Awaitable[dict]],
@@ -434,6 +535,8 @@ def make_twin_nodes[T: BaseModel](
             proposed_reduction_fn=proposed_reduction_fn,
             ensemble_k=ensemble_k,
             ensemble_aggregate_fn=ensemble_aggregate_fn,
+            sizing_method_key=sizing_method_key,
+            sizing_method_default=sizing_method_default,
         )
 
     @traced(name=f"{trace_name}.p1")

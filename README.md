@@ -62,12 +62,12 @@ Every `PhaseEstimate` carries **both scenarios** as `HourRange(optimistic, most_
 
 | Phase | Twin | Algorithm | What it scales on |
 |---|---|---|---|
-| Discovery | Discovery Analyst | **UCP** — Use Case Points | use case / actor counts, TFactor, EFactor |
+| Discovery | Discovery Analyst | **UCP** (default) or **FP-based analysis effort** | use case / actor counts × TFactor/EFactor, or FP × analysis hours/FP — switchable in Settings |
 | UX / Design | UX Design Strategist | **SCP** — Screen Complexity Points | screen count × complexity weights, design system maturity |
-| Development | Development Architect | **COCOMO II** | SLOC estimate × effort multipliers × scale factors |
+| Development | Development Architect | **COCOMO II** (default), **Function Points**, or **COSMIC FP** | SLOC × scale factors (super-linear), or FP × hours/FP / CFP × hours/CFP (linear) — switchable in Settings |
 | Code Review | Code Review Sentinel | **Fagan inspection** | KLOC, inspection rate, rework factor |
 | Deployment / DevOps | Deployment & DevOps | **CMP** — Configuration Management Points | environments, integrations, infra complexity |
-| QA / Testing | QA & Testing Strategist | **TPA** + 3-plan recommendation | Function Points × dynamic/static quality chars, supplementary hours |
+| QA / Testing | QA & Testing Strategist | **TPA** (default), **Test Case Point**, or **Defect Removal (Capers-Jones)** + 3-plan recommendation | FP × dynamic/static quality chars, test-case count × checkpoint complexity, or defect potential × removal effort — switchable in Settings |
 
 Each twin:
 
@@ -128,7 +128,7 @@ ai_i     = base_i · (1 − r_i) + risk_i                 # risks hit both scena
 ```
 
 1. **Input-size** — the twin's LLM proposes a `low/high` interval (`montecarlo.Range3`) on its dominant driver (SLOC/KSLOC for COCOMO, FP for TPA, `cmp_score`, productivity, UX iteration factor, …) plus an `estimate_cov` fallback. Each draw perturbs that field via Beta-PERT and **re-runs the same `compute_*`** — so the nonlinearity (e.g. COCOMO's `KSLOC^E`) is captured, not linearized.
-2. **AI-effectiveness** — the LLM's *proposed* reduction is sampled (from an LLM `reduction_range`, a default spread, or — for Discovery/UX, which don't propose one — the guardrail band itself), and `ai_acceleration.effective_ai_reduction(...)` is **re-run on every draw** so the clamp + codebase·seniority moderation + verification penalty are honored each time.
+2. **AI-effectiveness** — the LLM's *proposed* reduction is sampled (from an LLM `reduction_range`, a default spread, or — for Discovery/UX, which don't propose one — the guardrail band itself), and `ai_acceleration.effective_ai_reduction(...)` is **re-run on every draw** so the clamp + codebase·seniority moderation + verification penalty are honored each time. The default spread is **left-skewed and heavier-tailed** (reaches farther below the proposed point than above it, with a reduced Beta-PERT shape) — empirically (METR 2025) realized AI speedup has a bounded upside but a long downside toward zero/net-negative, so the band leans pessimistic. The deterministic point reduction is unchanged; only the band is reshaped.
 3. **Discrete risks** — the LLM now proposes structured `RiskInput {description, probability, impact_hours_low/high}` items, fired as independent Bernoulli events that add sampled hours to **both** scenarios undiscounted (so risks lift the *mean*, not the mode).
 
 Load-bearing **invariants** (kept stable so the rest of the system and the eval rubrics don't break):
@@ -281,7 +281,7 @@ Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhea
 │   ├── alembic/               # async migrations (env.py reads settings.resolved_postgres_dsn)
 │   │   ├── env.py
 │   │   ├── script.py.mako
-│   │   └── versions/          # 0001 history+calibration … 0009 (reduction bands, envelope_json, nullable raw_input, band retunes, staffing_coefficients)
+│   │   └── versions/          # 0001 history+calibration … 0012 (reduction bands, envelope_json, nullable raw_input, band retunes, staffing_coefficients, dev-agentic band raise, default rate card, app_settings)
 │   ├── alembic.ini
 │   │
 │   ├── observability/
@@ -303,9 +303,12 @@ Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhea
     ├── components/            # PhaseBar, DualScenarioToggle, RoleRosterEditor, StageProgress,
     │                          #   ConfidenceMeter, FanChart (Monte Carlo), AlgorithmBreakdownChart,
     │                          #   AlgorithmTooltip/Badge, AiSavingsSection, BreakdownView, Modal,
-    │                          #   Tabs (review-page panels), RosterRationaleModal, FieldHint
+    │                          #   Tabs (review-page panels), GanttChart + PertChart (Timeline),
+    │                          #   DocumentUpload (Stage 1 file upload), RosterRationaleModal, FieldHint
     ├── lib/                   # schemas (Zod), api-client (fetch + SSE), wizard-store, types, format,
-    │                          #   algorithms, breakdown, fan-chart (MC math), staffing (team-scaling), review-ui, estimate-status, roster-agui
+    │                          #   algorithms, breakdown, fan-chart (MC math), staffing (team-scaling),
+    │                          #   schedule (Gantt/PERT/critical-path + MC finish-risk), document-extract (PDF/Word/text),
+    │                          #   review-ui, estimate-status, roster-agui
     ├── instrumentation.ts     # Next.js startup hook — logs `✓ Frontend ready ...`
     ├── next.config.mjs        # output: "standalone"
     ├── vitest.config.ts       # globs: lib/**, components/**, instrumentation.test.ts
@@ -448,6 +451,16 @@ Graceful degradation is intentional — every external dependency (Anthropic, Ne
 | `PUT` | `/admin/reduction-bands` | Persist edited reduction bands. No-ops (response `editable: false`) when Postgres is disabled. |
 | `GET` | `/admin/staffing-coefficients` | Read the effective team-scaling coefficients (Brooks's Law + diminishing returns; code defaults merged with DB overrides) — backs the Settings screen. |
 | `PUT` | `/admin/staffing-coefficients` | Persist edited staffing coefficients. No-ops (response `editable: false`) when Postgres is disabled. |
+| `GET` | `/admin/default-rates` | Read the effective default rate card (per role category × seniority; code defaults merged with DB overrides) — backs the Settings screen. |
+| `PUT` | `/admin/default-rates` | Persist edited default rates. No-ops (response `editable: false`) when Postgres is disabled. |
+| `GET` | `/admin/discovery-sizing-method` | Read the Discovery twin's sizing method (`ucp` default \| `function_points`) + the allowed choices — backs the Settings screen. |
+| `PUT` | `/admin/discovery-sizing-method` | Persist the chosen sizing method. No-ops (response `editable: false`) when Postgres is disabled. |
+| `GET` | `/admin/development-sizing-method` | Read the Development twin's sizing method (`cocomo` default \| `function_points` \| `cosmic_function_points`) + the allowed choices — backs the Settings screen. |
+| `PUT` | `/admin/development-sizing-method` | Persist the chosen sizing method. No-ops (response `editable: false`) when Postgres is disabled. |
+| `GET` | `/admin/qa-sizing-method` | Read the QA/testing twin's sizing method (`tpa` default \| `test_case_point` \| `defect_removal`) + the allowed choices — backs the Settings screen. |
+| `PUT` | `/admin/qa-sizing-method` | Persist the chosen QA sizing method. No-ops (response `editable: false`) when Postgres is disabled. |
+| `GET` | `/admin/contingency` | Read the global contingency reserve % (uplifts final cost + timeline) + bounds — backs the Settings screen. |
+| `PUT` | `/admin/contingency` | Persist the contingency reserve % (`[0, 100]`). No-ops (response `editable: false`) when Postgres is disabled. |
 | `POST` | `/estimates` | Start a new estimation. Body: `CreateEstimateRequest { project_name?, raw_input, stage2?, stage3? }`. Returns the envelope with status `pending`; Pass 1 runs as a background task. |
 | `GET` | `/estimates/history` | Paginated persisted estimates (newest first) for the dashboard history list. Query: `?limit=&offset=`; returns `{ items, total }`. Empty when Postgres is disabled. |
 | `GET` | `/estimates/{id}` | Fetch the current envelope (status, pass1/pass2 estimates, clarifying questions, final). **Authoritative source of truth.** On in-memory cache miss it falls back to the persisted `envelope_json` (when Postgres is connected) so completed estimates redisplay after a restart / in a fresh session. |
@@ -466,14 +479,14 @@ OpenAPI docs are served at `http://localhost:8000/docs` once the backend is up.
 
 | Route | Stage | Notes |
 |---|---|---|
-| `/estimate/new` | 1. Raw input | Wrapped in `<Suspense>` to satisfy Next.js 15's `useSearchParams` rule. |
+| `/estimate/new` | 1. Raw input | Paste the description, pick an example, or **upload a document** (`<DocumentUpload>`) — PDF / Word `.docx` / `.txt` / `.md` are parsed **client-side** (`lib/document-extract.ts`: pdf.js + mammoth, dynamically imported) and dropped into the editable description box. Wrapped in `<Suspense>` to satisfy Next.js 15's `useSearchParams` rule. |
 | `/estimate/draft/create` | (transition) | Wraps `useSearchParams` in Suspense; submits to `POST /estimates`. |
 | `/estimate/draft/context` | 2. Project context | MVP subset of planning outline §4.2 — industry, project type, screen count, integrations, engagement model, **and the team roster** (description + category + seniority + rate + percentage per role). The `<RoleRosterEditor>` lives here, with a separate "Auto-adjust to 100%" button (no auto-rebalance on blur). A prefill/roster agent can pre-populate both. Client-side state in `lib/wizard-store.ts`. |
 | `/estimate/draft/maturity` | 3. AI tooling & codebase | A **freeform AI-tooling description** text field (classified into per-phase tooling levels on submit via `POST /estimates/draft/classify-tooling`) plus a codebase-context selector (greenfield / brownfield small / large-unfamiliar / large-familiar). The old per-phase L0–L4 maturity sliders are gone. Team composition lives in Stage 2. |
 | `/estimate/[id]/questions` | 4. Clarifying questions | Renders questions returned by Pass 1; POSTs answers to resume Pass 2. |
-| `/estimate/[id]/review` | 5. Review | Organized into three tabs (`<Tabs>`) — **Cost breakdown**, **AI assistance**, **Risk & uncertainty** — so it reads as three focused views (only the active panel is mounted). Across them: per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout via `lib/staffing.ts`), algorithm tooltips, an AI-assistance-savings section, risks/assumptions in modals off the phase cards, and an LLM cost/token-usage modal. Copy-as-markdown. |
+| `/estimate/[id]/review` | 5. Review | Organized into four tabs (`<Tabs>`) — **Cost breakdown**, **Timeline**, **AI assistance**, **Risk & uncertainty** — so it reads as focused views (only the active panel is mounted). Across them: per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout via `lib/staffing.ts`), a **Timeline** (overlapping-phase **Gantt** with a milestone strip + a **PERT** critical-path/slack network + a Monte-Carlo finish-risk readout — P10–P90 weeks, P(finish ≤ target), per-phase criticality — all derived on the client in `lib/schedule.ts`), algorithm tooltips, an AI-assistance-savings section, risks/assumptions in modals off the phase cards, and an LLM cost/token-usage modal. Copy-as-markdown. |
 
-The landing page at `/` lists historical estimates pulled from the backend and redisplays the review page for completed ones. A gear icon opens `/settings`, which edits the AI-reduction guardrail bands (`GET`/`PUT /admin/reduction-bands`) and the team-scaling (Brooks's Law + diminishing-returns) coefficients (`GET`/`PUT /admin/staffing-coefficients`).
+The landing page at `/` lists historical estimates pulled from the backend and redisplays the review page for completed ones. A gear icon opens `/settings`, which edits the AI-reduction guardrail bands (`GET`/`PUT /admin/reduction-bands`), the team-scaling (Brooks's Law + diminishing-returns) coefficients (`GET`/`PUT /admin/staffing-coefficients`), and the default hourly **rate card** per role category × seniority (`GET`/`PUT /admin/default-rates`).
 
 Global font scale: `app/globals.css` sets `html { font-size: 14px; }` so all Tailwind rem-based utilities shrink uniformly. Change it in one place to rescale the whole UI.
 
@@ -608,7 +621,7 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 - Freeform AI-tooling classification with docs-mcp-server research, plus the prefill + roster pre-submission agents
 - Dual-scenario aggregation (AI-assisted vs. manual-only) end-to-end
 - LLM cost / token-usage tracking surfaced on the estimate
-- Stage 1 (raw text), simplified Stages 2–3 (Stage 3 = freeform AI tooling + codebase context), full Stages 4–5
+- Stage 1 (raw text **or** client-side document upload — PDF / Word / text), simplified Stages 2–3 (Stage 3 = freeform AI tooling + codebase context), full Stages 4–5
 - Estimate history landing page + verbatim redisplay of completed estimates
 - Neo4j envelope persistence + Postgres history & twin calibration aggregates (when reachable)
 - Alembic migrations + programmatic upgrade on startup
@@ -618,7 +631,7 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 **Deferred (Phase 2 / 3 / 4 — scaffolded, not implemented)**
 
 - A2A peer-to-peer cross-phase signaling between twins
-- File upload parsing (RFP / SOW PDFs)
+- Server-side / OCR document parsing (the MVP extracts text **client-side** for PDF / Word / text; scanned image-only PDFs aren't OCR'd)
 - Full Stage 2 / 3 field set per planning outline §4.2
 - Qdrant vector-similarity calibration (Postgres SQL aggregates are the MVP version)
 - Neo4j-backed LangGraph checkpointer (in-memory only today)

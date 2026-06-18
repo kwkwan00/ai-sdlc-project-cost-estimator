@@ -189,6 +189,107 @@ export async function saveStaffingCoefficients(
   });
 }
 
+export interface RateRow {
+  category: string;
+  seniority: string;
+  rate: number;
+  default_rate: number;
+  is_override: boolean;
+}
+
+export interface RateCardResponse {
+  editable: boolean;
+  min_rate: number;
+  max_rate: number;
+  rates: RateRow[];
+}
+
+/** Default hourly rate card (per role category × seniority) for the Settings screen. */
+export async function getDefaultRates(): Promise<RateCardResponse> {
+  return jsonFetch("/admin/default-rates");
+}
+
+export async function saveDefaultRates(
+  rates: { category: string; seniority: string; rate: number }[]
+): Promise<RateCardResponse> {
+  return jsonFetch("/admin/default-rates", {
+    method: "PUT",
+    body: JSON.stringify({ rates }),
+  });
+}
+
+/** A single-choice twin sizing-method setting (Development, QA, …) for the Settings screen. */
+export interface SizingMethodResponse {
+  editable: boolean;
+  method: string;
+  default_method: string;
+  methods: string[];
+}
+
+/** Discovery sizing method (Use Case Points ↔ FP-based analysis effort) for the Settings screen. */
+export async function getDiscoverySizingMethod(): Promise<SizingMethodResponse> {
+  return jsonFetch("/admin/discovery-sizing-method");
+}
+
+export async function saveDiscoverySizingMethod(
+  method: string
+): Promise<SizingMethodResponse> {
+  return jsonFetch("/admin/discovery-sizing-method", {
+    method: "PUT",
+    body: JSON.stringify({ method }),
+  });
+}
+
+/** Development sizing method (COCOMO II ↔ Function Points) for the Settings screen. */
+export async function getDevelopmentSizingMethod(): Promise<SizingMethodResponse> {
+  return jsonFetch("/admin/development-sizing-method");
+}
+
+export async function saveDevelopmentSizingMethod(
+  method: string
+): Promise<SizingMethodResponse> {
+  return jsonFetch("/admin/development-sizing-method", {
+    method: "PUT",
+    body: JSON.stringify({ method }),
+  });
+}
+
+/** QA/testing sizing method (TPA ↔ Test Case Point Analysis) for the Settings screen. */
+export async function getQaSizingMethod(): Promise<SizingMethodResponse> {
+  return jsonFetch("/admin/qa-sizing-method");
+}
+
+export async function saveQaSizingMethod(
+  method: string
+): Promise<SizingMethodResponse> {
+  return jsonFetch("/admin/qa-sizing-method", {
+    method: "PUT",
+    body: JSON.stringify({ method }),
+  });
+}
+
+/** Global contingency management-reserve % (uplifts final cost + timeline). */
+export interface ContingencyResponse {
+  editable: boolean;
+  contingency_pct: number;
+  default_pct: number;
+  min_pct: number;
+  max_pct: number;
+}
+
+export async function getContingency(): Promise<ContingencyResponse> {
+  return jsonFetch("/admin/contingency");
+}
+
+export async function saveContingency(
+  contingency_pct: number
+): Promise<ContingencyResponse> {
+  return jsonFetch("/admin/contingency", {
+    method: "PUT",
+    body: JSON.stringify({ contingency_pct }),
+  });
+}
+
 export async function getEstimate(id: string): Promise<EstimateEnvelope> {
   return jsonFetch(`/estimates/${id}`);
 }

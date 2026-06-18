@@ -39,7 +39,7 @@ from orchestrator.nodes.deployment_devops import (
 from orchestrator.nodes.development_architect import (
     DevCOCOMOInputs,
     StackCategory,
-    _aggregate_cocomo,
+    _aggregate_dev,
     compute_cocomo_hours,
     development_pass1,
     development_pass2,
@@ -185,7 +185,7 @@ def test_dev_infrastructure_leverage_reduces_hours() -> None:
     assert high_leverage == pytest.approx(no_leverage * 0.6, rel=1e-3)
 
 
-def test_dev_aggregate_cocomo_takes_median_drivers() -> None:
+def test_dev_aggregate_dev_takes_median_drivers() -> None:
     # 5 samples; raw SLOC 2400/3600/4000/4400/5600 → median 4000; scale 10..14 → 12;
     # eaf 0.8..1.2 → 1.0. The consensus uses each numeric driver's median.
     samples = [
@@ -194,11 +194,13 @@ def test_dev_aggregate_cocomo_takes_median_drivers() -> None:
             (2400, 10, 0.8), (3600, 11, 0.9), (4000, 12, 1.0), (4400, 13, 1.1), (5600, 14, 1.2)
         ]
     ]
-    agg = _aggregate_cocomo(samples)
+    agg = _aggregate_dev(samples)
     assert agg.sloc_estimate == pytest.approx(4000.0)
     assert agg.scale_factor_sum == 12
     assert agg.eaf_composite == pytest.approx(1.0)
-    assert agg.function_points is None
+    # FP is now medianed (not nulled) so the FP method also has a driver: SLOC→FP via the
+    # typescript ratio (47), median SLOC 4000 → ~85.1 FP.
+    assert agg.function_points == pytest.approx(4000.0 / 47)
 
 
 @pytest.mark.asyncio
@@ -222,7 +224,7 @@ async def test_dev_pass2_self_consistency_aggregates_k_samples(monkeypatch) -> N
     out = await development_pass2({"estimate_id": "ens", "raw_input": "x"})
     est = out["pass2_estimates"][0]
     assert calls["n"] == 5  # K independent samples drawn
-    expected = compute_cocomo_hours(_aggregate_cocomo(samples))[0]
+    expected = compute_cocomo_hours(_aggregate_dev(samples))[0]
     assert est.manual_only_hours.most_likely == pytest.approx(expected, rel=1e-6)
 
 

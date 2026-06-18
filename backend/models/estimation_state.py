@@ -31,6 +31,14 @@ class EstimationState(TypedDict, total=False):
     # DB-loaded per-(phase, tooling) reduction guardrail bands, nested
     # {phase_value: {tooling_value: [lo, hi]}}. Empty → twins use code defaults.
     reduction_bands: dict
+    # Selected discovery sizing algorithm: "ucp" (default) | "function_points".
+    discovery_sizing_method: str
+    # Selected development sizing algorithm: "cocomo" (default) | "function_points" | "cosmic_function_points".
+    development_sizing_method: str
+    # Selected QA/testing sizing algorithm: "tpa" (default) | "test_case_point" | "defect_removal".
+    qa_sizing_method: str
+    # Global contingency management-reserve %, uplifting final cost + timeline (0 = none).
+    contingency_pct: float
 
     pass1_estimates: Annotated[list[PhaseEstimate], operator.add]
     clarifying_questions: list[ClarifyingQuestion]

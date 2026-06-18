@@ -29,7 +29,6 @@ from orchestrator.nodes.discovery_analyst import (
     _stakeholder_multiplier,
     build_phase_estimate,
     compute_ucp_hours,
-    pert_range,
 )
 
 
@@ -115,14 +114,6 @@ def test_stakeholder_multiplier_compounds_factors() -> None:
     )
     # Softened components compound to ~1.586, which the 1.5 cap clamps.
     assert _stakeholder_multiplier(inputs) == pytest.approx(min(1.5, 1.18 * 1.20 * 1.12))
-
-
-# ---- PERT range ----
-
-def test_pert_range_orders_optimistic_below_pessimistic() -> None:
-    r = pert_range(100.0)
-    assert r.optimistic < r.most_likely < r.pessimistic
-    assert r.most_likely == 100.0
 
 
 # ---- build_phase_estimate end-to-end ----

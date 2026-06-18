@@ -26,11 +26,14 @@ from db.orm_models import Base  # noqa: E402  — autogenerate target
 
 config = context.config
 
-if config.config_file_name is not None:
-    # disable_existing_loggers=False is critical: the default (True) would
-    # disable every logger the app already created — including all of our
-    # module loggers — when migrations run (e.g. POSTGRES_MIGRATE_ON_START on
-    # startup), silently killing application logging for the rest of the process.
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
+    # Apply alembic.ini's logging config ONLY for the CLI path (`alembic upgrade head`).
+    # When migrations run IN-PROCESS from the FastAPI lifespan (POSTGRES_MIGRATE_ON_START),
+    # db/migrate.py sets attributes["configure_logger"]=False so this is skipped — otherwise
+    # fileConfig would reconfigure the ROOT logger to alembic.ini's `WARN` level + stderr
+    # handler, replacing the app's INFO/stdout handler and silently suppressing every app
+    # INFO log (the "✓ Backend ready" line, request logs, …) for the rest of the process.
+    # disable_existing_loggers=False also keeps already-created module loggers alive.
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Always prefer the app's resolved DSN over alembic.ini's placeholder.

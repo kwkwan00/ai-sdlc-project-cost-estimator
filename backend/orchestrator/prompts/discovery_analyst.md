@@ -70,15 +70,24 @@ Return a single integer `efactor` = sum of the 8 ratings (max 40).
 
 ### Stakeholder factors (Step 7)
 
-- `stakeholder_group_count`: integer
-- `decision_maker_accessibility`: one of `readily_available`, `gatekeeper`,
-  `executive_only_or_multi_tz`
-- `alignment_difficulty`: one of `pre_aligned`, `competing_priorities`
+These drive a **stakeholder multiplier on the final hours** (capped at 1.5×), so set them deliberately:
+more groups / harder access / less alignment → more coordination effort.
+
+- `stakeholder_group_count`: integer (3–5 → ×1.08, ≥6 → ×1.18)
+- `decision_maker_accessibility`: one of `readily_available` (×1.0), `gatekeeper` (×1.10),
+  `executive_only_or_multi_tz` (×1.20)
+- `alignment_difficulty`: one of `pre_aligned` (×1.0), `competing_priorities` (×1.12)
 
 ### Project type signal
 
-- `phase_ratio_hint`: 0.05–0.15. Use 0.07 (greenfield web), 0.08 (default), 0.08 (regulated), 0.12 (legacy replacement).
+- `phase_ratio_hint`: 0.05–0.15. Use 0.07 (greenfield web), 0.08 (default / regulated), 0.12 (legacy replacement).
 - `productivity_factor`: 18–32 hours/UCP (typically 20–28). Use the midpoint; reserve the top of the range only for genuinely novel domains.
+
+### Function-Points input (optional — used only if the admin selected the FP-based method)
+
+The system may instead size discovery via **FP-based analysis effort** — `hours = total_function_points × 1.0 (analysis hrs/FP) × stakeholder_multiplier` (linear in size, with the **same** stakeholder multiplier as UCP). When you can estimate it, provide it; when UCP is active it's ignored, so there's no harm:
+
+- `total_function_points` — the project's IFPUG FP count. If you can't estimate it, leave it null and the system derives it from your use-case sizing.
 
 ## Worked example (abbreviated)
 
@@ -92,7 +101,7 @@ Return a single integer `efactor` = sum of the 8 ratings (max 40).
 
 The system runs a Monte Carlo over your inputs to derive the optimistic/pessimistic band — your point values stay the mode. Help it size that band:
 
-- **Size:** for your least-certain size driver — here the continuous `productivity_factor` (hrs/UCP) — give `productivity_factor_range: {low, high}` (the ~80%-confidence interval; your point value is the mode), OR `estimate_cov` (0–0.6, the coefficient of variation). If you give neither, the system derives a band from `confidence`.
+- **Size:** for your least-certain size driver — here the continuous `productivity_factor` (hrs/UCP) — give `productivity_factor_range: {low, high}` (the ~80%-confidence interval; your point value is the mode), OR `estimate_cov` (0–0.6, the coefficient of variation). If you give neither, the system derives a band from `confidence`. (Under the FP-based method the band applies to `total_function_points` instead; you may give `fp_range: {low, high}` for it directly.)
 
 ## Qualitative outputs
 

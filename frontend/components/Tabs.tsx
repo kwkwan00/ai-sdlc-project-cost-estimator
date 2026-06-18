@@ -17,6 +17,8 @@ interface Props {
   tabs: TabItem[];
   /** id of the initially-active tab; defaults to the first. */
   initialId?: string;
+  /** Accessible label for the tablist; defaults to "Estimate sections". */
+  ariaLabel?: string;
 }
 
 /** Accessible tab switcher following the WAI-ARIA tabs pattern: a roving-tabindex
@@ -24,7 +26,7 @@ interface Props {
  *  `tabpanel`. Only the active panel renders, so heavy children (recharts fan
  *  charts) aren't all mounted at once. Styling matches the review surface — a
  *  brand-underlined active tab over a slate divider. */
-export function Tabs({ tabs, initialId }: Props) {
+export function Tabs({ tabs, initialId, ariaLabel = "Estimate sections" }: Props) {
   const [active, setActive] = useState(initialId ?? tabs[0]?.id);
   const base = useId();
   const btnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -55,7 +57,7 @@ export function Tabs({ tabs, initialId }: Props) {
     <div>
       <div
         role="tablist"
-        aria-label="Estimate sections"
+        aria-label={ariaLabel}
         onKeyDown={onKeyDown}
         className="flex flex-wrap gap-1 border-b border-slate-200"
       >

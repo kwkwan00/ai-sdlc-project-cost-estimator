@@ -121,10 +121,7 @@ export default function Dashboard() {
 
       <div className="flex items-center gap-3">
         <Link href="/estimate/new" className="btn-primary">
-          New estimate
-        </Link>
-        <Link href="/estimate/new?quick=1" className="btn-secondary">
-          Quick estimate (skip Stages 2 + 3)
+          Quick Estimate
         </Link>
       </div>
 

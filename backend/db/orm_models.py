@@ -199,3 +199,34 @@ class StaffingCoefficient(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class DefaultRate(Base):
+    """Default hourly rate per role ``(category, seniority)`` — the org's standard rate card.
+    Admin-editable on the Settings screen so rates can be retuned without a deploy;
+    ``pricing.py::DEFAULT_RATES`` holds the same defaults as a fallback when this table is
+    empty/unavailable. The roster agent seeds new estimates from these rates (the user can still
+    override per estimate)."""
+
+    __tablename__ = "default_rates"
+
+    category: Mapped[str] = mapped_column(String(32), primary_key=True)
+    seniority: Mapped[str] = mapped_column(String(32), primary_key=True)
+    rate: Mapped[float] = mapped_column(Float)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AppSetting(Base):
+    """Generic string-valued application setting, keyed by name (e.g. ``development_sizing_method``).
+    Admin-editable on the Settings screen; a code default applies when the key is absent/unavailable
+    (so the table is optional — an empty/missing table just means 'use defaults')."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

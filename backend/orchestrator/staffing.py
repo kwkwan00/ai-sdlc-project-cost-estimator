@@ -20,6 +20,8 @@ the *marginal* over/under-staffing effect, not a solo→team penalty.
 
 from __future__ import annotations
 
+import math
+
 # Code defaults; the DB ``staffing_coefficients`` table overrides any key.
 DEFAULT_STAFFING_COEFFS: dict[str, float] = {
     "link_cost": 0.06,                     # capacity fraction lost per communication link
@@ -101,7 +103,7 @@ def optimal_team_size(
     the peak; it is NOT a fixed number pinned by the coefficients alone."""
     if effort_hours <= 0 or hours_per_week <= 0:
         return 1
-    work_bound = max(1, int(effort_hours / (hours_per_week * _MIN_WEEKS_PER_PERSON)))
+    work_bound = max(1, math.ceil(effort_hours / (hours_per_week * _MIN_WEEKS_PER_PERSON)))
     upper = max(1, min(max_team, work_bound))
     best_n, best_tp = 1, team_throughput(1, coeffs)
     for n in range(2, upper + 1):

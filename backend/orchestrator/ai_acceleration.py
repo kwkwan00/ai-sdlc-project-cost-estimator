@@ -42,7 +42,7 @@ DEFAULT_BANDS: dict[tuple[Phase, AiToolingLevel], tuple[float, float]] = {
     (Phase.DEVELOPMENT, AiToolingLevel.NONE): (0.00, 0.00),
     (Phase.DEVELOPMENT, AiToolingLevel.AUTOCOMPLETE): (0.08, 0.18),
     (Phase.DEVELOPMENT, AiToolingLevel.CHAT): (0.24, 0.48),
-    (Phase.DEVELOPMENT, AiToolingLevel.AGENTIC): (0.36, 0.66),
+    (Phase.DEVELOPMENT, AiToolingLevel.AGENTIC): (0.45, 0.72),
     (Phase.CODE_REVIEW, AiToolingLevel.NONE): (0.00, 0.00),
     (Phase.CODE_REVIEW, AiToolingLevel.CHAT): (0.10, 0.22),
     (Phase.CODE_REVIEW, AiToolingLevel.AGENTIC): (0.16, 0.30),
@@ -103,13 +103,15 @@ def band_for(
 
 def seniority_factor(roster: RoleRoster | None) -> float:
     """Effort-share-weighted seniority moderator. Juniors capture more AI gain;
-    seniors (especially on familiar code) capture less. Clamped to ~[0.6, 1.25]."""
+    seniors (especially on familiar code) capture less. Uses a **softened ±0.2**
+    effort-share swing (was ±0.3), so a senior-heavy team is moderated less harshly.
+    Clamped to [0.6, 1.25]."""
     if roster is None or not roster.roles:
         return 1.0
     total = sum(r.percentage for r in roster.roles) or 100.0
     senior = sum(r.percentage for r in roster.roles if r.seniority == RoleSeniority.SENIOR)
     junior = sum(r.percentage for r in roster.roles if r.seniority == RoleSeniority.JUNIOR)
-    factor = 1.0 + 0.3 * (junior / total) - 0.3 * (senior / total)
+    factor = 1.0 + 0.2 * (junior / total) - 0.2 * (senior / total)
     return max(0.6, min(1.25, factor))
 
 

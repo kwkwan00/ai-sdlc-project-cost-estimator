@@ -107,8 +107,12 @@ def _ensure_category_floor(
     non_target = [r for r in roster.roles if r.category not in target_categories]
     non_target_total = sum(p.get(r.role_id, 0.0) for r in non_target)
     if non_target_total > 0:
+        # Only pull as much as the non-target roles actually hold. Without this clamp,
+        # a shortfall larger than non_target_total drives individual non-target shares
+        # negative (later clamped to 0 by _normalize's max(v, 0.0)), distorting the floor.
+        pull = min(shortfall, non_target_total)
         for r in non_target:
-            p[r.role_id] -= shortfall * (p[r.role_id] / non_target_total)
+            p[r.role_id] -= pull * (p[r.role_id] / non_target_total)
 
     # Add shortfall to preferred categories first.
     recipients_by_pref: list[CustomRole] = []

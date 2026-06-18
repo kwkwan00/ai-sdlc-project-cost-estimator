@@ -42,6 +42,10 @@ def upgrade_to_head() -> bool:
 
     try:
         cfg = Config(str(_ALEMBIC_INI))
+        # Run env.py WITHOUT applying alembic.ini's logging config: in-process here it would
+        # reconfigure the root logger to WARN + a stderr handler, clobbering the app's INFO/stdout
+        # logging for the rest of the process (the CLI path leaves this True). See alembic/env.py.
+        cfg.attributes["configure_logger"] = False
         cfg.set_main_option("script_location", str(_BACKEND_DIR / "alembic"))
         cfg.set_main_option("sqlalchemy.url", settings.resolved_postgres_dsn)
         logger.info("Running Alembic upgrade head")

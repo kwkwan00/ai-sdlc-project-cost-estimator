@@ -33,7 +33,7 @@ async def test_effective_bands_default_shape() -> None:
         b for b in resp.bands
         if b.phase == "development" and b.tooling_level == "agentic"
     )
-    assert (dev.min_pct, dev.max_pct) == (36.0, 66.0)
+    assert (dev.min_pct, dev.max_pct) == (45.0, 72.0)
     assert dev.is_override is False
 
 

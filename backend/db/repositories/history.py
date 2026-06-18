@@ -56,6 +56,58 @@ def _phase_row(
     }
 
 
+def _apply_final_estimate(row: EstimateHistory, final: DualScenarioEstimate) -> None:
+    """Copy the rolled-up final-estimate fields onto the history row."""
+    row.total_ai_assisted_mid_hours = final.total_ai_assisted_hours.most_likely
+    row.total_manual_only_mid_hours = final.total_manual_only_hours.most_likely
+    row.ai_hours_saved = final.ai_hours_saved_pert
+    row.ai_cost_saved_usd = final.ai_cost_saved_usd
+    row.total_cost_ai_assisted_usd = final.total_cost_ai_assisted_usd
+    row.total_cost_manual_only_usd = final.total_cost_manual_only_usd
+    row.confidence = final.confidence
+    row.duration_weeks_low = final.duration_weeks_low
+    row.duration_weeks_high = final.duration_weeks_high
+
+
+async def _replace_phase_rows(
+    session: Any,
+    envelope: EstimateEnvelope,
+    *,
+    industry: str | None,
+    project_type: str | None,
+    stage3: Stage3Context | None,
+) -> None:
+    """Replace an estimate's phase rows wholesale — delete then re-insert rather than
+    diffing individual rows, so Pass 2 supersedes Pass 1 cleanly. Logs whether any
+    rows were written."""
+    phases = envelope.pass2_estimates or envelope.pass1_estimates
+    if not phases:
+        logger.info(
+            "postgres: persisted history for estimate %s (no phase rows written)",
+            envelope.estimate_id,
+        )
+        return
+    await session.execute(
+        delete(PhaseHistory).where(PhaseHistory.estimate_id == envelope.estimate_id)
+    )
+    rows = [
+        _phase_row(
+            envelope.estimate_id,
+            p,
+            industry=industry,
+            project_type=project_type,
+            maturity=codebase_code(stage3),
+        )
+        for p in phases
+    ]
+    session.add_all([PhaseHistory(**r) for r in rows])
+    logger.info(
+        "postgres: persisted history for estimate %s (%d phase row(s))",
+        envelope.estimate_id,
+        len(phases),
+    )
+
+
 async def save_estimate_history(
     envelope: EstimateEnvelope,
     *,
@@ -88,43 +140,24 @@ async def save_estimate_history(
             existing.project_name = envelope.project_name
             existing.status = envelope.status.value
             existing.envelope_json = envelope.model_dump(mode="json")
-            existing.industry = industry
-            existing.project_type = project_type
-            existing.engagement_model = engagement
-            existing.target_timeline_weeks = target_weeks
+            # Stage2-derived metadata is only written when stage2 is actually provided.
+            # On a Pass-2 FAILURE the caller passes stage2=None; nulling these would
+            # wipe the values Pass 1 already populated (data-loss bug). When stage2 is
+            # absent, preserve whatever is already stored on the row.
+            if stage2 is not None:
+                existing.industry = industry
+                existing.project_type = project_type
+                existing.engagement_model = engagement
+                existing.target_timeline_weeks = target_weeks
             if final is not None:
-                existing.total_ai_assisted_mid_hours = final.total_ai_assisted_hours.most_likely
-                existing.total_manual_only_mid_hours = final.total_manual_only_hours.most_likely
-                existing.ai_hours_saved = final.ai_hours_saved_pert
-                existing.ai_cost_saved_usd = final.ai_cost_saved_usd
-                existing.total_cost_ai_assisted_usd = final.total_cost_ai_assisted_usd
-                existing.total_cost_manual_only_usd = final.total_cost_manual_only_usd
-                existing.confidence = final.confidence
-                existing.duration_weeks_low = final.duration_weeks_low
-                existing.duration_weeks_high = final.duration_weeks_high
+                _apply_final_estimate(existing, final)
 
-            # Replace phase rows wholesale — Pass 2 supersedes Pass 1, so we
-            # delete then re-insert rather than try to diff individual rows.
-            phases = envelope.pass2_estimates or envelope.pass1_estimates
-            if phases:
-                await session.execute(
-                    delete(PhaseHistory).where(PhaseHistory.estimate_id == envelope.estimate_id)
-                )
-                rows = [
-                    _phase_row(
-                        envelope.estimate_id,
-                        p,
-                        industry=industry,
-                        project_type=project_type,
-                        maturity=codebase_code(stage3),
-                    )
-                    for p in phases
-                ]
-                session.add_all([PhaseHistory(**r) for r in rows])
-            logger.info(
-                "postgres: persisted history for estimate %s (%d phase row(s))",
-                envelope.estimate_id,
-                len(phases),
+            await _replace_phase_rows(
+                session,
+                envelope,
+                industry=industry,
+                project_type=project_type,
+                stage3=stage3,
             )
         except asyncio.CancelledError:
             raise

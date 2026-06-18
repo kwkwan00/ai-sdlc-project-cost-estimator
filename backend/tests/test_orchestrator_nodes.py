@@ -501,6 +501,45 @@ async def test_synthesize_no_overhead_when_team_within_free_size(monkeypatch) ->
     assert final.staffing_efficiency_pct > 0
 
 
+@pytest.mark.asyncio
+async def test_synthesize_applies_contingency_to_cost_and_timeline() -> None:
+    # A small team (no Brooks overhead) isolates the contingency uplift on cost + duration.
+    state = {
+        "pass2_estimates": [_phase(Phase.DEVELOPMENT, ai_mid=1000, manual_mid=1200)],
+        "total_cost_ai_assisted_usd": 50_000,
+        "total_cost_manual_only_usd": 60_000,
+        "stage2": Stage2Context(target_timeline_weeks=20),
+        "contingency_pct": 15.0,
+    }
+    final = (await synthesize_estimate(state))["final_estimate"]
+    assert final.contingency_pct == 15.0
+    brooks = 1 + final.brooks_overhead_pct / 100
+    cont = 1.15
+    # Cost (both scenarios) and the timeline are uplifted by contingency (on top of Brooks).
+    assert final.total_cost_ai_assisted_usd == pytest.approx(50_000 * brooks * cont)
+    assert final.total_cost_manual_only_usd == pytest.approx(60_000 * brooks * cont)
+    assert final.duration_weeks_high == pytest.approx(20 * 1.25 * brooks * cont)
+    assert final.duration_weeks_low == pytest.approx(max(1.0, 20 * 0.85) * brooks * cont)
+    # Hours and headcount are intentionally NOT touched by contingency.
+    assert final.total_ai_assisted_hours.most_likely == 1000
+    assert final.total_manual_only_hours.most_likely == 1200
+    assert final.team_size == sum(r.headcount for r in final.headcount_by_role)
+
+
+@pytest.mark.asyncio
+async def test_synthesize_contingency_defaults_to_zero_no_op() -> None:
+    state = {
+        "pass2_estimates": [_phase(Phase.DEVELOPMENT, ai_mid=1000)],
+        "total_cost_ai_assisted_usd": 50_000,
+        "total_cost_manual_only_usd": 60_000,
+        "stage2": Stage2Context(target_timeline_weeks=20),
+    }
+    final = (await synthesize_estimate(state))["final_estimate"]
+    assert final.contingency_pct == 0.0
+    # No contingency key → cost reflects only Brooks overhead, no extra uplift.
+    assert final.total_cost_ai_assisted_usd == pytest.approx(50_000 * (1 + final.brooks_overhead_pct / 100))
+
+
 def test_distribute_team_staffs_each_active_role_by_effort() -> None:
     roles = [
         CustomRole(role_id="pm", description="PM", category=RoleCategory.PRODUCT,
@@ -585,6 +624,27 @@ async def test_synthesize_handles_empty_pass2() -> None:
     final = result["final_estimate"]
     assert final.total_ai_assisted_hours.most_likely == 0
     assert final.confidence == 0.0
+
+
+@pytest.mark.asyncio
+async def test_synthesize_no_target_floors_zero_throughput_team(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # Regression: a degenerate team whose weekly throughput is 0 must NOT silently report a
+    # 0-week schedule for a project with real hours. The no-target branch floors the divisor at
+    # a minimal 1-person throughput, so the duration stays a real (positive, finite) estimate.
+    def _zero_throughput(n: int, coeffs: dict[str, float] | None = None) -> float:
+        return 0.0
+
+    monkeypatch.setattr(
+        "orchestrator.nodes.synthesize_estimate.team_throughput", _zero_throughput
+    )
+    state = {
+        "pass2_estimates": [_phase(Phase.DEVELOPMENT, ai_mid=2000, manual_mid=2400)],
+        "stage2": Stage2Context(),  # no target_timeline_weeks → no-target regime
+    }
+    final = (await synthesize_estimate(state))["final_estimate"]
+    assert final.duration_weeks_low > 0
+    assert final.duration_weeks_high >= final.duration_weeks_low
+    assert math.isfinite(final.duration_weeks_high)
 
 
 @pytest.mark.asyncio

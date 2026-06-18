@@ -10,7 +10,9 @@ import { BreakdownView } from "@/components/BreakdownView";
 import { ConfidenceMeter } from "@/components/ConfidenceMeter";
 import { DualScenarioToggle } from "@/components/DualScenarioToggle";
 import { FanChart } from "@/components/FanChart";
+import { GanttChart } from "@/components/GanttChart";
 import { Modal } from "@/components/Modal";
+import { PertChart } from "@/components/PertChart";
 import { PhaseBar } from "@/components/PhaseBar";
 import { RiskRegister } from "@/components/RiskRegister";
 import { StageProgress } from "@/components/StageProgress";
@@ -19,6 +21,7 @@ import { TornadoChart } from "@/components/TornadoChart";
 import { getEstimate } from "@/lib/api-client";
 import { confidenceLabel, pAiSavesTime } from "@/lib/fan-chart";
 import { expectedRiskHours, sortRisks } from "@/lib/risk";
+import { deriveSchedule } from "@/lib/schedule";
 import { staffingSummary } from "@/lib/staffing";
 import {
   formatHours,
@@ -86,6 +89,13 @@ export default function ReviewPage({ params }: PageProps) {
     0,
   );
   const staffing = staffingSummary(fe);
+  // Contingency reserve (a deliberate management buffer, applied to cost + timeline). The total
+  // already includes it; surface the portion that is contingency for transparency.
+  const contingencyPct = fe.contingency_pct ?? 0;
+  const contingencyReserve = (totalCost * contingencyPct) / (100 + contingencyPct);
+  // Derived presentational schedule (Gantt + PERT + Monte-Carlo finish-risk) for the active
+  // scenario. Pure + cheap; recomputes with the mode toggle like the other derived locals.
+  const schedule = deriveSchedule(fe, mode);
   // Sum of per-phase most-likely hours (for each phase's "share of effort" bar).
   const phaseHoursTotal = fe.phases.reduce(
     (sum, p) =>
@@ -352,6 +362,66 @@ export default function ReviewPage({ params }: PageProps) {
     </>
   );
 
+  // Tab 4 — the derived schedule: Gantt timeline, milestone strip, PERT critical-path
+  // network, and the Monte-Carlo finish-risk readout.
+  const timelinePanel = (
+    <>
+      <section className="card space-y-4">
+        <div className="flex items-baseline justify-between gap-2">
+          <h2 className="section-title">Schedule — Gantt</h2>
+          <p className="text-xs muted">
+            {mode === "ai_assisted" ? "AI-assisted" : "Manual-only"} · ~
+            {schedule.totalWeeks.toFixed(0)} wk
+          </p>
+        </div>
+        {schedule.risk && (
+          <div className="flex flex-wrap items-end gap-x-6 gap-y-2 rounded-lg bg-slate-50 p-3">
+            <div>
+              <p className="text-xs uppercase tracking-wide muted">Finish, P10–P90</p>
+              <p className="text-lg font-semibold tabular-nums text-slate-800">
+                {schedule.risk.p10Weeks.toFixed(0)}–{schedule.risk.p90Weeks.toFixed(0)}{" "}
+                <span className="text-sm font-normal muted">wk</span>
+              </p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide muted">Median finish</p>
+              <p className="text-lg font-semibold tabular-nums text-slate-800">
+                {schedule.risk.medianWeeks.toFixed(0)}{" "}
+                <span className="text-sm font-normal muted">wk</span>
+              </p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide muted">
+                P(finish ≤ {fe.duration_weeks_high.toFixed(0)} wk)
+              </p>
+              <p className="text-lg font-semibold tabular-nums text-emerald-600">
+                {formatPct(schedule.risk.pFinishBy(fe.duration_weeks_high))}
+              </p>
+            </div>
+            {!schedule.risk.simulated && (
+              <p className="text-xs muted">
+                Triangular estimate — this estimate carries no Monte-Carlo percentiles.
+              </p>
+            )}
+          </div>
+        )}
+        <GanttChart schedule={schedule} />
+      </section>
+
+      <section className="card space-y-3">
+        <h2 className="section-title">Dependencies &amp; critical path (PERT)</h2>
+        <p className="text-xs muted">
+          The critical path sets the duration; phases with slack can slip without delaying
+          launch
+          {schedule.risk?.simulated
+            ? ". The criticality bar is how often each phase lands on the critical path across the Monte-Carlo draws."
+            : "."}
+        </p>
+        <PertChart schedule={schedule} />
+      </section>
+    </>
+  );
+
   return (
     <div className="space-y-6">
       <StageProgress current={5} />
@@ -400,12 +470,20 @@ export default function ReviewPage({ params }: PageProps) {
         <div className="card">
           <p className="text-xs muted">Total cost</p>
           <p className="text-2xl font-semibold mt-1">{formatUSD(totalCost)}</p>
+          {contingencyPct > 0 && (
+            <p className="text-xs muted mt-1">
+              incl. {contingencyPct}% contingency ({formatUSD(contingencyReserve)})
+            </p>
+          )}
         </div>
         <div className="card">
           <p className="text-xs muted">Duration</p>
           <p className="text-2xl font-semibold mt-1">
             {Math.round(fe.duration_weeks_low)}-{Math.round(fe.duration_weeks_high)} wk
           </p>
+          {contingencyPct > 0 && (
+            <p className="text-xs muted mt-1">incl. {contingencyPct}% contingency</p>
+          )}
         </div>
         <div className="card">
           <p className="text-xs muted">AI savings</p>
@@ -446,6 +524,7 @@ export default function ReviewPage({ params }: PageProps) {
             label: "Cost breakdown",
             content: breakdownPanel,
           },
+          { id: "timeline", label: "Timeline", content: timelinePanel },
           { id: "ai", label: "AI assistance", content: aiPanel },
           {
             id: "risk",

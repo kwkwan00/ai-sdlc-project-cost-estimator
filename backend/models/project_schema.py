@@ -232,6 +232,25 @@ class AnswerSubmission(BaseModel):
     answers: dict[str, str] = Field(description="question_id -> answer text")
     skip_remaining: bool = False
 
+    # Generous caps that a legitimate clarifying-answer set (a handful of questions)
+    # never approaches, but that reject an oversized/abusive payload.
+    _MAX_ANSWERS = 100
+    _MAX_ANSWER_LEN = 5000
+
+    @model_validator(mode="after")
+    def _bound_answers(self) -> AnswerSubmission:
+        if len(self.answers) > self._MAX_ANSWERS:
+            raise ValueError(
+                f"Too many answers: {len(self.answers)} (max {self._MAX_ANSWERS})"
+            )
+        for key, value in self.answers.items():
+            if len(value) > self._MAX_ANSWER_LEN:
+                raise ValueError(
+                    f"Answer for {key!r} is too long: {len(value)} chars "
+                    f"(max {self._MAX_ANSWER_LEN})"
+                )
+        return self
+
 
 class EstimateStatus(str, Enum):
     PENDING = "pending"

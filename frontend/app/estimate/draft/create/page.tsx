@@ -1,6 +1,6 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
 import { createEstimate, buildCreatePayload } from "@/lib/api-client";
@@ -8,8 +8,6 @@ import { clearDraft, loadDraft, saveSession } from "@/lib/wizard-store";
 
 function CreateInner() {
   const router = useRouter();
-  const params = useSearchParams();
-  const quick = params.get("quick") === "1";
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -24,8 +22,8 @@ function CreateInner() {
         const payload = buildCreatePayload(
           draft.raw_input,
           draft.project_name,
-          quick ? undefined : draft.stage2,
-          quick ? undefined : draft.stage3
+          draft.stage2,
+          draft.stage3
         );
         const envelope = await createEstimate(payload);
         if (cancelled) return;
@@ -39,7 +37,7 @@ function CreateInner() {
     return () => {
       cancelled = true;
     };
-  }, [router, quick]);
+  }, [router]);
 
   if (error) {
     return (

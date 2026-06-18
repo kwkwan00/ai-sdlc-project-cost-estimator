@@ -52,8 +52,11 @@ async def main(*, use_llm: bool = True) -> None:
         "stage3": Stage3Context(
             codebase_context=CodebaseContext.GREENFIELD,
             ai_tooling=PhaseToolingLevels(
+                discovery=AiToolingLevel.CHAT,
+                ux_design=AiToolingLevel.CHAT,
                 development=AiToolingLevel.AGENTIC,
                 code_review=AiToolingLevel.AGENTIC,
+                deployment=AiToolingLevel.CHAT,
                 qa_testing=AiToolingLevel.CHAT,
             ),
         ),

@@ -43,6 +43,10 @@ async def create_estimate(req: CreateEstimateRequest) -> EstimateEnvelope:
         status=EstimateStatus.PENDING,
         created_at=datetime.now(UTC),
     )
+    # TODO(review-fix-refactor): cross-partition refactor: promote runtime public API
+    # (these handlers reach into runtime's underscore-private members — _envelopes,
+    # _event_streams, _EventBroker, _spawn_background, _run_pass1, _resume_pass2 — which
+    # is a coupling smell; the fix lives in runtime.py, outside this partition).
     runtime._envelopes[estimate_id] = env
     runtime._event_streams[estimate_id] = runtime._EventBroker()
 
@@ -176,7 +180,13 @@ async def stream_estimate(estimate_id: str):
     async def gen():
         try:
             # Send current status immediately so reconnecting clients catch up.
-            env = runtime._envelopes[estimate_id]
+            # The estimate may have been evicted or DELETEd between subscription and
+            # the generator starting — short-circuit cleanly instead of KeyError'ing
+            # inside the stream (mirrors the get-with-fallback pattern above).
+            env = runtime._envelopes.get(estimate_id)
+            if env is None:
+                yield {"event": "error", "data": json.dumps({"error": "Estimate not found"})}
+                return
             yield {"event": "status", "data": json.dumps({"status": env.status.value})}
             # Replay buffered backlog so a late/reconnecting client doesn't miss any
             # already-published events before switching to live delivery.

@@ -63,9 +63,9 @@
     "input": {
       "description": "We use Claude Code as an agentic coding assistant for development, CodeRabbit for automated code review, GitHub Copilot autocomplete in the IDE, and Figma AI for design exploration. QA is manual."
     },
-    "expected_output": "Per-phase classification: development=agentic (Claude Code), code_review reflects CodeRabbit (chat or agentic), ux_design reflects Figma AI (chat/autocomplete), with autocomplete acknowledged for IDE Copilot. QA stays none (manual). Unknown tools should be empty or minimal, and the notes should justify each mapping.",
-    "gold": {"ai_tooling": {"discovery": "none", "ux_design": "chat", "development": "agentic", "code_review": "agentic", "deployment": "none", "qa_testing": "none"}},
-    "notes": "Tooling classifier — description-only path. Gold: Claude Code=agentic dev, CodeRabbit=agentic review, Figma AI=chat ux_design, QA manual=none. classification_accuracy is exact per-phase match; expect the model to land most phases but the gold encodes the intended mapping."
+    "expected_output": "Per-phase classification: development=agentic (Claude Code), code_review reflects CodeRabbit (chat or agentic), ux_design reflects Figma AI (chat/autocomplete), with autocomplete acknowledged for IDE Copilot. Because this team is clearly AI-forward (agentic tooling), the unmentioned / 'manual' phases (discovery, deployment, qa_testing) are floored to a chat-level baseline rather than left at none. Unknown tools should be empty or minimal, and the notes should justify each mapping.",
+    "gold": {"ai_tooling": {"discovery": "chat", "ux_design": "chat", "development": "agentic", "code_review": "agentic", "deployment": "chat", "qa_testing": "chat"}},
+    "notes": "Tooling classifier — description-only path for an AGENTIC (AI-forward) team. Gold: Claude Code=agentic dev, CodeRabbit=agentic review, Figma AI=chat ux_design; the remaining phases are floored to a chat baseline by _apply_baseline_floor (agentic adoption ⇒ at least chat assist everywhere). classification_accuracy is exact per-phase match."
   },
   {
     "id": "tooling-sparse",

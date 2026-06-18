@@ -18,7 +18,9 @@ import statistics
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from models.twin_outputs import HourRange
+from models.project_schema import AiToolingLevel, CodebaseContext, RoleRoster
+from models.twin_outputs import HourRange, Phase
+from orchestrator.ai_acceleration import effective_ai_reduction
 from orchestrator.montecarlo import (
     DEFAULT_DRAWS,
     MCResult,
@@ -31,6 +33,7 @@ from orchestrator.montecarlo import (
     sample_pert,
     sample_risks,
 )
+from orchestrator.nodes._twin_base import make_reduction_sampler
 
 
 def _pert_mean(low: float, mode: float, high: float) -> float:
@@ -113,6 +116,34 @@ def test_sample_pert_right_skew_when_mode_left_of_center() -> None:
     median = statistics.median(draws)
     mean = statistics.fmean(draws)
     assert median < mean
+
+
+# ---------------------------------------------------------------------------
+# 2b. AI-effectiveness prior shape (Option 1 — left-skewed / downside-weighted)
+# ---------------------------------------------------------------------------
+
+
+def test_reduction_prior_is_downside_weighted() -> None:
+    """The reshaped AI-effectiveness prior leans toward the pessimistic (lower-reduction) side, so
+    the EXPECTED realized reduction sits BELOW the deterministic point. The point (most_likely) is
+    computed separately and unchanged; only the band leans down — and it still brackets the point."""
+    ctx = {
+        "phase": Phase.DEVELOPMENT,
+        "codebase": CodebaseContext.GREENFIELD,
+        "tooling": AiToolingLevel.AGENTIC,  # dev/agentic has a real band → sampler isn't constant 0
+        "roster": RoleRoster.default(),
+        "regulated": False,
+        "bands": None,
+    }
+    point = 0.55
+    r_point = effective_ai_reduction(proposed_reduction=point, **ctx)
+    sampler = make_reduction_sampler(
+        reduction_ctx=ctx, proposed_point=point, reduction_range=None
+    )
+    rng = make_rng("reduction-skew")
+    draws = [sampler(rng) for _ in range(4000)]
+    assert statistics.fmean(draws) < r_point         # downside-weighted (heavier low tail)
+    assert min(draws) <= r_point <= max(draws)        # band still brackets the deterministic point
 
 
 # ---------------------------------------------------------------------------

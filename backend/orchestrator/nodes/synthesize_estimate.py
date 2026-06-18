@@ -17,6 +17,7 @@ from models.twin_outputs import (
     RoleHeadcount,
 )
 from observability.langfuse_wrapper import traced
+from orchestrator.nodes._twin_base import rate_by_role, roster_for
 from orchestrator.staffing import (
     coordination_overhead,
     optimal_team_size,
@@ -30,8 +31,6 @@ logger = logging.getLogger(__name__)
 # (8h/day × 19 days), so headcount capacity must use the same full work-week (8h/day × 5).
 # A lower "productive" number here would double-count meeting overhead and over-count headcount.
 WORK_HOURS_PER_WEEK = 40
-
-_EPS = 1e-9
 
 # Default cross-phase correlation: phases partially co-move (shared scope drives
 # several phases together). Read at call time via _phase_correlation() so the
@@ -214,6 +213,20 @@ def _distribute_team(
     return alloc
 
 
+def _headcounts_for_target(
+    roster: RoleRoster, ai_hours_by_role: dict[str, float], target_weeks: float
+) -> dict[str, int]:
+    """Deadline-derived headcount per role: ``ceil(role_hours / (target_weeks · WORK_HOURS))``,
+    ≥ 1 for any role with work, 0 otherwise — enough capacity to deliver in the target window.
+    Only called when ``target_weeks > 0`` (so capacity is positive)."""
+    capacity = target_weeks * WORK_HOURS_PER_WEEK
+    out: dict[str, int] = {}
+    for r in roster.roles:
+        role_hours = ai_hours_by_role.get(r.role_id, 0.0)
+        out[r.role_id] = 0 if role_hours <= 0 else max(1, math.ceil(role_hours / capacity))
+    return out
+
+
 @traced(name="synthesize_estimate")
 async def synthesize_estimate(state: EstimationState) -> dict:
     pass2: list[PhaseEstimate] = state.get("pass2_estimates", [])
@@ -221,7 +234,7 @@ async def synthesize_estimate(state: EstimationState) -> dict:
     total_cost_manual = state.get("total_cost_manual_only_usd", 0.0)
     consistency_warnings = state.get("consistency_warnings", [])
     stage2 = state.get("stage2")
-    roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
+    roster = roster_for(state)
 
     target_weeks = (stage2.target_timeline_weeks if stage2 and stage2.target_timeline_weeks else 0)
 
@@ -230,10 +243,10 @@ async def synthesize_estimate(state: EstimationState) -> dict:
 
     ai_hours_by_role = _sum_hours_by_role(pass2, ai=True)
     manual_hours_by_role = _sum_hours_by_role(pass2, ai=False)
-    rate_by_role = {r.role_id: r.rate_per_hour for r in roster.roles}
+    rates = rate_by_role(roster)
 
     def _row(r: CustomRole, headcount: int) -> RoleHeadcount:
-        rate = rate_by_role.get(r.role_id, 0.0)
+        rate = rates.get(r.role_id, 0.0)
         ai_h = ai_hours_by_role.get(r.role_id, 0.0)
         manual_h = manual_hours_by_role.get(r.role_id, 0.0)
         return RoleHeadcount(
@@ -249,56 +262,63 @@ async def synthesize_estimate(state: EstimationState) -> dict:
             manual_only_cost_usd=manual_h * rate,
         )
 
-    headcount_rows: list[RoleHeadcount] = []
-    weekly_burn = 0.0
-
     # Team-scaling (Brooks's Law + diminishing returns), applied at the project level so the six
     # twins stay independent. `opt` is the recommended team size (scaled to project effort); it is
     # the no-target team, while in the target regime team_size is the deadline-derived headcount.
     # Either way, team_size, the headcount table, the Brooks overhead, the burn, and the duration
-    # all describe ONE coherent team (set per regime below).
+    # all describe ONE coherent team.
     coeffs = await get_staffing_coefficients()
     opt = optimal_team_size(ai_range.most_likely, WORK_HOURS_PER_WEEK, coeffs)
 
+    # Per-regime headcount: deadline-derived ceilings with a target, else the recommended team
+    # `opt` distributed across the roster by effort share (≥ 1 per active role). Both yield a
+    # {role_id: headcount} map that the shared row/burn loop below turns into the table.
     if target_weeks > 0:
-        capacity = target_weeks * WORK_HOURS_PER_WEEK
-        for r in roster.roles:
-            role_hours = ai_hours_by_role.get(r.role_id, 0.0)
-            if role_hours <= 0:
-                hc = 0
-            else:
-                # Ceiling so we always have enough capacity to deliver in the
-                # target window. Minimum of 1 if the role has any work at all.
-                hc = max(1, math.ceil(role_hours / capacity))
-            headcount_rows.append(_row(r, hc))
-            weekly_burn += hc * WORK_HOURS_PER_WEEK * rate_by_role.get(r.role_id, 0.0)
+        headcounts = _headcounts_for_target(roster, ai_hours_by_role, target_weeks)
+    else:
+        headcounts = _distribute_team(opt, ai_hours_by_role, roster.roles)
 
-        team_size = sum(r.headcount for r in headcount_rows)
-        overhead = coordination_overhead(team_size, coeffs)
+    headcount_rows = [_row(r, headcounts.get(r.role_id, 0)) for r in roster.roles]
+    weekly_burn = sum(
+        headcounts.get(r.role_id, 0) * WORK_HOURS_PER_WEEK * rates.get(r.role_id, 0.0)
+        for r in roster.roles
+    )
+    team_size = sum(r.headcount for r in headcount_rows)
+    overhead = coordination_overhead(team_size, coeffs)
+
+    if target_weeks > 0:
         # Brooks: coordination overhead stretches the target window.
         duration_low = max(1.0, target_weeks * 0.85) * (1.0 + overhead)
         duration_high = target_weeks * 1.25 * (1.0 + overhead)
     else:
-        # No target: staff the recommended team `opt`, DISTRIBUTED across the roster by effort
-        # share (≥ 1 per active role), and derive the duration from that same team's throughput.
-        # team_size = Σ headcount, so the table / overhead / burn / duration all describe ONE team
-        # (no phantom team-size decoupled from the displayed headcount).
-        alloc = _distribute_team(opt, ai_hours_by_role, roster.roles)
-        for r in roster.roles:
-            hc = alloc.get(r.role_id, 0)
-            headcount_rows.append(_row(r, hc))
-            weekly_burn += hc * WORK_HOURS_PER_WEEK * rate_by_role.get(r.role_id, 0.0)
-        team_size = sum(r.headcount for r in headcount_rows)
-        overhead = coordination_overhead(team_size, coeffs)
+        # No target: derive the duration from the staffed team's throughput (both laws), so the
+        # table / overhead / burn / duration all describe ONE team (no phantom decoupled size).
+        # A degenerate team (team_size 0 → throughput 0) would otherwise report a 0-week schedule;
+        # floor the divisor at a minimal 1-person throughput so the duration stays a real estimate.
         weekly_throughput = team_throughput(team_size, coeffs) * WORK_HOURS_PER_WEEK
-        duration_low = ai_range.optimistic / weekly_throughput if weekly_throughput > 0 else 0.0
-        duration_high = ai_range.pessimistic / weekly_throughput if weekly_throughput > 0 else 0.0
+        if weekly_throughput <= 0:
+            weekly_throughput = max(
+                team_throughput(1, coeffs) * WORK_HOURS_PER_WEEK, WORK_HOURS_PER_WEEK
+            )
+        duration_low = ai_range.optimistic / weekly_throughput
+        duration_high = ai_range.pessimistic / weekly_throughput
 
     # Brooks coordination tax on cost (both scenarios); `commercial_processing` kept the base
     # labor cost. Diminishing returns does NOT inflate cost — the algorithm estimates already
     # embed a normal team's productivity (see orchestrator/staffing.py).
     total_cost_ai *= 1.0 + overhead
     total_cost_manual *= 1.0 + overhead
+
+    # Contingency reserve: a deliberate, admin-set management buffer (distinct from the Monte Carlo
+    # band, which models estimation uncertainty). It uplifts BOTH cost scenarios and stretches the
+    # timeline, mirroring how Brooks overhead affects both. Hours, role-hours, and headcount are
+    # intentionally left untouched (so the twin eval rubrics are unaffected). Default 0% → no-op.
+    contingency_pct = max(0.0, state.get("contingency_pct", 0.0))
+    contingency = contingency_pct / 100.0
+    total_cost_ai *= 1.0 + contingency
+    total_cost_manual *= 1.0 + contingency
+    duration_low *= 1.0 + contingency
+    duration_high *= 1.0 + contingency
 
     avg_confidence = (
         sum(p.confidence for p in pass2) / len(pass2) if pass2 else 0.0
@@ -316,6 +336,7 @@ async def synthesize_estimate(state: EstimationState) -> dict:
         headcount_by_role=headcount_rows,
         weekly_burn_rate_usd=weekly_burn,
         brooks_overhead_pct=round(overhead * 100.0, 1),
+        contingency_pct=round(contingency_pct, 1),
         staffing_efficiency_pct=round(staffing_efficiency(team_size, coeffs) * 100.0, 1),
         team_size=team_size,
         optimal_team_size=opt,

@@ -28,6 +28,7 @@ from ag_ui.encoder import EventEncoder
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
+from db.repositories import get_default_rates
 from models.project_schema import Stage2Context
 from roster_agent import proposal_to_roster, run_roster_agent
 
@@ -77,7 +78,7 @@ async def roster_agui_endpoint(
         try:
             stage2, raw_input = _extract_inputs(input_data)
             proposal = await run_roster_agent(stage2, raw_input)
-            roster = proposal_to_roster(proposal)
+            roster = proposal_to_roster(proposal, await get_default_rates())
             # Shared-state snapshot the UI binds to. `roster` matches the Stage 2
             # form shape ({"roles": [...]}) so the frontend applies it directly.
             snapshot = {
@@ -98,8 +99,12 @@ async def roster_agui_endpoint(
                     run_id=input_data.run_id,
                 )
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("roster AG-UI run failed (%s); emitting RUN_ERROR", exc)
-            yield encoder.encode(RunErrorEvent(type=EventType.RUN_ERROR, message=str(exc)))
+        except Exception:  # noqa: BLE001
+            # Log the real error server-side only; never leak internal LLM/DB/MCP
+            # exception details to the client.
+            logger.exception("roster AG-UI run failed; emitting RUN_ERROR")
+            yield encoder.encode(
+                RunErrorEvent(type=EventType.RUN_ERROR, message="roster proposal failed")
+            )
 
     return StreamingResponse(event_generator(), media_type=encoder.get_content_type())

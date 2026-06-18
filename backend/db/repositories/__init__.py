@@ -19,6 +19,11 @@ Postgres being disabled / unreachable by returning the empty case (None / [] / {
 
 from __future__ import annotations
 
+from db.repositories.app_settings import (
+    get_app_setting,
+    get_app_settings_map,
+    set_app_setting,
+)
 from db.repositories.bands import get_reduction_bands, upsert_reduction_bands
 from db.repositories.calibration import (
     get_calibration,
@@ -32,6 +37,7 @@ from db.repositories.history import (
     list_estimate_history,
     save_estimate_history,
 )
+from db.repositories.rates import get_default_rates, upsert_default_rates
 from db.repositories.staffing import (
     get_staffing_coefficients,
     upsert_staffing_coefficients,
@@ -54,4 +60,11 @@ __all__ = [
     # staffing coefficients
     "get_staffing_coefficients",
     "upsert_staffing_coefficients",
+    # default rate card
+    "get_default_rates",
+    "upsert_default_rates",
+    # generic app settings
+    "get_app_setting",
+    "get_app_settings_map",
+    "set_app_setting",
 ]

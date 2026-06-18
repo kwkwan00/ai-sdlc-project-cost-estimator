@@ -7,10 +7,42 @@ from models.twin_outputs import Phase
 from orchestrator.nodes._twin_base import (
     assemble_phase_estimate,
     build_twin_user_prompt,
+    load_prompt,
+    rate_by_role,
     risk_specs_from,
     risks_from_inputs,
+    roster_for,
     stub_phase_estimate,
 )
+
+
+def test_load_prompt_is_cached_per_name() -> None:
+    # Static prompts: a second call returns the SAME cached object (read once).
+    first = load_prompt("development_architect")
+    second = load_prompt("development_architect")
+    assert first is second
+    assert first.strip()  # non-empty prompt body
+
+
+def test_roster_for_falls_back_to_default_when_stage2_absent() -> None:
+    assert roster_for({"stage2": None}).roles == RoleRoster.default().roles
+    # No stage2 key at all → still the default.
+    assert roster_for({}).roles == RoleRoster.default().roles
+
+
+def test_roster_for_returns_stage2_roster_when_populated() -> None:
+    from models.project_schema import Stage2Context
+
+    roster = RoleRoster.default()
+    stage2 = Stage2Context(roster=roster)
+    assert roster_for({"stage2": stage2}) is roster
+
+
+def test_rate_by_role_maps_role_id_to_rate() -> None:
+    roster = RoleRoster.default()
+    rates = rate_by_role(roster)
+    assert rates == {r.role_id: r.rate_per_hour for r in roster.roles}
+    assert len(rates) == len(roster.roles)
 
 
 def test_stub_phase_estimate_round_trips_through_pydantic() -> None:
@@ -86,10 +118,10 @@ def test_build_twin_user_prompt_injects_reduction_guardrail() -> None:
         "clarifying_questions": [],
     }
     prompt = build_twin_user_prompt(state, pass_num=1, phase_value="development")
-    # DEVELOPMENT/AGENTIC default band is (0.36, 0.66) → 36.0–66.0%.
+    # DEVELOPMENT/AGENTIC default band is (0.45, 0.72) → 45.0–72.0%.
     assert "ai_reduction_guardrail" in prompt
-    assert '"min_pct": 36' in prompt
-    assert '"max_pct": 66' in prompt
+    assert '"min_pct": 45' in prompt
+    assert '"max_pct": 72' in prompt
     assert '"tooling_level": "agentic"' in prompt
 
 

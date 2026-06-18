@@ -312,6 +312,9 @@ class DualScenarioEstimate(BaseModel):
     staffing_efficiency_pct: float = 0.0  # realized fraction of ideal linear team scaling
     team_size: int = 0                    # headcount the overhead/efficiency were computed on
     optimal_team_size: int = 0            # the Brooks/diminishing-returns "sweet spot"
+    # Contingency management reserve % applied on top of cost + timeline (0 = none). Defaulted so
+    # persisted pre-feature envelopes deserialize cleanly.
+    contingency_pct: float = 0.0
     total_cost_ai_assisted_usd: float = 0.0
     total_cost_manual_only_usd: float = 0.0
     # Meta-cost: Anthropic tokens + $ spent producing this estimate. Empty/zero

@@ -13,15 +13,9 @@ from models.twin_outputs import (
     PhaseEstimate,
     RiskInputList,
 )
-from orchestrator.montecarlo import (
-    DEFAULT_DRAWS,
-    Range3,
-    ReductionSampler,
-    propagate_phase,
-    resolve_size_band,
-)
+from orchestrator.montecarlo import Range3, ReductionSampler, resolve_size_band
 
-from ._twin_base import assemble_phase_estimate, make_twin_nodes, risk_specs_from
+from ._twin_base import build_phase_from_compute, make_twin_nodes
 
 logger = logging.getLogger(__name__)
 
@@ -101,31 +95,17 @@ def build_phase_estimate(
     rng,
     reduction_sampler: ReductionSampler,
 ) -> PhaseEstimate:
-    point_mid, breakdown = compute_review_hours(inputs)
-    manual_mc, ai_mc = propagate_phase(
+    return build_phase_from_compute(
         inputs,
-        compute_review_hours,
-        size_fields=_uncertain_fields_cr(inputs),
-        reduction_sampler=reduction_sampler,
-        risk_specs=risk_specs_from(inputs.risks),
-        eff_point=effective_reduction,
-        n_draws=DEFAULT_DRAWS,
-        rng=rng,
-    )
-    ai_mid = point_mid * (1 - effective_reduction)
-
-    return assemble_phase_estimate(
         phase=Phase.CODE_REVIEW,
         twin_name="code_review_sentinel",
         algorithm="Fagan",
-        point_mid=point_mid,
-        ai_mid=ai_mid,
-        manual_mc=manual_mc,
-        ai_mc=ai_mc,
-        roster=roster,
-        inputs=inputs,
-        breakdown=breakdown,
+        compute_fn=compute_review_hours,
+        size_fields=_uncertain_fields_cr(inputs),
         effective_reduction=effective_reduction,
+        roster=roster,
+        rng=rng,
+        reduction_sampler=reduction_sampler,
         assumption_impact_factor=0.1,
         notes=inputs.notes.strip(),
     )

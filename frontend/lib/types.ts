@@ -125,6 +125,8 @@ export interface DualScenarioEstimate {
   staffing_efficiency_pct?: number;
   team_size?: number;
   optimal_team_size?: number;
+  // Contingency management-reserve % applied to cost + timeline (0/absent = none).
+  contingency_pct?: number;
   total_cost_ai_assisted_usd: number;
   total_cost_manual_only_usd: number;
   llm_usage: LlmUsage;

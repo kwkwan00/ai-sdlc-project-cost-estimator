@@ -1,10 +1,11 @@
 "use client";
 
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 
+import { DocumentUpload } from "@/components/DocumentUpload";
 import { prefillFromDescription } from "@/lib/api-client";
 import { stage1Schema, type Stage1Input } from "@/lib/schemas";
 import { loadDraft, saveDraft } from "@/lib/wizard-store";
@@ -121,10 +122,8 @@ About 30 screens across 3 roles (customer, compliance reviewer, admin). Regulate
 
 function Stage1Inner() {
   const router = useRouter();
-  const params = useSearchParams();
-  const quick = params.get("quick") === "1";
 
-  const { register, handleSubmit, setValue, formState } = useForm<Stage1Input>({
+  const { register, handleSubmit, setValue, getValues, formState } = useForm<Stage1Input>({
     resolver: zodResolver(stage1Schema),
     defaultValues: { raw_input: "", project_name: "" },
   });
@@ -142,17 +141,6 @@ function Stage1Inner() {
   }, [setValue]);
 
   const onSubmit = async (values: Stage1Input) => {
-    if (quick) {
-      // Quick mode bypasses Stage 2/3 entirely — skip the prefill call so we
-      // don't burn an LLM round-trip the user will immediately discard.
-      saveDraft({
-        raw_input: values.raw_input,
-        project_name: values.project_name,
-      });
-      router.push(`/estimate/draft/create?quick=1`);
-      return;
-    }
-
     setAnalyzing(true);
     setPrefillNote(null);
     try {
@@ -189,6 +177,16 @@ function Stage1Inner() {
   const applyExample = (ex: ExampleProject) => {
     setValue("raw_input", ex.description);
     setValue("project_name", ex.name);
+  };
+
+  // Uploaded document → fill the (editable) description; derive a project name from the file
+  // name if one isn't set yet.
+  const onDocumentText = (text: string, fileName: string) => {
+    setValue("raw_input", text, { shouldValidate: true, shouldDirty: true });
+    if (!getValues("project_name")) {
+      const base = fileName.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+      if (base) setValue("project_name", base.slice(0, 80));
+    }
   };
 
   return (
@@ -246,10 +244,13 @@ function Stage1Inner() {
               ))}
             </select>
           </div>
+          <div className="mt-1">
+            <DocumentUpload onExtracted={onDocumentText} />
+          </div>
           <textarea
             id="raw_input"
-            className="textarea mt-1"
-            placeholder="Describe the project in plain English..."
+            className="textarea mt-2"
+            placeholder="Describe the project in plain English — or upload a document above."
             {...register("raw_input")}
           />
           {formState.errors.raw_input && (
@@ -273,8 +274,6 @@ function Stage1Inner() {
           <p className="text-xs muted">
             {analyzing
               ? "Analyzing description with Claude…"
-              : quick
-              ? "Quick mode — Stages 2 + 3 will be skipped with defaults."
               : "Next: project context (Stage 2). The description is auto-analyzed to prefill the form."}
           </p>
           <button
@@ -282,7 +281,7 @@ function Stage1Inner() {
             type="submit"
             disabled={analyzing}
           >
-            {analyzing ? "Analyzing…" : quick ? "Generate estimate" : "Continue"}
+            {analyzing ? "Analyzing…" : "Continue"}
           </button>
         </div>
       </form>

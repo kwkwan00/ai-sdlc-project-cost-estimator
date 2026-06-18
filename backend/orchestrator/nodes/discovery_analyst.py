@@ -10,9 +10,11 @@ Flow:
      ECF  = 1.4 - 0.03 * EFactor
      UCP  = (UUCW + UAW) * TCF * ECF
      Hours_manual_mid = UCP * productivity_factor * phase_ratio * stakeholder_multiplier
-     Three-point PERT around the mid.
-3. Apply AI maturity reduction (capped per planning outline §3.1.3 worked example).
-4. Split hours across the four roles using role_attribution (Discovery is senior-biased).
+3. Propagate input-size / AI-effectiveness / risk uncertainty via the Monte Carlo layer.
+4. Apply the AI-reduction guardrail band (system-derived) and split hours across the
+   user-defined roster via role_attribution (Discovery is senior-biased).
+
+Admin-switchable sizing: UCP (default) or FP-based analysis effort — see `_COMPUTE_BY_METHOD`.
 """
 
 from __future__ import annotations
@@ -25,26 +27,33 @@ from pydantic import BaseModel, ConfigDict, Field
 from models.project_schema import RoleRoster
 from models.twin_outputs import (
     Gap,
-    HourRange,
     Phase,
     PhaseEstimate,
     RiskInputList,
 )
-from orchestrator.montecarlo import (
-    DEFAULT_DRAWS,
-    Range3,
-    ReductionSampler,
-    propagate_phase,
-    resolve_size_band,
-)
+from orchestrator.montecarlo import Range3, ReductionSampler, resolve_size_band
 
-from ._twin_base import assemble_phase_estimate, make_twin_nodes, risk_specs_from
+from ._twin_base import build_phase_from_compute, make_twin_nodes
 
 logger = logging.getLogger(__name__)
 
 # Bounds the continuous productivity-factor driver (matches the field's ge/le); the
 # sampled size band is clamped into this so compute_ucp_hours never runs out of range.
 _PRODUCTIVITY_LO, _PRODUCTIVITY_HI = 18.0, 32.0
+
+# Function-Points alternative: discovery/analysis effort as a parametric function of project size
+# (ISBSG phase-distribution style — analysis is a documented slice of an FP-anchored total), instead
+# of UCP's use-case-points model. `HOURS_PER_FP_ANALYSIS` is discovery's analysis effort per FP
+# (the phase share is already folded in); `FP_PER_UUCW` converts the UCP unadjusted use-case weight
+# into an FP estimate when the LLM doesn't supply one. Tuned so a nominal project lands near the UCP
+# baseline. Calibrate against real actuals if available.
+HOURS_PER_FP_ANALYSIS = 1.0   # discovery/analysis hours per function point
+FP_PER_UUCW = 1.2             # UUCW → FP fallback ratio when no explicit FP count is given
+
+# Selectable discovery sizing algorithms (the Settings screen switches between them; the discovery
+# twin reads the choice off EstimationState, defaulting to UCP).
+DEFAULT_DISCOVERY_SIZING_METHOD = "ucp"
+DISCOVERY_SIZING_METHODS: tuple[str, ...] = ("ucp", "function_points")
 
 
 class DecisionMakerAccessibility(str, Enum):
@@ -81,11 +90,17 @@ class DiscoveryUCPInputs(BaseModel):
     phase_ratio_hint: float = Field(default=0.08, ge=0.05, le=0.15)
     productivity_factor: float = Field(default=24.0, ge=18.0, le=32.0)
 
+    # Function-Points sizing input (used only when the discovery sizing method is
+    # ``function_points``; UCP ignores it). The project's IFPUG FP count; absent → derived from the
+    # UCP unadjusted use-case weight via ``FP_PER_UUCW``.
+    total_function_points: float | None = Field(default=None, ge=0)
+
     # Monte Carlo uncertainty (optional). The least-certain size driver here is the
     # continuous productivity factor (hrs/UCP); the LLM may give an ~80% band for it,
     # or a fallback coefficient-of-variation. No `reduction_range`: Discovery does not
     # propose an AI reduction (it spreads the guardrail band instead).
     productivity_factor_range: Range3 | None = None
+    fp_range: Range3 | None = None  # MC band on total_function_points under the FP method
     estimate_cov: float | None = Field(default=None, ge=0, le=0.6)
 
     assumptions: list[str] = Field(default_factory=list, max_length=6)
@@ -116,9 +131,15 @@ def _stakeholder_multiplier(inputs: DiscoveryUCPInputs) -> float:
     return min(1.5, group_mult * access_mult * align_mult)
 
 
+def _uucw(inputs: DiscoveryUCPInputs) -> int:
+    """Unadjusted Use Case Weight — the raw use-case size proxy shared by the UCP formula and the
+    FP-method's size fallback."""
+    return 5 * inputs.simple_use_cases + 10 * inputs.average_use_cases + 15 * inputs.complex_use_cases
+
+
 def compute_ucp_hours(inputs: DiscoveryUCPInputs) -> tuple[float, dict]:
     """Apply the UCP formula. Returns (manual_mid_hours, breakdown_dict)."""
-    uucw = 5 * inputs.simple_use_cases + 10 * inputs.average_use_cases + 15 * inputs.complex_use_cases
+    uucw = _uucw(inputs)
     uaw = 1 * inputs.simple_actors + 2 * inputs.average_actors + 3 * inputs.complex_actors
     tcf = 0.6 + 0.01 * inputs.tfactor
     # Note: ECF formula in planning outline uses subtraction (1.4 - 0.03 * EFactor); the
@@ -140,22 +161,57 @@ def compute_ucp_hours(inputs: DiscoveryUCPInputs) -> tuple[float, dict]:
     }
 
 
-def pert_range(mid: float, *, opt_factor: float = 0.78, pess_factor: float = 1.35) -> HourRange:
-    """Three-point PERT around `mid`. Defaults give ±~25-35% spread, matching the
-    healthcare worked example (155 / 199 / 268).
-    """
-    return HourRange(
-        optimistic=max(0.0, mid * opt_factor),
-        most_likely=mid,
-        pessimistic=mid * pess_factor,
-    )
+def resolve_fp_discovery(inputs: DiscoveryUCPInputs) -> float:
+    """Function-point size for the FP method: the LLM's ``total_function_points`` if given, else
+    derived from the UCP unadjusted use-case weight (``UUCW × FP_PER_UUCW``) so the method still
+    produces a sane size when the LLM doesn't supply an explicit FP count. Mirrors dev's
+    ``resolve_fp`` (explicit-first, size-proxy fallback)."""
+    if inputs.total_function_points is not None and inputs.total_function_points > 0:
+        return inputs.total_function_points
+    return _uucw(inputs) * FP_PER_UUCW
+
+
+def compute_fp_analysis_hours(inputs: DiscoveryUCPInputs) -> tuple[float, dict]:
+    """FP-based discovery/analysis effort, the UCP alternative: ``hours = FP × HOURS_PER_FP_ANALYSIS``
+    (analysis effort is linear in functional size, with the phase share folded into the rate),
+    moderated by the **same** stakeholder multiplier as UCP so the two methods stay comparable."""
+    fp = resolve_fp_discovery(inputs)
+    stakeholder_mult = _stakeholder_multiplier(inputs)
+    base_hours = fp * HOURS_PER_FP_ANALYSIS
+    manual_mid = base_hours * stakeholder_mult
+    return manual_mid, {
+        "function_points": round(fp, 1),
+        "hours_per_fp_analysis": HOURS_PER_FP_ANALYSIS,
+        "base_hours": round(base_hours, 1),
+        "stakeholder_multiplier": round(stakeholder_mult, 3),
+    }
+
+
+# Maps the selected sizing method → (deterministic compute fn, algorithm label on the estimate).
+_COMPUTE_BY_METHOD: dict[str, tuple] = {
+    "ucp": (compute_ucp_hours, "UCP"),
+    "function_points": (compute_fp_analysis_hours, "FP_ANALYSIS"),
+}
 
 
 def _uncertain_fields_discovery(
-    inputs: DiscoveryUCPInputs,
+    inputs: DiscoveryUCPInputs, sizing_method: str = DEFAULT_DISCOVERY_SIZING_METHOD
 ) -> dict[str, tuple[float, float, float]]:
-    """Resolve the size band onto the continuous productivity factor (the least-certain
-    driver), clamped to its [18, 32] bounds. Mirrors ``_uncertain_fields_dev``."""
+    """Resolve the size band onto the driver the active compute fn reads, so the MC re-runs that
+    fn over the perturbed field: ``total_function_points`` under the FP method, else the continuous
+    ``productivity_factor`` (clamped to its [18, 32] bounds) under UCP. Mirrors
+    ``_uncertain_fields_dev``."""
+    if sizing_method == "function_points":
+        fp = resolve_fp_discovery(inputs)
+        if fp <= 0:
+            return {}
+        band = resolve_size_band(
+            point_value=fp,
+            explicit=inputs.fp_range,
+            estimate_cov=inputs.estimate_cov,
+            confidence=inputs.confidence,
+        )
+        return {"total_function_points": band} if band else {}
     band = resolve_size_band(
         point_value=inputs.productivity_factor,
         explicit=inputs.productivity_factor_range,
@@ -174,32 +230,22 @@ def build_phase_estimate(
     roster: RoleRoster,
     rng,
     reduction_sampler: ReductionSampler,
+    sizing_method: str = DEFAULT_DISCOVERY_SIZING_METHOD,
 ) -> PhaseEstimate:
-    point_mid, breakdown = compute_ucp_hours(inputs)
-    manual_mc, ai_mc = propagate_phase(
-        inputs,
-        compute_ucp_hours,
-        size_fields=_uncertain_fields_discovery(inputs),
-        reduction_sampler=reduction_sampler,
-        risk_specs=risk_specs_from(inputs.risks),
-        eff_point=effective_reduction,
-        n_draws=DEFAULT_DRAWS,
-        rng=rng,
+    compute_fn, algorithm = _COMPUTE_BY_METHOD.get(
+        sizing_method, _COMPUTE_BY_METHOD[DEFAULT_DISCOVERY_SIZING_METHOD]
     )
-    ai_mid = point_mid * (1 - effective_reduction)
-
-    return assemble_phase_estimate(
+    return build_phase_from_compute(
+        inputs,
         phase=Phase.DISCOVERY,
         twin_name="discovery_analyst",
-        algorithm="UCP",
-        point_mid=point_mid,
-        ai_mid=ai_mid,
-        manual_mc=manual_mc,
-        ai_mc=ai_mc,
-        roster=roster,
-        inputs=inputs,
-        breakdown=breakdown,
+        algorithm=algorithm,
+        compute_fn=compute_fn,
+        size_fields=_uncertain_fields_discovery(inputs, sizing_method),
         effective_reduction=effective_reduction,
+        roster=roster,
+        rng=rng,
+        reduction_sampler=reduction_sampler,
         assumption_impact_factor=0.1,
         notes=inputs.notes.strip(),
     )
@@ -214,5 +260,7 @@ discovery_analyst_pass1, discovery_analyst_pass2 = make_twin_nodes(
     stub_algorithm="UCP",
     stub_ai_mid=200,
     stub_manual_mid=240,
+    sizing_method_key="discovery_sizing_method",
+    sizing_method_default=DEFAULT_DISCOVERY_SIZING_METHOD,
     trace_name="twin.discovery_analyst",
 )

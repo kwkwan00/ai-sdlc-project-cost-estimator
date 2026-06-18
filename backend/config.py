@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     docs_mcp_scrape_timeout_s: float = Field(
         default=240.0, alias="DOCS_MCP_SCRAPE_TIMEOUT_S"
     )
+    # SSRF / prompt-injection hardening for the in-process docs-mcp research loop. The loop
+    # exposes fetch_url/scrape_docs to the LLM, whose inputs derive from untrusted Stage-3 text,
+    # so the backend gates every tool call. `docs_mcp_url_allowlist` is an optional comma-separated
+    # list of doc domains (suffix match, e.g. "docs.anthropic.com,readthedocs.io"); when set, the
+    # model may only fetch/scrape those hosts. When empty, no domain restriction applies but
+    # private/loopback/link-local/metadata addresses are ALWAYS blocked. `docs_mcp_max_tool_calls`
+    # caps the number of tool invocations per research call (bounds a hijacked/runaway loop).
+    docs_mcp_url_allowlist: str = Field(default="", alias="DOCS_MCP_URL_ALLOWLIST")
+    docs_mcp_max_tool_calls: int = Field(default=25, alias="DOCS_MCP_MAX_TOOL_CALLS")
 
     neo4j_uri: str = Field(default="bolt://localhost:7687", alias="NEO4J_URI")
     neo4j_user: str = Field(default="neo4j", alias="NEO4J_USER")

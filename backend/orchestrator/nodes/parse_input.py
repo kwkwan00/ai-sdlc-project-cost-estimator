@@ -12,7 +12,11 @@ import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from db.repositories import get_calibration_for_all_phases, get_reduction_bands
+from db.repositories import (
+    get_app_settings_map,
+    get_calibration_for_all_phases,
+    get_reduction_bands,
+)
 from models.estimation_state import EstimationState
 from observability.langfuse_wrapper import traced
 from orchestrator.llm import call_structured
@@ -49,6 +53,13 @@ SYSTEM = """You are the intake analyst for a software project cost estimator.
 Read the user's raw project description and extract structured signals. Be conservative:
 when something is not stated, leave the field empty / 0 rather than guessing. The
 downstream twin agents will surface gaps and ask follow-up questions.
+
+Constrain these fields to their allowed values:
+- `project_type_hint` — exactly one of: greenfield, legacy_replacement, enhancement,
+  integration, data_migration, ai_ml_build. Default to `greenfield` if unclear.
+- `industry_hint` — a short lowercase label (e.g. healthcare, fintech, retail) or "" if unstated.
+- `ambiguity_score` — 0.0 = fully specified (explicit scope, screens, integrations), ~0.5 = partial,
+  ~0.8 = a vague one-liner. Calibrate honestly; it gates how many clarifying questions are asked.
 """
 
 
@@ -106,20 +117,58 @@ async def _load_reduction_bands() -> dict:
         return {}
 
 
+async def _load_app_settings_map() -> dict[str, str]:
+    """All ``app_settings`` rows in a single full-table read → a ``{key: value}`` snapshot.
+
+    Lets the sizing-method + contingency resolvers below share ONE DB round-trip instead of one
+    per key. Returns ``{}`` when Postgres is disabled/unreachable, so every resolver falls back to
+    its code default."""
+    try:
+        return await get_app_settings_map()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("app_settings fetch failed (%s); using code defaults", exc)
+        return {}
+
+
+def _load_sizing_methods(settings_map: dict[str, str]) -> dict[str, str]:
+    """All DB-selected per-twin sizing algorithms → graph state (discovery + development + QA),
+    resolved from a shared ``app_settings`` snapshot, each falling back to its code default.
+    Returned as the state fields to splat into parse_input's result."""
+    return {
+        "discovery_sizing_method": settings_map.get("discovery_sizing_method", "ucp"),
+        "development_sizing_method": settings_map.get("development_sizing_method", "cocomo"),
+        "qa_sizing_method": settings_map.get("qa_sizing_method", "tpa"),
+    }
+
+
+def _load_contingency_pct(settings_map: dict[str, str]) -> float:
+    """DB-set global contingency management-reserve % → graph state, resolved from a shared
+    ``app_settings`` snapshot. Returns 0.0 (no contingency) when the key is unset or the stored
+    value isn't numeric."""
+    try:
+        return max(0.0, float(settings_map.get("contingency_pct", "0")))
+    except (ValueError, TypeError):
+        return 0.0
+
+
 @traced(name="parse_input")
 async def parse_input(state: EstimationState) -> dict:
     # Short-circuit when an external caller has pre-populated parsed_context
     # (used by the smoke harness and tests so they can skip the LLM call).
     existing = state.get("parsed_context") or {}
     if existing:
-        calibration, bands = await asyncio.gather(
-            _load_calibration(state), _load_reduction_bands()
+        calibration, bands, settings_map = await asyncio.gather(
+            _load_calibration(state),
+            _load_reduction_bands(),
+            _load_app_settings_map(),
         )
         logger.debug("parse_input: pre-populated context; %d calibration row(s) loaded", len(calibration))
         return {
             "parsed_context": existing,
             "calibration_examples": calibration,
             "reduction_bands": bands,
+            "contingency_pct": _load_contingency_pct(settings_map),
+            **_load_sizing_methods(settings_map),
         }
 
     parsed = await extract_context_from_raw(state["raw_input"])
@@ -137,15 +186,18 @@ async def parse_input(state: EstimationState) -> dict:
     # Calibration runs after parse so Stage-2-less requests still benefit from
     # the LLM-extracted industry / project_type hints.
     state_after = {**state, "parsed_context": parsed_dict}
-    calibration, bands = await asyncio.gather(
+    calibration, bands, settings_map = await asyncio.gather(
         _load_calibration(state_after),  # type: ignore[arg-type]
         _load_reduction_bands(),
+        _load_app_settings_map(),
     )
     logger.debug("parse_input: %d calibration row(s) loaded", len(calibration))
     return {
         "parsed_context": parsed_dict,
         "calibration_examples": calibration,
         "reduction_bands": bands,
+        "contingency_pct": _load_contingency_pct(settings_map),
+        **_load_sizing_methods(settings_map),
     }
 
 

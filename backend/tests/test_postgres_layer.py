@@ -33,11 +33,13 @@ from db.repositories import (
     delete_estimate_history,
     get_calibration,
     get_calibration_for_all_phases,
+    get_default_rates,
     get_estimate_envelope,
     get_staffing_coefficients,
     list_estimate_history,
     refresh_calibration_for_phase,
     save_estimate_history,
+    upsert_default_rates,
     upsert_staffing_coefficients,
 )
 from models.project_schema import (
@@ -209,6 +211,38 @@ async def test_save_estimate_history_writes_envelope_and_phases(in_memory_db) ->
 
 
 @pytest.mark.asyncio
+async def test_save_estimate_history_preserves_metadata_when_context_absent(
+    in_memory_db,
+) -> None:
+    """Pass-1 populates stage2-derived metadata; a later save with stage2=None (e.g. a
+    Pass-2 FAILURE) must NOT null those columns — it preserves the stored values."""
+    env = _make_envelope(status=EstimateStatus.AWAITING_ANSWERS)
+    stage2 = Stage2Context(
+        industry="fintech",
+        project_type=ProjectType.GREENFIELD,
+        target_timeline_weeks=12,
+    )
+    stage3 = Stage3Context()
+    await save_estimate_history(env, stage2=stage2, stage3=stage3)
+
+    # Now re-save with NO contexts (the Pass-2 failure path) and a new status.
+    env.status = EstimateStatus.FAILED
+    await save_estimate_history(env, stage2=None, stage3=None)
+
+    async with in_memory_db() as session:
+        from db.orm_models import EstimateHistory
+
+        row = await session.get(EstimateHistory, env.estimate_id)
+        assert row is not None
+        # Status (always updated) advanced...
+        assert row.status == EstimateStatus.FAILED.value
+        # ...but the stage2-derived metadata from Pass 1 survived.
+        assert row.industry == "fintech"
+        assert row.project_type == ProjectType.GREENFIELD.value
+        assert row.target_timeline_weeks == 12
+
+
+@pytest.mark.asyncio
 async def test_history_list_and_envelope_roundtrip(in_memory_db) -> None:
     env = _make_envelope()
     await save_estimate_history(env, stage2=None, stage3=None)
@@ -296,6 +330,25 @@ async def test_staffing_coefficients_roundtrip(in_memory_db) -> None:
     # Upsert updates an existing key in place.
     assert await upsert_staffing_coefficients([("link_cost", 0.2)]) is True
     assert (await get_staffing_coefficients())["link_cost"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_default_rates_roundtrip(in_memory_db) -> None:
+    from models.twin_outputs import RoleCategory as RC
+    from models.twin_outputs import RoleSeniority as RS
+
+    # Empty table → no overrides (callers fall back to pricing.DEFAULT_RATES per cell).
+    assert await get_default_rates() == {}
+    assert (
+        await upsert_default_rates([(RC.ENGINEERING, RS.SENIOR, 300.0), (RC.QA, RS.JUNIOR, 95.0)])
+        is True
+    )
+    rates = await get_default_rates()
+    assert rates[(RC.ENGINEERING, RS.SENIOR)] == 300.0
+    assert rates[(RC.QA, RS.JUNIOR)] == 95.0
+    # Upsert updates an existing (category, seniority) cell in place.
+    assert await upsert_default_rates([(RC.ENGINEERING, RS.SENIOR, 320.0)]) is True
+    assert (await get_default_rates())[(RC.ENGINEERING, RS.SENIOR)] == 320.0
 
 
 @pytest.mark.asyncio
@@ -627,4 +680,4 @@ async def test_admin_effective_bands_merge_db_override(in_memory_db) -> None:
     )
     assert (row.min_pct, row.max_pct) == (30.0, 45.0)  # the override, as percent
     assert row.is_override is True
-    assert (row.default_min_pct, row.default_max_pct) == (36.0, 66.0)  # code default still shown
+    assert (row.default_min_pct, row.default_max_pct) == (45.0, 72.0)  # code default still shown

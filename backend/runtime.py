@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from db.neo4j_adapter import save_estimate_envelope
@@ -145,9 +146,7 @@ def _evict_if_over_capacity() -> None:
         for estimate_id, env in _envelopes.items():
             if _is_in_flight(env):
                 continue
-            _envelopes.pop(estimate_id, None)
-            _event_streams.pop(estimate_id, None)
-            _llm_usage.pop(estimate_id, None)
+            remove_estimate(estimate_id)  # drops envelope + event broker + usage accumulator
             evicted = True
             break
         if not evicted:
@@ -206,105 +205,136 @@ def _refresh_envelope_from_state(estimate_id: str, state: dict[str, Any]) -> Est
     return env
 
 
-async def _run_pass1(estimate_id: str, initial_state: dict[str, Any]) -> None:
-    """Run the graph until it interrupts at Stage 4."""
+async def _run_graph_phase(
+    estimate_id: str,
+    *,
+    running_status: EstimateStatus,
+    invoke_arg: Any,
+    running_log: str,
+    fail_log: str,
+    handle_result: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]],
+    persist: dict[str, Any],
+    keep_usage_when: Callable[[EstimateStatus], bool],
+) -> None:
+    """Shared run envelope for both graph passes: bind the usage accumulator, set the
+    running status + emit it, invoke the graph, hand the result to the pass-specific
+    ``handle_result`` (which mutates the envelope + emits + may return persist overrides),
+    and on any exception mark the run FAILED + emit the error. The ``finally`` always
+    persists and evicts; the per-pass ``keep_usage_when`` predicate decides whether the
+    token accumulator survives (Pass 1 keeps it across the AWAITING_ANSWERS pause).
+
+    Only the running/fail log lines, the invoke argument, the result handling, the persist
+    inputs, and the usage-retention rule differ between Pass 1 and Pass 2 — everything else
+    was byte-identical and lives here.
+    """
+    from orchestrator.usage import bind_usage_accumulator
+
     env = _envelopes[estimate_id]
     try:
-        from orchestrator.usage import bind_usage_accumulator
-
         bind_usage_accumulator(_llm_usage.setdefault(estimate_id, []))
-        env.status = EstimateStatus.PASS_1_RUNNING
+        env.status = running_status
         await _emit(estimate_id, "status", {"status": env.status.value})
-        logger.info("estimate %s: pass 1 running", estimate_id)
+        logger.info(running_log, estimate_id)
 
-        result = await _graph.ainvoke(initial_state, config=_config_for(estimate_id))
-        _refresh_envelope_from_state(estimate_id, result)
-
-        if result.get("__interrupt__"):
-            env.status = EstimateStatus.AWAITING_ANSWERS
-            await _emit(estimate_id, "status", {"status": env.status.value})
-            await _emit(
-                estimate_id,
-                "questions",
-                {"questions": [q.model_dump() for q in env.clarifying_questions]},
-            )
-            logger.info(
-                "estimate %s: pass 1 paused, awaiting %d clarifying answer(s)",
-                estimate_id,
-                len(env.clarifying_questions),
-            )
-        else:
-            # No interrupt — graph completed straight through.
-            env.final_estimate = result.get("final_estimate")
-            _attach_llm_usage(estimate_id)
-            env.status = EstimateStatus.COMPLETED
-            await _emit(estimate_id, "status", {"status": env.status.value})
-            logger.info("estimate %s: completed (no clarifying interrupt)", estimate_id)
+        result = await _graph.ainvoke(invoke_arg, config=_config_for(estimate_id))
+        overrides = await handle_result(estimate_id, result)
+        if overrides:
+            persist.update(overrides)
     except Exception as exc:  # noqa: BLE001
         env.status = EstimateStatus.FAILED
         env.error = str(exc)
-        logger.exception("Pass 1 failed")
+        logger.exception(fail_log)
         await _emit(estimate_id, "error", {"message": str(exc)})
     finally:
         await _persist(
-            env,
-            initial_state.get("raw_input", ""),
-            stage2=initial_state.get("stage2"),
-            stage3=initial_state.get("stage3"),
+            env, persist["raw_input"], stage2=persist["stage2"], stage3=persist["stage3"]
         )
-        # Free the usage accumulator on both paths once the run is no longer active.
-        # While AWAITING_ANSWERS, Pass 2 still appends to the same list — keep it.
-        if env.status != EstimateStatus.AWAITING_ANSWERS:
+        if not keep_usage_when(env.status):
             _llm_usage.pop(estimate_id, None)
         _evict_if_over_capacity()
+
+
+async def _handle_pass1_result(estimate_id: str, result: dict[str, Any]) -> None:
+    """Pass 1 result handling: pause at the Stage-4 interrupt (AWAITING_ANSWERS) or, if the
+    graph ran straight through, finalize as COMPLETED. No persist overrides (Stage 2/3 came
+    from the initial state)."""
+    env = _envelopes[estimate_id]
+    _refresh_envelope_from_state(estimate_id, result)
+    if result.get("__interrupt__"):
+        env.status = EstimateStatus.AWAITING_ANSWERS
+        await _emit(estimate_id, "status", {"status": env.status.value})
+        await _emit(
+            estimate_id,
+            "questions",
+            {"questions": [q.model_dump() for q in env.clarifying_questions]},
+        )
+        logger.info(
+            "estimate %s: pass 1 paused, awaiting %d clarifying answer(s)",
+            estimate_id,
+            len(env.clarifying_questions),
+        )
+    else:
+        # No interrupt — graph completed straight through.
+        env.final_estimate = result.get("final_estimate")
+        _attach_llm_usage(estimate_id)
+        env.status = EstimateStatus.COMPLETED
+        await _emit(estimate_id, "status", {"status": env.status.value})
+        logger.info("estimate %s: completed (no clarifying interrupt)", estimate_id)
+
+
+async def _run_pass1(estimate_id: str, initial_state: dict[str, Any]) -> None:
+    """Run the graph until it interrupts at Stage 4."""
+    await _run_graph_phase(
+        estimate_id,
+        running_status=EstimateStatus.PASS_1_RUNNING,
+        invoke_arg=initial_state,
+        running_log="estimate %s: pass 1 running",
+        fail_log="Pass 1 failed",
+        handle_result=_handle_pass1_result,
+        persist={
+            "raw_input": initial_state.get("raw_input", ""),
+            "stage2": initial_state.get("stage2"),
+            "stage3": initial_state.get("stage3"),
+        },
+        # Keep the accumulator across the AWAITING_ANSWERS pause — Pass 2 appends to it.
+        keep_usage_when=lambda status: status == EstimateStatus.AWAITING_ANSWERS,
+    )
+
+
+async def _handle_pass2_result(estimate_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """Pass 2 result handling: finalize as COMPLETED and emit the final estimate. Returns the
+    Stage 2/3 persist overrides carried off the graph state so the history row stays fully
+    populated on the Pass 2 update (they survive both passes untouched)."""
+    env = _envelopes[estimate_id]
+    _refresh_envelope_from_state(estimate_id, result)
+    env.final_estimate = result.get("final_estimate")
+    _attach_llm_usage(estimate_id)
+    env.status = EstimateStatus.COMPLETED
+    await _emit(estimate_id, "status", {"status": env.status.value})
+    await _emit(
+        estimate_id,
+        "final",
+        env.final_estimate.model_dump() if env.final_estimate else {},
+    )
+    logger.info("estimate %s: completed (pass 2 synthesized)", estimate_id)
+    return {"stage2": result.get("stage2"), "stage3": result.get("stage3")}
 
 
 async def _resume_pass2(estimate_id: str, answers: dict[str, str]) -> None:
     from langgraph.types import Command
 
-    env = _envelopes[estimate_id]
-    stage2: Stage2Context | None = None
-    stage3: Stage3Context | None = None
-    try:
-        from orchestrator.usage import bind_usage_accumulator
-
-        # Same list Pass 1 used, so total usage spans both passes.
-        bind_usage_accumulator(_llm_usage.setdefault(estimate_id, []))
-        env.status = EstimateStatus.PASS_2_RUNNING
-        await _emit(estimate_id, "status", {"status": env.status.value})
-        logger.info("estimate %s: pass 2 running (resumed with answers)", estimate_id)
-
-        result = await _graph.ainvoke(
-            Command(resume={"answers": answers}),
-            config=_config_for(estimate_id),
-        )
-        # Carry Stage 2/3 through to the post-run persist so the history row
-        # stays fully populated on the Pass 2 update (initial state put them on
-        # the graph; they survive both passes untouched).
-        stage2 = result.get("stage2")
-        stage3 = result.get("stage3")
-        _refresh_envelope_from_state(estimate_id, result)
-        env.final_estimate = result.get("final_estimate")
-        _attach_llm_usage(estimate_id)
-        env.status = EstimateStatus.COMPLETED
-        await _emit(estimate_id, "status", {"status": env.status.value})
-        await _emit(
-            estimate_id,
-            "final",
-            env.final_estimate.model_dump() if env.final_estimate else {},
-        )
-        logger.info("estimate %s: completed (pass 2 synthesized)", estimate_id)
-    except Exception as exc:  # noqa: BLE001
-        env.status = EstimateStatus.FAILED
-        env.error = str(exc)
-        logger.exception("Pass 2 failed")
-        await _emit(estimate_id, "error", {"message": str(exc)})
-    finally:
-        await _persist(env, "", stage2=stage2, stage3=stage3)
-        # Pass 2 is terminal (completed or failed) — free the usage accumulator on
-        # both paths so it never leaks (previously popped only on success).
-        _llm_usage.pop(estimate_id, None)
-        _evict_if_over_capacity()
+    await _run_graph_phase(
+        estimate_id,
+        running_status=EstimateStatus.PASS_2_RUNNING,
+        invoke_arg=Command(resume={"answers": answers}),
+        running_log="estimate %s: pass 2 running (resumed with answers)",
+        fail_log="Pass 2 failed",
+        handle_result=_handle_pass2_result,
+        # Stage 2/3 default to None until the successful invoke supplies them (override).
+        persist={"raw_input": "", "stage2": None, "stage3": None},
+        # Pass 2 is terminal — always free the accumulator (success or failure).
+        keep_usage_when=lambda status: False,
+    )
 
 
 async def _persist(

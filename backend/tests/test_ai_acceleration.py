@@ -117,9 +117,13 @@ def test_codebase_moderation_lowers_familiar_brownfield() -> None:
 
 
 def test_familiar_brownfield_senior_regulated_goes_negative() -> None:
+    # Chat-level dev on a familiar large brownfield with seniors + regulation still nets
+    # negative (verification overhead > the moderated reduction). NB: agentic dev no longer
+    # goes negative here since its band floor was raised to 0.45 — a deliberate, less-conservative
+    # choice — but lower tiers still can, so the negative-floor mechanism is exercised here.
     eff = effective_ai_reduction(
         phase=Phase.DEVELOPMENT,
-        tooling=T.AGENTIC,
+        tooling=T.CHAT,
         codebase=C.BROWNFIELD_LARGE_FAMILIAR,
         roster=_roster(S.SENIOR, S.SENIOR),
         proposed_reduction=0.20,
@@ -129,8 +133,25 @@ def test_familiar_brownfield_senior_regulated_goes_negative() -> None:
     assert eff >= NEGATIVE_FLOOR
 
 
+def test_dev_agentic_band_raised_and_clamps_low_proposals_up() -> None:
+    # The development agentic band floor was raised 0.36 → 0.45, so a below-floor LLM proposal
+    # is clamped UP — the deterministic lever that lifts the (dominant) dev phase's AI saving.
+    assert band_for(Phase.DEVELOPMENT, T.AGENTIC) == (0.45, 0.72)
+    eff = effective_ai_reduction(
+        phase=Phase.DEVELOPMENT,
+        tooling=T.AGENTIC,
+        codebase=C.GREENFIELD,
+        roster=_roster(S.MID),  # factor 1.0, no penalty
+        proposed_reduction=0.40,  # below the 0.45 floor → clamped up
+    )
+    assert abs(eff - 0.45) < 1e-9
+
+
 def test_seniority_factor_is_inverse_and_bounded() -> None:
     assert seniority_factor(_roster(S.JUNIOR)) > seniority_factor(_roster(S.SENIOR))
     assert seniority_factor(None) == 1.0
     assert seniority_factor(RoleRoster()) == 1.0
     assert 0.6 <= seniority_factor(_roster(S.SENIOR)) <= 1.25
+    # Softened ±0.2 swing (was ±0.3): an all-senior team → 0.8, all-junior → 1.2.
+    assert abs(seniority_factor(_roster(S.SENIOR)) - 0.8) < 1e-9
+    assert abs(seniority_factor(_roster(S.JUNIOR)) - 1.2) < 1e-9

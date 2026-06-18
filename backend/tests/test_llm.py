@@ -12,7 +12,11 @@ import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from orchestrator import llm
-from orchestrator.llm import _model_accepts_sampling_params, call_structured
+from orchestrator.llm import (
+    _model_accepts_sampling_params,
+    _pydantic_to_tool_schema,
+    call_structured,
+)
 
 
 class _Echo(BaseModel):
@@ -51,6 +55,24 @@ def test_legacy_models_accept_sampling_params(model: str) -> None:
     assert _model_accepts_sampling_params(model) is True
 
 
+# ---------- _pydantic_to_tool_schema memoization ----------
+
+
+def test_pydantic_to_tool_schema_is_memoized() -> None:
+    # The schema is immutable per (model class, tool_name) and recomputing
+    # model_json_schema() on every call_structured is wasteful, so it's cached.
+    first = _pydantic_to_tool_schema(_Echo, "echo")
+    second = _pydantic_to_tool_schema(_Echo, "echo")
+    assert first is second  # same cached object, not just equal
+    # A different tool_name is a distinct cache entry with the right name.
+    other = _pydantic_to_tool_schema(_Echo, "other")
+    assert other is not first
+    assert other["name"] == "other"
+    # Content is still correct.
+    assert first["name"] == "echo"
+    assert "value" in first["input_schema"]["properties"]
+
+
 # ---------- call_structured request construction ----------
 
 
@@ -70,7 +92,7 @@ class _FakeResponse:
 
 class _SpyMessages:
     def __init__(self) -> None:
-        self.kwargs: dict | None = None
+        self.kwargs: dict = {}
 
     async def create(self, **kwargs):  # noqa: ANN003
         self.kwargs = kwargs
@@ -202,6 +224,53 @@ async def test_call_structured_retries_without_output_config_on_rejection(
     assert "output_config" not in client.messages.calls[1]
 
 
+class _AuthErrorMessages:
+    """Every create call raises a non-output_config API error (e.g. auth/rate-limit).
+    The narrowed retry must re-raise immediately rather than re-issuing the call."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):  # noqa: ANN003
+        self.calls.append(dict(kwargs))
+        raise RuntimeError("401 authentication_error: invalid x-api-key")
+
+
+class _AuthErrorClient:
+    def __init__(self) -> None:
+        self.messages = _AuthErrorMessages()
+
+
+@pytest.mark.asyncio
+async def test_call_structured_does_not_retry_non_output_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An auth/rate-limit error carrying output_config in kwargs must NOT be retried
+    # without output_config (that would double the failing call). The corrective
+    # validation retry also re-issues, so each _attempt fires exactly once → 2 total.
+    client = _AuthErrorClient()
+    monkeypatch.setattr(llm, "_get_client", lambda: client)
+
+    class _Settings:
+        anthropic_model = "unused"
+
+    monkeypatch.setattr(llm, "get_settings", lambda: _Settings())
+
+    with pytest.raises(RuntimeError, match="authentication_error"):
+        await call_structured(
+            system="s",
+            user="u",
+            response_model=_Echo,
+            tool_name="echo",
+            model="claude-sonnet-4-6",
+            effort="low",
+        )
+    # No output_config-less retry within either attempt: the first attempt raises,
+    # the corrective attempt raises too — both still carry output_config.
+    assert len(client.messages.calls) == 2
+    assert all("output_config" in c for c in client.messages.calls)
+
+
 # ---------- one-shot retry on a transient structured-output (validation) failure ----------
 
 
@@ -279,3 +348,80 @@ async def test_call_structured_propagates_after_two_validation_failures(
             model="claude-opus-4-8",
         )
     assert len(client.messages.calls) == 2  # one retry, then give up
+
+
+# ---------- _GuardedMcpSession (docs-mcp research SSRF / allowlist / budget guard) ----------
+
+
+class _FakeMcpSession:
+    """Records forwarded tool calls; stands in for an MCP ClientSession."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict | None]] = []
+
+    async def call_tool(self, name, arguments=None, *args, **kwargs):
+        self.calls.append((name, arguments))
+        return {"ok": name}
+
+    async def list_tools(self):  # exercises __getattr__ delegation
+        return "TOOLS"
+
+
+def _guard(session, *, allowed=None, allowlist=None, max_calls=10):
+    from orchestrator.llm import _GuardedMcpSession
+
+    return _GuardedMcpSession(
+        session, allowed_tools=allowed, url_allowlist=allowlist, max_calls=max_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_guard_blocks_disallowed_tool() -> None:
+    fake = _FakeMcpSession()
+    g = _guard(fake, allowed=frozenset({"search_docs"}))
+    with pytest.raises(PermissionError):
+        await g.call_tool("fetch_url", {"url": "https://8.8.8.8"})
+    assert fake.calls == []  # never forwarded to the server
+
+
+@pytest.mark.asyncio
+async def test_guard_blocks_internal_url_arg() -> None:
+    fake = _FakeMcpSession()
+    g = _guard(fake, allowed=None)  # tool allowed, but the URL is internal
+    with pytest.raises(PermissionError):
+        await g.call_tool("fetch_url", {"url": "http://169.254.169.254/latest/meta-data"})
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_guard_forwards_allowed_tool_with_public_url() -> None:
+    fake = _FakeMcpSession()
+    g = _guard(fake, allowed=frozenset({"scrape_docs"}))
+    args = {"library": "x", "url": "https://8.8.8.8/docs"}  # public literal IP → no DNS
+    assert await g.call_tool("scrape_docs", args) == {"ok": "scrape_docs"}
+    assert fake.calls == [("scrape_docs", args)]
+
+
+@pytest.mark.asyncio
+async def test_guard_forwards_non_url_tool() -> None:
+    fake = _FakeMcpSession()
+    g = _guard(fake, allowed=frozenset({"search_docs"}))
+    await g.call_tool("search_docs", {"query": "claude code"})
+    assert fake.calls == [("search_docs", {"query": "claude code"})]
+
+
+@pytest.mark.asyncio
+async def test_guard_enforces_call_budget() -> None:
+    fake = _FakeMcpSession()
+    g = _guard(fake, allowed=None, max_calls=2)
+    await g.call_tool("search_docs", {"q": "a"})
+    await g.call_tool("search_docs", {"q": "b"})
+    with pytest.raises(PermissionError):
+        await g.call_tool("search_docs", {"q": "c"})
+
+
+@pytest.mark.asyncio
+async def test_guard_delegates_unknown_attrs() -> None:
+    fake = _FakeMcpSession()
+    g = _guard(fake)
+    assert await g.list_tools() == "TOOLS"

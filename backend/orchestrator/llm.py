@@ -8,6 +8,7 @@ into the model. Faster + more reliable than JSON-mode prompting.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -49,6 +50,38 @@ def _model_accepts_sampling_params(model: str) -> bool:
     return not any(tag in model for tag in _NO_SAMPLING_PARAM_MODELS)
 
 
+def _record_call_usage_and_log(
+    response: Any, *, use_model: str, tool_name: str, started: float
+) -> None:
+    """Record one Claude call's token usage and emit the INFO completion log line.
+
+    Hoisted out of ``call_structured._attempt`` (which fires this once per attempt —
+    both attempts cost tokens). Reads ``response.usage`` defensively (any field may be
+    absent on a partial/mocked response) and records via the contextvar accumulator,
+    a no-op when nothing is bound (tests / stub path / pre-submission agents). Pure
+    side effects; no return value and no behavior change."""
+    usage = getattr(response, "usage", None)
+    from orchestrator.usage import record_usage
+
+    record_usage(
+        model=use_model,
+        input_tokens=getattr(usage, "input_tokens", 0) or 0,
+        output_tokens=getattr(usage, "output_tokens", 0) or 0,
+        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+    )
+    logger.info(
+        "llm call ✓ model=%s tool=%s latency=%dms stop=%s "
+        "tokens(in/out/cache_read)=%s/%s/%s",
+        use_model,
+        tool_name,
+        int((time.perf_counter() - started) * 1000),
+        response.stop_reason,
+        getattr(usage, "input_tokens", None),
+        getattr(usage, "output_tokens", None),
+        getattr(usage, "cache_read_input_tokens", None),
+    )
+
+
 def _get_client() -> AsyncAnthropic:
     global _client
     if _client is None:
@@ -59,8 +92,14 @@ def _get_client() -> AsyncAnthropic:
     return _client
 
 
+@functools.cache
 def _pydantic_to_tool_schema(model: type[BaseModel], name: str) -> dict[str, Any]:
-    """Convert a Pydantic model to an Anthropic tool definition."""
+    """Convert a Pydantic model to an Anthropic tool definition.
+
+    The result is immutable per `(model class, tool_name)`, so it's memoized — every
+    `call_structured` call would otherwise recompute `model_json_schema()`. Callers
+    must treat the returned dict as read-only (it's a shared cached object).
+    """
     schema = model.model_json_schema()
     # Strip `$defs` / `definitions` cycles by inlining refs.
     return {
@@ -149,7 +188,11 @@ async def call_structured(
         try:
             response = await client.messages.create(**kwargs)
         except Exception as exc:  # noqa: BLE001
-            if "output_config" in kwargs:
+            # Only retry-without-output_config when the failure is actually about that
+            # param (older SDK/model/endpoint rejecting it). Auth (401) / rate-limit
+            # (429) / other API errors must NOT be retried here — doing so doubles the
+            # call without recovering — so we re-raise them immediately.
+            if "output_config" in kwargs and "output_config" in str(exc).lower():
                 logger.warning(
                     "messages.create rejected output_config (%s); retrying without it", exc
                 )
@@ -161,25 +204,8 @@ async def call_structured(
         # Every LLM / forced-tool call is logged at INFO with cost + latency so the
         # operational narrative shows model usage without needing Langfuse enabled.
         # Both attempts cost tokens, so usage is recorded on each.
-        usage = getattr(response, "usage", None)
-        from orchestrator.usage import record_usage
-
-        record_usage(
-            model=use_model,
-            input_tokens=getattr(usage, "input_tokens", 0) or 0,
-            output_tokens=getattr(usage, "output_tokens", 0) or 0,
-            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-        )
-        logger.info(
-            "llm call ✓ model=%s tool=%s latency=%dms stop=%s "
-            "tokens(in/out/cache_read)=%s/%s/%s",
-            use_model,
-            tool_name,
-            int((time.perf_counter() - started) * 1000),
-            response.stop_reason,
-            getattr(usage, "input_tokens", None),
-            getattr(usage, "output_tokens", None),
-            getattr(usage, "cache_read_input_tokens", None),
+        _record_call_usage_and_log(
+            response, use_model=use_model, tool_name=tool_name, started=started
         )
 
         for block in response.content:
@@ -206,6 +232,62 @@ async def call_structured(
         return await _attempt(corrective=True)
 
 
+def _iter_strings(value: Any) -> list[str]:
+    """Flatten any str leaves out of a tool-argument value (str / list / dict / nested)."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _iter_strings(v)]
+    if isinstance(value, (list, tuple)):
+        return [s for v in value for s in _iter_strings(v)]
+    return []
+
+
+class _GuardedMcpSession:
+    """Wraps an MCP ``ClientSession`` for the in-process research loop so the LLM can't turn it
+    into an SSRF/abuse primitive: it (1) restricts which tools may be called, (2) validates every
+    http(s) URL argument against the SSRF guard before forwarding, and (3) caps the total number of
+    tool calls. Everything else delegates to the real session. Fails closed (raises) on a violation,
+    which the caller's try/except degrades to "unknown tools stay none"."""
+
+    def __init__(
+        self,
+        session: Any,
+        *,
+        allowed_tools: frozenset[str] | None,
+        url_allowlist: frozenset[str] | None,
+        max_calls: int,
+    ) -> None:
+        self._session = session
+        self._allowed = allowed_tools
+        self._url_allowlist = url_allowlist
+        self._max_calls = max_calls
+        self._calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything we don't explicitly override (initialize, list_tools, ...).
+        return getattr(self._session, name)
+
+    async def call_tool(self, name: str, arguments: dict | None = None, *args: Any, **kwargs: Any) -> Any:
+        from orchestrator.ssrf import UrlNotAllowed, assert_url_allowed, looks_like_url
+
+        self._calls += 1
+        if self._calls > self._max_calls:
+            raise PermissionError(f"docs-mcp research tool-call budget exhausted ({self._max_calls})")
+        if self._allowed is not None and name not in self._allowed:
+            raise PermissionError(f"docs-mcp tool {name!r} is not permitted in research")
+        for candidate in _iter_strings(arguments or {}):
+            if looks_like_url(candidate):
+                try:
+                    await asyncio.to_thread(
+                        assert_url_allowed, candidate, allowlist=self._url_allowlist
+                    )
+                except UrlNotAllowed as exc:
+                    logger.warning("docs-mcp research blocked URL in %s: %s", name, exc)
+                    raise PermissionError(f"URL blocked by SSRF guard: {exc}") from exc
+        return await self._session.call_tool(name, arguments, *args, **kwargs)
+
+
 @traced(name="claude-mcp-research", as_type="generation")
 async def research_with_local_mcp(
     *,
@@ -215,6 +297,9 @@ async def research_with_local_mcp(
     headers: dict[str, str] | None = None,
     model: str | None = None,
     max_tokens: int = 2048,
+    allowed_tools: frozenset[str] | None = None,
+    url_allowlist: frozenset[str] | None = None,
+    max_tool_calls: int = 25,
 ) -> str:
     """Free-text call backed by a SELF-HOSTED MCP server (e.g. docs-mcp-server).
 
@@ -245,12 +330,24 @@ async def research_with_local_mcp(
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools_result = await session.list_tools()
+            # Only expose allowlisted tools to the model (defense in depth), and route every call
+            # through the SSRF/budget guard before it reaches the server.
+            exposed = [
+                t for t in tools_result.tools if allowed_tools is None or t.name in allowed_tools
+            ]
+            guarded = _GuardedMcpSession(
+                session,
+                allowed_tools=allowed_tools,
+                url_allowlist=url_allowlist,
+                max_calls=max_tool_calls,
+            )
             runner = client.beta.messages.tool_runner(
                 model=use_model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
-                tools=[async_mcp_tool(t, session) for t in tools_result.tools],
+                # _GuardedMcpSession duck-types ClientSession (delegates everything but call_tool).
+                tools=[async_mcp_tool(t, guarded) for t in exposed],  # type: ignore[arg-type]
             )
             if _inspect.isawaitable(runner):
                 runner = await runner
@@ -270,7 +367,7 @@ async def research_with_local_mcp(
     logger.info(
         "local mcp research ✓ model=%s tools=%d latency=%dms out_chars=%d",
         use_model,
-        len(tools_result.tools),
+        len(exposed),
         int((time.perf_counter() - started) * 1000),
         len(text),
     )

@@ -31,48 +31,11 @@ from models.project_schema import CustomRole, RoleRoster, Stage2Context
 from models.twin_outputs import RoleCategory, RoleSeniority
 from orchestrator.llm import call_structured, render_context_block
 from orchestrator.nodes._twin_base import load_prompt
+from pricing import resolve_rate
 
 logger = logging.getLogger(__name__)
 
 _MAX_ROLES = 8
-
-# Blended USD/hr defaults keyed by (category, seniority). The four product /
-# engineering senior/junior cells are anchored to RoleRoster.default() so a
-# vanilla proposal round-trips identically; the rest extend the same shape to the
-# other categories. Rates are NEVER taken from the LLM — they are a user-owned
-# commercial input that feeds commercial_processing, and the user edits them in
-# the wizard. _RATE_FALLBACK covers any (category, seniority) pair not listed.
-_RATE_FALLBACK = 165.0
-_DEFAULT_RATE: dict[tuple[RoleCategory, RoleSeniority], float] = {
-    (RoleCategory.PRODUCT, RoleSeniority.SENIOR): 220.0,
-    (RoleCategory.PRODUCT, RoleSeniority.MID): 180.0,
-    (RoleCategory.PRODUCT, RoleSeniority.JUNIOR): 140.0,
-    (RoleCategory.PRODUCT, RoleSeniority.OTHER): 180.0,
-    (RoleCategory.ENGINEERING, RoleSeniority.SENIOR): 240.0,
-    (RoleCategory.ENGINEERING, RoleSeniority.MID): 195.0,
-    (RoleCategory.ENGINEERING, RoleSeniority.JUNIOR): 150.0,
-    (RoleCategory.ENGINEERING, RoleSeniority.OTHER): 195.0,
-    (RoleCategory.UI_UX, RoleSeniority.SENIOR): 200.0,
-    (RoleCategory.UI_UX, RoleSeniority.MID): 165.0,
-    (RoleCategory.UI_UX, RoleSeniority.JUNIOR): 130.0,
-    (RoleCategory.UI_UX, RoleSeniority.OTHER): 165.0,
-    (RoleCategory.QA, RoleSeniority.SENIOR): 170.0,
-    (RoleCategory.QA, RoleSeniority.MID): 140.0,
-    (RoleCategory.QA, RoleSeniority.JUNIOR): 110.0,
-    (RoleCategory.QA, RoleSeniority.OTHER): 140.0,
-    (RoleCategory.DEVOPS, RoleSeniority.SENIOR): 230.0,
-    (RoleCategory.DEVOPS, RoleSeniority.MID): 190.0,
-    (RoleCategory.DEVOPS, RoleSeniority.JUNIOR): 150.0,
-    (RoleCategory.DEVOPS, RoleSeniority.OTHER): 190.0,
-    (RoleCategory.DATA, RoleSeniority.SENIOR): 235.0,
-    (RoleCategory.DATA, RoleSeniority.MID): 195.0,
-    (RoleCategory.DATA, RoleSeniority.JUNIOR): 150.0,
-    (RoleCategory.DATA, RoleSeniority.OTHER): 195.0,
-    (RoleCategory.OTHER, RoleSeniority.SENIOR): 200.0,
-    (RoleCategory.OTHER, RoleSeniority.MID): 165.0,
-    (RoleCategory.OTHER, RoleSeniority.JUNIOR): 130.0,
-    (RoleCategory.OTHER, RoleSeniority.OTHER): 165.0,
-}
 
 
 # ---------- agent response model (enum-constrained; LLM emits structure only) ----------
@@ -111,10 +74,6 @@ class RosterProposal(BaseModel):
 
 
 # ---------- deterministic backstop ----------
-
-
-def _rate_for(category: RoleCategory, seniority: RoleSeniority) -> float:
-    return _DEFAULT_RATE.get((category, seniority), _RATE_FALLBACK)
 
 
 def _make_unique_ids(roles: list[ProposedRole]) -> list[str]:
@@ -180,7 +139,10 @@ def _rebalance_to_100(weights: list[float]) -> list[int]:
     return result
 
 
-def proposal_to_roster(proposal: RosterProposal) -> RoleRoster:
+def proposal_to_roster(
+    proposal: RosterProposal,
+    rate_overrides: dict[tuple[RoleCategory, RoleSeniority], float] | None = None,
+) -> RoleRoster:
     """Map the agent's proposal into a valid RoleRoster (the wizard's shape).
 
     Caps role count, assigns unique ids + table rates, and rebalances
@@ -204,7 +166,7 @@ def proposal_to_roster(proposal: RosterProposal) -> RoleRoster:
             description=role.description,
             category=role.category,
             seniority=role.seniority,
-            rate_per_hour=_rate_for(role.category, role.seniority),
+            rate_per_hour=resolve_rate(role.category, role.seniority, rate_overrides),
             percentage=float(pct),
         )
         for rid, role, pct in zip(ids, roles, pcts, strict=True)

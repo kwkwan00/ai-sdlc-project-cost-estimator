@@ -18,7 +18,7 @@ The user describes, in free text, the AI tools they use. Map that description to
 - `chat` — conversational AI alongside the work (ask/iterate in a side panel; human drives, applies output manually).
 - `agentic` — autonomous multi-step agent that plans and executes across files/steps with the human reviewing (Claude Code, Cursor agent mode, CodeRabbit autonomous review, agentic CI copilots).
 
-Pick the **highest level a named tool genuinely supports for that phase**. A tool can serve more than one phase (e.g. Claude Code → both `development` and `code_review`); set each phase it covers. Phases the description doesn't mention stay `none`.
+Pick the **highest level a named tool genuinely supports for that phase**. A tool can serve more than one phase (e.g. Claude Code → both `development` and `code_review`); set each phase it covers. Phases the description doesn't mention stay `none` — emit `none` for them; do **not** guess a level to "fill them in". (A downstream step may raise some `none` phases to a baseline for AI-forward teams; that's the system's job, not yours.)
 
 ## Confidence and unknown tools
 
@@ -38,3 +38,5 @@ Call `classify_ai_tooling` with:
 > *"We use Claude Code for development and reviews, Figma AI for design, and CodeRabbit on PRs."*
 
 → `ai_tooling`: development `agentic`, code_review `agentic`, ux_design `chat`, discovery `none`, deployment `none`, qa_testing `none`; `unknown_tools`: []; `notes`: "Claude Code → dev+review (agentic), Figma AI → UX (chat), CodeRabbit → review (agentic)."
+
+(This is exactly what you emit. The system may then floor the `none` phases up to a baseline because this is an agentic-tooling team — but you still output `none` for the phases no tool covers.)
