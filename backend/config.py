@@ -36,6 +36,19 @@ class Settings(BaseSettings):
     anthropic_model_tooling: str = Field(
         default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_TOOLING"
     )
+    # Drafts the bottom-up WBS task tree (the Work Breakdown Structure flow). A knowledge-heavy
+    # decomposition task, so it defaults to Sonnet rather than Haiku.
+    anthropic_model_wbs: str = Field(
+        default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_WBS"
+    )
+    # Global tuning scale on the WBS bottom-up realism factor. LLM/human bottom-up task estimates
+    # are systematically OPTIMISTIC, and the optimism grows with hidden complexity, so the drafted
+    # leaf hours are scaled up by a COMPLEXITY-AWARE factor derived from the project's own signals
+    # (regulatory regimes, integration count, screens, project type, codebase familiarity — see
+    # wbs_agent._complexity_effort_factor). This setting globally scales that computed factor for
+    # fine-tuning: 1.0 (default) = use it as computed; >1 nudges all estimates up, <1 down. Applied
+    # only to the LLM draft; users can still edit any task afterward.
+    wbs_effort_scale: float = Field(default=1.0, alias="WBS_EFFORT_SCALE")
     # LLM-as-judge for the evals harness (backend/evals/) defaults to OpenAI GPT-5.5 —
     # the judge is intentionally a DIFFERENT provider from the Anthropic twins it
     # grades (less same-model self-preference bias). `OPENAI_API_KEY` authenticates it;

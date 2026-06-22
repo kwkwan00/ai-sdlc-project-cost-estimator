@@ -6,7 +6,13 @@ import type {
   Stage2Input,
   Stage3Input,
 } from "./schemas";
-import type { EstimateEnvelope } from "./types";
+import type { DualScenarioEstimate, EstimateEnvelope } from "./types";
+import type {
+  WbsDraft,
+  WbsDraftList,
+  WbsDraftResponse,
+  WbsTaskInput,
+} from "./wbs";
 
 export interface Stage2Prefill {
   // Roster-free: the prefill endpoint no longer returns a team roster. The
@@ -35,12 +41,16 @@ async function jsonFetch<T>(
     },
   });
   if (!res.ok) {
-    let detail: string;
+    // Read the body exactly once — a response body can only be consumed once, so the old
+    // `res.json()` then `res.text()` fallback threw "body already used" and masked the real
+    // HTTP error. Read text, then best-effort parse it as JSON for the `detail` field.
+    const raw = await res.text();
+    let detail = raw;
     try {
-      const body = await res.json();
-      detail = body.detail || JSON.stringify(body);
+      const body = JSON.parse(raw);
+      detail = body.detail || raw;
     } catch {
-      detail = await res.text();
+      // not JSON — keep the raw text
     }
     throw new Error(`${res.status} ${res.statusText} — ${detail}`);
   }
@@ -87,6 +97,8 @@ export interface EstimateHistoryItem {
   estimate_id: string;
   project_name: string;
   status: string;
+  /** "twins" (default flow) or "wbs" (bottom-up). Drives the dashboard badge + Duplicate action. */
+  method: string;
   industry: string | null;
   project_type: string | null;
   total_ai_assisted_hours: number | null;
@@ -197,25 +209,47 @@ export interface RateRow {
   is_override: boolean;
 }
 
+/** An admin-defined named custom role on the rate card (on top of the category×seniority grid). */
+export interface CustomRoleRow {
+  role_id: string;
+  label: string;
+  category: string;
+  seniority: string;
+  rate: number;
+}
+
+/** Editor-side custom role: same fields as `CustomRoleRow` but `role_id` is optional (omitted for a
+ *  freshly-added row — the server assigns one). Named `…Row` to avoid colliding with the roster
+ *  `CustomRoleInput` in `lib/schemas`. */
+export type CustomRoleInputRow = Omit<CustomRoleRow, "role_id"> & { role_id?: string };
+
 export interface RateCardResponse {
   editable: boolean;
   min_rate: number;
   max_rate: number;
   rates: RateRow[];
+  custom_roles: CustomRoleRow[];
 }
 
-/** Default hourly rate card (per role category × seniority) for the Settings screen. */
+/** Default rate card (grid + custom roles) for the Settings screen. */
 export async function getDefaultRates(): Promise<RateCardResponse> {
   return jsonFetch("/admin/default-rates");
 }
 
 export async function saveDefaultRates(
-  rates: { category: string; seniority: string; rate: number }[]
+  rates: { category: string; seniority: string; rate: number }[],
+  customRoles: CustomRoleInputRow[]
 ): Promise<RateCardResponse> {
   return jsonFetch("/admin/default-rates", {
     method: "PUT",
-    body: JSON.stringify({ rates }),
+    body: JSON.stringify({ rates, custom_roles: customRoles }),
   });
+}
+
+/** The admin-defined custom roles, for the Stage 2 roster editor's "add from catalog" picker.
+ *  Returns `{ roles: [] }` when Postgres is off or none are defined. */
+export async function getRoleCatalog(): Promise<{ roles: CustomRoleRow[] }> {
+  return jsonFetch("/role-catalog");
 }
 
 /** A single-choice twin sizing-method setting (Development, QA, …) for the Settings screen. */
@@ -291,7 +325,7 @@ export async function saveContingency(
 }
 
 export async function getEstimate(id: string): Promise<EstimateEnvelope> {
-  return jsonFetch(`/estimates/${id}`);
+  return jsonFetch(`/estimates/${encodeURIComponent(id)}`);
 }
 
 export async function submitAnswers(
@@ -299,14 +333,101 @@ export async function submitAnswers(
   answers: Record<string, string>,
   skipRemaining = false
 ): Promise<EstimateEnvelope> {
-  return jsonFetch(`/estimates/${id}/answers`, {
+  return jsonFetch(`/estimates/${encodeURIComponent(id)}/answers`, {
     method: "POST",
     body: JSON.stringify({ answers, skip_remaining: skipRemaining }),
   });
 }
 
 export function streamUrl(id: string): string {
-  return `${API_BASE}/estimates/${id}/stream`;
+  return `${API_BASE}/estimates/${encodeURIComponent(id)}/stream`;
+}
+
+// --- WBS (Work Breakdown Structure) flow ---------------------------------------------------
+
+export interface WbsDraftInput {
+  project_name?: string;
+  raw_input: string;
+  stage2?: Stage2Input;
+  stage3?: Stage3Input;
+}
+
+export interface WbsCalculateInput {
+  project_name?: string;
+  raw_input?: string;
+  draft_id?: string;
+  tree: WbsTaskInput[];
+  stage2?: Stage2Input;
+  stage3?: Stage3Input;
+  // Explicit WBS contingency reserve %; omitted ⇒ backend applies the 30% WBS default.
+  contingency_pct?: number;
+}
+
+export interface WbsDraftSaveInput {
+  project_name: string;
+  raw_input: string;
+  tree: WbsTaskInput[];
+  stage2?: Stage2Input;
+  stage3?: Stage3Input;
+  contingency_pct?: number;
+}
+
+/** Generate (and server-persist) an LLM-drafted WBS tree. Always returns an editable tree. */
+export async function draftWbs(body: WbsDraftInput): Promise<WbsDraftResponse> {
+  return jsonFetch("/wbs/draft", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** The 'resume a draft' list. `resumable=false` ⇒ Neo4j is off (rely on the localStorage cache). */
+export async function listWbsDrafts(): Promise<WbsDraftList> {
+  return jsonFetch("/wbs/drafts");
+}
+
+/** Load a draft to resume editing. Throws 404 when absent / Neo4j off (caller falls back to cache). */
+export async function getWbsDraft(draftId: string): Promise<WbsDraft> {
+  return jsonFetch(`/wbs/drafts/${encodeURIComponent(draftId)}`);
+}
+
+/** Autosave the editor state for a draft. */
+export async function saveWbsDraft(
+  draftId: string,
+  body: WbsDraftSaveInput,
+): Promise<WbsDraft> {
+  return jsonFetch(`/wbs/drafts/${encodeURIComponent(draftId)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Discard a draft. Idempotent (204). */
+export async function deleteWbsDraft(draftId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/wbs/drafts/${encodeURIComponent(draftId)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+}
+
+/** Clone an in-progress draft into a new editable draft (fresh ids, " (Copy)" name). */
+export async function duplicateWbsDraft(draftId: string): Promise<WbsDraftResponse> {
+  return jsonFetch(`/wbs/drafts/${encodeURIComponent(draftId)}/duplicate`, {
+    method: "POST",
+  });
+}
+
+/** Clone a completed WBS estimate (from its review) into a new editable draft. */
+export async function duplicateWbsEstimate(estimateId: string): Promise<WbsDraftResponse> {
+  return jsonFetch(`/estimates/${encodeURIComponent(estimateId)}/wbs/duplicate`, {
+    method: "POST",
+  });
+}
+
+/** Roll the current tree up into an estimate WITHOUT persisting (the editor's Re-evaluate). */
+export async function previewWbs(body: WbsCalculateInput): Promise<DualScenarioEstimate> {
+  return jsonFetch("/estimates/wbs/preview", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Commit a WBS estimate (persist + create envelope). Returns the completed envelope. */
+export async function calculateWbs(body: WbsCalculateInput): Promise<EstimateEnvelope> {
+  return jsonFetch("/estimates/wbs", { method: "POST", body: JSON.stringify(body) });
 }
 
 /** Helper for the wizard: pack Stage 2/3 into the create payload. */

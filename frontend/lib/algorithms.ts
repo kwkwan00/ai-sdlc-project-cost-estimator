@@ -1,6 +1,9 @@
-/** Human-readable descriptions of the six estimation algorithms the twins use,
+/** Human-readable descriptions of the estimation algorithms the twins use,
  *  surfaced as tooltips on the review page. Matched by substring against a phase's
- *  `algorithm` string (e.g. "COCOMO_II" → COCOMO, "TPA_Plan_B" → TPA). */
+ *  `algorithm` string (e.g. "COCOMO_II" → COCOMO, "TPA_Plan_B" → TPA). Includes the
+ *  admin-switchable sizing methods Discovery (UCP ↔ FP_ANALYSIS), Development
+ *  (COCOMO_II ↔ FUNCTION_POINTS ↔ COSMIC_FFP), and QA (TPA ↔ TCPA ↔ DEFECT) can emit,
+ *  so those phases still render a name/color/tooltip instead of falling back to gray. */
 
 export interface AlgorithmInfo {
   /** Substring matched against the phase `algorithm` value. */
@@ -57,6 +60,44 @@ const ALGORITHMS: AlgorithmInfo[] = [
     color: "#8b5cf6", // violet
     description:
       "Sizes QA/testing effort from function points weighted by dynamic and static quality characteristics, for the chosen test strategy (eval harness, QA team, or hybrid).",
+  },
+  // --- admin-switchable sizing methods (Discovery / Development / QA) ---
+  // Substring abbrs chosen so they don't collide with the defaults above:
+  // "TCPA" does NOT contain "TPA", and "COSMIC" does NOT contain "COCOMO".
+  {
+    abbr: "FUNCTION_POINTS",
+    name: "Function Point Analysis (IFPUG)",
+    color: "#14b8a6", // teal
+    description:
+      "Sizes development effort linearly from IFPUG function points × hours-per-FP, adjusted by the same effort-multiplier, tech-stack, and AI-leverage factors as COCOMO — the linear alternative to COCOMO II.",
+  },
+  {
+    abbr: "COSMIC",
+    name: "COSMIC Function Points (ISO 19761)",
+    color: "#06b6d4", // cyan
+    description:
+      "Sizes development effort from COSMIC functional size (data movements) rather than IFPUG transactions — better for real-time/embedded/SOA systems — scaled by hours-per-CFP and the same EAF/stack/leverage modifiers.",
+  },
+  {
+    abbr: "FP_ANALYSIS",
+    name: "Function Point analysis effort",
+    color: "#4f46e5", // indigo-600
+    description:
+      "Sizes discovery/requirements effort linearly from function points × analysis-hours-per-FP (ISBSG-style phase share) — the UCP alternative — adjusted by a stakeholder-complexity multiplier.",
+  },
+  {
+    abbr: "TCPA",
+    name: "Test Case Point Analysis (TCPA)",
+    color: "#a855f7", // purple
+    description:
+      "Sizes QA/testing effort from the test-case count weighted by checkpoint complexity, converted to test-point-equivalents for the chosen test strategy — the test-case-driven alternative to TPA.",
+  },
+  {
+    abbr: "DEFECT",
+    name: "Defect-removal (Capers-Jones)",
+    color: "#d946ef", // fuchsia
+    description:
+      "Sizes QA/testing effort from the number of defects a project will contain (function points × defect density × test-removal share) — the defect-centric alternative to TPA/TCPA.",
   },
 ];
 

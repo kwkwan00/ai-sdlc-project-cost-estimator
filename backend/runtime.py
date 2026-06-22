@@ -337,6 +337,31 @@ async def _resume_pass2(estimate_id: str, answers: dict[str, str]) -> None:
     )
 
 
+def build_estimate_snapshot(
+    env: EstimateEnvelope, *, raw_input: str, phases: list
+) -> dict[str, Any]:
+    """The denormalized dict ``neo4j_adapter.save_estimate_envelope`` consumes (one Estimate node +
+    its Phase nodes). Shared by the twin persistence path (``_persist``) and the WBS commit so the
+    snapshot shape stays in one place."""
+    return {
+        "estimate_id": env.estimate_id,
+        "project_name": env.project_name,
+        "status": env.status.value,
+        "raw_input": raw_input,
+        "phases": [
+            {
+                "phase": p.phase.value,
+                "twin_name": p.twin_name,
+                "algorithm": p.algorithm,
+                "ai_mid": p.ai_assisted_hours.most_likely,
+                "manual_mid": p.manual_only_hours.most_likely,
+                "confidence": p.confidence,
+            }
+            for p in phases
+        ],
+    }
+
+
 async def _persist(
     env: EstimateEnvelope,
     raw_input: str,
@@ -350,24 +375,10 @@ async def _persist(
     don't propagate so the HTTP layer never fails because of persistence.
     """
     # Neo4j — graph snapshot for the calibration/history features.
-    save_estimate_envelope(
-        {
-            "estimate_id": env.estimate_id,
-            "project_name": env.project_name,
-            "status": env.status.value,
-            "raw_input": raw_input,
-            "phases": [
-                {
-                    "phase": p.phase.value,
-                    "twin_name": p.twin_name,
-                    "algorithm": p.algorithm,
-                    "ai_mid": p.ai_assisted_hours.most_likely,
-                    "manual_mid": p.manual_only_hours.most_likely,
-                    "confidence": p.confidence,
-                }
-                for p in (env.pass2_estimates or env.pass1_estimates)
-            ],
-        }
+    await save_estimate_envelope(
+        build_estimate_snapshot(
+            env, raw_input=raw_input, phases=(env.pass2_estimates or env.pass1_estimates)
+        )
     )
 
     # Postgres — denormalized history + refresh of twin calibration aggregates.

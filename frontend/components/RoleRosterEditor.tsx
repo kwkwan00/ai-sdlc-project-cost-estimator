@@ -1,9 +1,16 @@
 "use client";
 
-import { useId } from "react";
+import { useEffect, useId, useState } from "react";
 
 import { FieldHint } from "@/components/FieldHint";
-import type { CustomRoleInput, RoleCategory, RoleSeniority } from "@/lib/schemas";
+import { getRoleCatalog, type CustomRoleRow } from "@/lib/api-client";
+import {
+  ROLE_CATEGORY_OPTIONS,
+  ROLE_SENIORITY_OPTIONS,
+  type CustomRoleInput,
+  type RoleCategory,
+  type RoleSeniority,
+} from "@/lib/schemas";
 
 interface Props {
   value: CustomRoleInput[];
@@ -14,22 +21,9 @@ interface Props {
   disabled?: boolean;
 }
 
-const CATEGORY_OPTIONS: { value: RoleCategory; label: string }[] = [
-  { value: "product", label: "Product" },
-  { value: "engineering", label: "Engineering" },
-  { value: "ui_ux", label: "UI / UX" },
-  { value: "qa", label: "QA / Testing" },
-  { value: "devops", label: "DevOps" },
-  { value: "data", label: "Data" },
-  { value: "other", label: "Other" },
-];
-
-const SENIORITY_OPTIONS: { value: RoleSeniority; label: string }[] = [
-  { value: "senior", label: "Senior" },
-  { value: "mid", label: "Mid" },
-  { value: "junior", label: "Junior" },
-  { value: "other", label: "Other" },
-];
+// Valid-value sets for guarding catalog tags against the canonical option lists (from lib/schemas).
+const CATEGORY_VALUES = new Set<string>(ROLE_CATEGORY_OPTIONS.map((o) => o.value));
+const SENIORITY_VALUES = new Set<string>(ROLE_SENIORITY_OPTIONS.map((o) => o.value));
 
 /** Parse a raw input value into a whole integer in [0, 100].
  *
@@ -103,10 +97,14 @@ function makeRoleId(existing: CustomRoleInput[]): string {
   return `role_${i}`;
 }
 
-/** Add a new role row at the bottom and "steal" up to 10% from whichever row
- *  has the most to give, so the sum stays at 100 without forcing the user to
- *  re-type every other field. Exported for testing. */
-export function addRow(roles: CustomRoleInput[]): CustomRoleInput[] {
+/** Append a new role row, "stealing" up to 10% from whichever row has the most to give so the
+ *  sum stays at 100 without re-typing every other field. The caller supplies the role's fields
+ *  (minus role_id + percentage, which are assigned here). Shared by `addRow` (a blank role) and
+ *  `addRoleFromCatalog` (a prefilled rate-card role). */
+function appendRole(
+  roles: CustomRoleInput[],
+  fields: Omit<CustomRoleInput, "role_id" | "percentage">,
+): CustomRoleInput[] {
   const stealFromIdx =
     roles.length === 0
       ? -1
@@ -115,20 +113,43 @@ export function addRow(roles: CustomRoleInput[]): CustomRoleInput[] {
           0
         );
   const stolen = stealFromIdx >= 0 ? Math.min(10, roles[stealFromIdx].percentage) : 100;
-  const newRow: CustomRoleInput = {
-    role_id: makeRoleId(roles),
-    description: "New role",
-    category: "other",
-    seniority: "other",
-    rate_per_hour: 150,
-    percentage: stolen,
-  };
   const next = roles.map((r) => ({ ...r }));
   if (stealFromIdx >= 0) {
     next[stealFromIdx].percentage -= stolen;
   }
-  next.push(newRow);
+  next.push({ ...fields, role_id: makeRoleId(roles), percentage: stolen });
   return next;
+}
+
+/** Add a new blank role row at the bottom. Exported for testing. */
+export function addRow(roles: CustomRoleInput[]): CustomRoleInput[] {
+  return appendRole(roles, {
+    description: "New role",
+    category: "other",
+    seniority: "other",
+    rate_per_hour: 150,
+  });
+}
+
+/** Add a role prefilled from an admin-defined rate-card catalog entry (label → description, plus
+ *  its category / seniority / rate). Exported for testing. */
+export function addRoleFromCatalog(
+  roles: CustomRoleInput[],
+  entry: CustomRoleRow,
+): CustomRoleInput[] {
+  // The catalog comes over the wire; clamp its tags to the known option sets (falling back to
+  // "other") so a backend enum the frontend hasn't shipped — or a stale row — can't inject an
+  // out-of-range category/seniority that the row's <select> couldn't render.
+  const category = (CATEGORY_VALUES.has(entry.category) ? entry.category : "other") as RoleCategory;
+  const seniority = (
+    SENIORITY_VALUES.has(entry.seniority) ? entry.seniority : "other"
+  ) as RoleSeniority;
+  return appendRole(roles, {
+    description: entry.label,
+    category,
+    seniority,
+    rate_per_hour: entry.rate,
+  });
 }
 
 /** Remove a row and proportionally return its share to the remaining rows so
@@ -198,6 +219,23 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
   const total = value.reduce((acc, r) => acc + r.percentage, 0);
   const sumValid = total === 100;
 
+  // Admin-defined custom roles offered as a quick-add catalog. Best-effort: an empty list (Postgres
+  // off / none defined / fetch failed) simply hides the picker.
+  const [catalog, setCatalog] = useState<CustomRoleRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    getRoleCatalog()
+      .then((r) => {
+        if (!cancelled) setCatalog(r.roles);
+      })
+      .catch(() => {
+        /* no catalog → just hide the picker */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const updateRow = (idx: number, patch: Partial<CustomRoleInput>) => {
     const next = value.map((r, i) => (i === idx ? { ...r, ...patch } : r));
     onChange(next);
@@ -205,18 +243,43 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
 
   return (
     <div className="space-y-3" aria-labelledby={headingId}>
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <h3 id={headingId} className="section-title">
           Team roster
         </h3>
-        <button
-          type="button"
-          onClick={() => onChange(addRow(value))}
-          disabled={disabled}
-          className="btn-secondary text-xs disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          + Add role
-        </button>
+        <div className="flex items-center gap-2">
+          {catalog.length > 0 && (
+            <select
+              value=""
+              disabled={disabled}
+              onChange={(e) => {
+                // Controlled at value="" → React resets it to the placeholder after each pick.
+                const entry = catalog.find((c) => c.role_id === e.target.value);
+                if (entry) onChange(addRoleFromCatalog(value, entry));
+              }}
+              className="select text-xs py-1 disabled:opacity-50 disabled:cursor-not-allowed"
+              aria-label="Add a role from the rate-card catalog"
+              title="Add a predefined custom role from the rate card"
+            >
+              <option value="" disabled>
+                + Add from catalog…
+              </option>
+              {catalog.map((c) => (
+                <option key={c.role_id} value={c.role_id}>
+                  {c.label} (${c.rate}/h)
+                </option>
+              ))}
+            </select>
+          )}
+          <button
+            type="button"
+            onClick={() => onChange(addRow(value))}
+            disabled={disabled}
+            className="btn-secondary text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            + Add role
+          </button>
+        </div>
       </div>
       <p className="text-xs muted">
         Define each resource on the team — a free-form description, category,
@@ -268,7 +331,7 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
                     updateRow(idx, { category: e.target.value as RoleCategory })
                   }
                 >
-                  {CATEGORY_OPTIONS.map((o) => (
+                  {ROLE_CATEGORY_OPTIONS.map((o) => (
                     <option key={o.value} value={o.value}>
                       {o.label}
                     </option>
@@ -288,7 +351,7 @@ export function RoleRosterEditor({ value, onChange, disabled = false }: Props) {
                     updateRow(idx, { seniority: e.target.value as RoleSeniority })
                   }
                 >
-                  {SENIORITY_OPTIONS.map((o) => (
+                  {ROLE_SENIORITY_OPTIONS.map((o) => (
                     <option key={o.value} value={o.value}>
                       {o.label}
                     </option>

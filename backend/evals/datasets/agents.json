@@ -56,6 +56,28 @@
     "expected_output": "A staffing plan + roster suited to a compliance-heavy fintech build: product, engineering, UI/UX, QA, and DevOps/security coverage; a delivery plan addressing IDV, screening, risk scoring, integrations, and SOC 2 / PCI-DSS controls; a rationale that justifies the role mix against the regulatory + integration complexity.",
     "notes": "Roster agent — fintech."
   },
+  {
+    "id": "roster-catalog-selection",
+    "agent": "roster",
+    "input": {
+      "raw_input": "HIPAA-compliant patient scheduling portal. 25 screens, integrations with Epic FHIR, Stripe, Twilio, Okta. The work needs a dedicated HIPAA compliance lead to own audit logging, BAAs, and PHI handling sign-off.",
+      "stage2": {
+        "industry": "healthcare",
+        "project_type": "greenfield",
+        "screen_count_estimate": 25,
+        "integration_count": 4,
+        "integration_list": ["Epic FHIR", "Stripe", "Twilio", "Okta"],
+        "regulatory_requirements": ["HIPAA"]
+      },
+      "custom_roles": [
+        {"role_id": "hipaa_compliance_lead", "label": "HIPAA Compliance Lead", "category": "qa", "seniority": "senior", "rate": 260.0},
+        {"role_id": "staff_platform_eng", "label": "Staff Platform Engineer", "category": "devops", "seniority": "senior", "rate": 280.0}
+      ]
+    },
+    "expected_output": "A roster for the regulated portal that DELIBERATELY reuses the org's predefined 'HIPAA Compliance Lead' role — the description explicitly calls for it — by selecting its catalog_role_id, plus engineering/product/UI-UX coverage. The compliance role must be priced at the org's set rate via the explicit selection, not a generic QA grid rate.",
+    "gold": {"expected_catalog_role_id": "hipaa_compliance_lead"},
+    "notes": "Roster agent — gates the catalog-selection behavior (#1 / #2b). roster_catalog_selection asserts the agent set some role's catalog_role_id to 'hipaa_compliance_lead'. SKIPS when no API key (no LLM ran)."
+  },
 
   {
     "id": "tooling-rich",

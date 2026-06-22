@@ -12,6 +12,7 @@ import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from contingency_admin import resolve_contingency_pct
 from db.repositories import (
     get_app_settings_map,
     get_calibration_for_all_phases,
@@ -143,12 +144,9 @@ def _load_sizing_methods(settings_map: dict[str, str]) -> dict[str, str]:
 
 def _load_contingency_pct(settings_map: dict[str, str]) -> float:
     """DB-set global contingency management-reserve % → graph state, resolved from a shared
-    ``app_settings`` snapshot. Returns 0.0 (no contingency) when the key is unset or the stored
-    value isn't numeric."""
-    try:
-        return max(0.0, float(settings_map.get("contingency_pct", "0")))
-    except (ValueError, TypeError):
-        return 0.0
+    ``app_settings`` snapshot via the canonical ``resolve_contingency_pct`` (clamped to the admin
+    ``[0, 100]`` bounds — same read path as the WBS rollup). Returns 0.0 when unset/non-numeric."""
+    return resolve_contingency_pct(settings_map.get("contingency_pct", "0"))
 
 
 @traced(name="parse_input")

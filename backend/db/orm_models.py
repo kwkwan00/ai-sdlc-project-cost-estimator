@@ -218,6 +218,25 @@ class DefaultRate(Base):
     )
 
 
+class CustomRateRole(Base):
+    """A named custom role on the rate card, added by an admin on top of the fixed
+    ``(category, seniority)`` grid (``default_rates``). Each carries its own hourly rate plus
+    category/seniority tags; the Stage 2 roster editor offers them as a catalog to prefill roster
+    rows. Purely admin-managed (add/delete/edit) — there is **no** code-default seed, so an
+    empty/missing table just means "no custom roles defined"."""
+
+    __tablename__ = "custom_rate_roles"
+
+    role_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    label: Mapped[str] = mapped_column(String(120))
+    category: Mapped[str] = mapped_column(String(32))
+    seniority: Mapped[str] = mapped_column(String(32))
+    rate: Mapped[float] = mapped_column(Float)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AppSetting(Base):
     """Generic string-valued application setting, keyed by name (e.g. ``development_sizing_method``).
     Admin-editable on the Settings screen; a code default applies when the key is absent/unavailable

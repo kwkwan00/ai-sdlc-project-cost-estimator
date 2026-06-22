@@ -14,6 +14,7 @@ and shared — only the transport differs from a plain JSON endpoint.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from ag_ui.core import (
@@ -28,9 +29,9 @@ from ag_ui.encoder import EventEncoder
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
-from db.repositories import get_default_rates
+from db.repositories import get_custom_roles, get_default_rates
 from models.project_schema import Stage2Context
-from roster_agent import proposal_to_roster, run_roster_agent
+from roster_agent import CatalogRole, proposal_to_roster, run_roster_agent
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +78,16 @@ async def roster_agui_endpoint(
         )
         try:
             stage2, raw_input = _extract_inputs(input_data)
-            proposal = await run_roster_agent(stage2, raw_input)
-            roster = proposal_to_roster(proposal, await get_default_rates())
+            # Fetch the rate card up front so the agent can be TOLD about the org's custom roles
+            # (and SELECT one by id), then price the selection deterministically afterward.
+            overrides, custom = await asyncio.gather(get_default_rates(), get_custom_roles())
+            catalog = [
+                CatalogRole(c.role_id, c.label, c.category, c.seniority, c.rate) for c in custom
+            ]
+            proposal = await run_roster_agent(stage2, raw_input, custom_roles=catalog)
+            # A proposed role whose catalog_role_id is a valid catalog id is priced at that role's
+            # exact rate and carries its id; otherwise it's grid-priced (no fuzzy label matching).
+            roster = proposal_to_roster(proposal, overrides, catalog)
             # Shared-state snapshot the UI binds to. `roster` matches the Stage 2
             # form shape ({"roles": [...]}) so the frontend applies it directly.
             snapshot = {

@@ -23,6 +23,13 @@ Endpoints (9), grouped by router:
                        POST /estimates/{id}/answers             -- submit Stage 4 answers
                        GET  /estimates/{id}/stream              -- SSE run events (best-effort)
                        GET  /health                             -- liveness probe
+  routers/wbs.py       POST /wbs/draft                          -- LLM-draft a WBS tree (resumable)
+                       GET  /wbs/drafts                         -- resume list
+                       GET/PUT/DELETE /wbs/drafts/{id}          -- load / autosave / discard a draft
+                       POST /wbs/drafts/{id}/duplicate          -- clone a draft
+                       POST /estimates/{id}/wbs/duplicate       -- clone a completed WBS estimate
+                       POST /estimates/wbs/preview              -- roll up without persisting
+                       POST /estimates/wbs                      -- commit a WBS estimate
 """
 
 from __future__ import annotations
@@ -45,8 +52,10 @@ from observability.logging_config import configure_logging
 from observability.request_logging import RequestLoggingMiddleware
 from orchestrator.graph import build_graph
 from routers import admin as admin_router
+from routers import catalog as catalog_router
 from routers import drafts as drafts_router
 from routers import estimates as estimates_router
+from routers import wbs as wbs_router
 from runtime import set_graph
 
 configure_logging()
@@ -74,7 +83,7 @@ async def lifespan(_app: FastAPI):
     )
     yield
     logger.info("Backend shutting down — closing drivers + flushing traces")
-    close_driver()
+    await close_driver()
     close_qdrant()
     await dispose_pg_engine()
     langfuse_shutdown()
@@ -99,4 +108,8 @@ app.add_middleware(RequestLoggingMiddleware)
 # /estimates/{estimate_id} so it isn't shadowed by the path param.
 app.include_router(drafts_router.router)
 app.include_router(admin_router.router)
+app.include_router(catalog_router.router)
 app.include_router(estimates_router.router)
+# WBS bottom-up flow (separate from the twin orchestrator). Mounted after estimates so its
+# literal /estimates/wbs* routes coexist with /estimates/{id} (distinct methods/paths).
+app.include_router(wbs_router.router)

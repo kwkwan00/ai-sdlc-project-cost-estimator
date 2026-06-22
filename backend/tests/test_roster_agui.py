@@ -53,7 +53,7 @@ def _parse_sse_events(body: str) -> list[dict]:
 def test_roster_agui_streams_snapshot_then_finished(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    async def fake_agent(stage2, raw_input: str) -> RosterProposal:
+    async def fake_agent(stage2, raw_input: str, custom_roles=None) -> RosterProposal:
         return RosterProposal(
             project_plan=[ProjectPlanItem(workstream="Core build", summary="Build it")],
             staffing_rationale="Lean regulated team",
@@ -102,7 +102,7 @@ def test_roster_agui_streams_snapshot_then_finished(
 def test_roster_agui_emits_run_error_on_agent_failure(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    async def failing_agent(stage2, raw_input: str) -> RosterProposal:
+    async def failing_agent(stage2, raw_input: str, custom_roles=None) -> RosterProposal:
         raise RuntimeError("sonnet unavailable")
 
     monkeypatch.setattr("roster_agui.run_roster_agent", failing_agent)

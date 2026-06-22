@@ -14,7 +14,9 @@ Propose **3–6 roles** (max 8) to staff the plan. Each role has:
 - `seniority` — one of: `senior`, `mid`, `junior`, `other`.
 - `percentage` — this role's rough share of total effort. These are approximate and need NOT sum to 100 — the system rebalances them automatically, so do not force them to add up.
 
-Do **NOT** output role ids or hourly rates — those are assigned downstream.
+Do **NOT** output role ids or hourly rates — those are assigned downstream. The one exception is `catalog_role_id` (below).
+
+**Predefined org roles.** The request may include a list of your organization's predefined roles, each with an `id`. When a role you'd propose corresponds to one, set that role's `catalog_role_id` to the matching `id` so it's priced at the org's set rate; otherwise leave `catalog_role_id` null. (The request block, when present, carries the exact ids and the selection rule.)
 
 ### Staffing guidance
 - Always include at least one `product` role and one `engineering` role.

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { CustomRoleInput } from "@/lib/schemas";
 import {
+  addRoleFromCatalog,
   addRow,
   clampPercentage,
   normalizeShares,
@@ -149,6 +150,45 @@ describe("rebalanceOnEdit", () => {
     expect(next[1].category).toBe(START[1].category);
     expect(next[2].seniority).toBe(START[2].seniority);
     expect(next[1].description).toBe(START[1].description);
+  });
+});
+
+// ---------- addRoleFromCatalog ----------
+
+describe("addRoleFromCatalog", () => {
+  const entry = {
+    role_id: "principal_architect",
+    label: "Principal Architect",
+    category: "engineering",
+    seniority: "senior",
+    rate: 300,
+  };
+
+  it("prefills the new row from the catalog entry (label, tags, rate) and keeps sum=100", () => {
+    const next = addRoleFromCatalog(START, entry);
+    expect(sum(next)).toBe(100);
+    expect(next).toHaveLength(START.length + 1);
+    const added = next[next.length - 1];
+    expect(added.description).toBe("Principal Architect");
+    expect(added.category).toBe("engineering");
+    expect(added.seniority).toBe("senior");
+    expect(added.rate_per_hour).toBe(300);
+  });
+
+  it("assigns a fresh unique role_id (not the catalog's) and steals up to 10%", () => {
+    const next = addRoleFromCatalog(START, entry);
+    const ids = next.map((r) => r.role_id);
+    expect(new Set(ids).size).toBe(ids.length); // all unique
+    expect(next[next.length - 1].percentage).toBe(10);
+  });
+
+  it("clamps an unknown catalog category/seniority to 'other' instead of injecting it", () => {
+    const rogue = { ...entry, category: "quantum", seniority: "wizard" };
+    const added = addRoleFromCatalog(START, rogue)[START.length];
+    expect(added.category).toBe("other");
+    expect(added.seniority).toBe("other");
+    expect(added.description).toBe("Principal Architect"); // label + rate still applied
+    expect(added.rate_per_hour).toBe(300);
   });
 });
 

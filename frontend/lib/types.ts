@@ -1,6 +1,7 @@
 /** Response types mirroring backend pydantic models. Wire format only — not validated. */
 
 import type { RoleCategory, RoleSeniority } from "./schemas";
+import type { WbsTaskInput } from "./wbs";
 
 export type EstimateStatus =
   | "pending"
@@ -142,6 +143,10 @@ export interface EstimateEnvelope {
   pass2_estimates: PhaseEstimate[];
   final_estimate: DualScenarioEstimate | null;
   error: string | null;
+  /** Which flow produced this: "twins" (default) or "wbs" (bottom-up). Defaulted server-side. */
+  method?: "twins" | "wbs";
+  /** WBS-only: the finalized task tree, for the review-page tree panel + Duplicate. */
+  wbs_tree?: WbsTaskInput[] | null;
 }
 
 export const PHASE_LABELS: Record<Phase, string> = {

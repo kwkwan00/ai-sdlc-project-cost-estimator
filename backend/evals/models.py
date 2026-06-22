@@ -36,9 +36,11 @@ RubricName = Literal[
     "interval_calibration",
     "extraction_accuracy",
     "staffing_adequacy",
+    "roster_catalog_selection",
     "classification_accuracy",
     "enum_constraint_adherence",
     "partition_correctness",
+    "wbs_structural",
     # Self-consistency rubric (deterministic scorer over N adapter re-runs).
     "consistency",
 ]
@@ -59,6 +61,7 @@ ALL_AGENTS: tuple[str, ...] = (
     "roster",
     "tooling",
     "consolidator",
+    "wbs",
 )
 
 # Applicability matrix. The two RAG retriever metrics (context_precision /
@@ -88,11 +91,13 @@ def _rubrics_for(agent: str) -> list[RubricName]:
     if agent == "prefill":
         return ["summarization", "extraction_accuracy"]
     if agent == "roster":
-        return ["plan_quality", "faithfulness", "staffing_adequacy"]
+        return ["plan_quality", "faithfulness", "staffing_adequacy", "roster_catalog_selection"]
     if agent == "tooling":
         return ["classification_accuracy", "enum_constraint_adherence", "consistency"]
     if agent == "consolidator":
         return ["plan_quality", "partition_correctness"]
+    if agent == "wbs":
+        return ["wbs_structural", "plan_quality"]
     return []
 
 
@@ -118,9 +123,11 @@ RUBRIC_THRESHOLDS: dict[RubricName, float] = {
     "interval_calibration": 0.7,
     "extraction_accuracy": 1.0,
     "staffing_adequacy": 1.0,
+    "roster_catalog_selection": 1.0,
     "classification_accuracy": 1.0,
     "enum_constraint_adherence": 1.0,
     "partition_correctness": 1.0,
+    "wbs_structural": 1.0,
     "consistency": 0.7,
 }
 

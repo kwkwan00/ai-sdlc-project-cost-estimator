@@ -135,14 +135,15 @@ export const phaseToolingSchema = z.object({
   qa_testing: aiToolingLevelSchema.default("none"),
 });
 
-const NO_TOOLING = {
+/** All-"none" per-phase tooling. Exported so callers can reuse it as a value. */
+export const NO_TOOLING: z.infer<typeof phaseToolingSchema> = {
   discovery: "none",
   ux_design: "none",
   development: "none",
   code_review: "none",
   deployment: "none",
   qa_testing: "none",
-} as const;
+};
 
 export const stage3Schema = z.object({
   codebase_context: codebaseContextSchema.default("greenfield"),
@@ -222,6 +223,16 @@ export const ROLE_SENIORITY_LABELS: Record<RoleSeniority, string> = {
   junior: "Junior",
   other: "Other",
 };
+
+// Canonical `{value,label}` option lists derived from the label maps — the single source of truth
+// for every category/seniority <select> (roster editor + Settings rate card). Don't re-derive these
+// per component, or the dropdowns can silently diverge.
+export const ROLE_CATEGORY_OPTIONS = (
+  Object.entries(ROLE_CATEGORY_LABELS) as [RoleCategory, string][]
+).map(([value, label]) => ({ value, label }));
+export const ROLE_SENIORITY_OPTIONS = (
+  Object.entries(ROLE_SENIORITY_LABELS) as [RoleSeniority, string][]
+).map(([value, label]) => ({ value, label }));
 
 export const CODEBASE_CONTEXT_LABELS: Record<CodebaseContext, string> = {
   greenfield: "Greenfield (new codebase)",

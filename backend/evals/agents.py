@@ -19,7 +19,7 @@ import logging
 from typing import Any, Protocol
 
 from models.estimation_state import EstimationState
-from models.project_schema import Stage2Context, Stage3Context
+from models.project_schema import RoleRoster, Stage2Context, Stage3Context
 from models.twin_outputs import Gap, Phase, PhaseEstimate
 from orchestrator.nodes._twin_base import build_twin_user_prompt, roster_for, tooling_for
 
@@ -221,9 +221,15 @@ class _PrefillAdapter:
 
 class _RosterAdapter:
     async def run(self, case: EvalCase) -> AgentSample:
-        from roster_agent import run_roster_agent
+        from roster_agent import CatalogRole, run_roster_agent
 
         raw_input = case.input.get("raw_input", "")
+        # Optional org rate-card catalog the agent may SELECT from (the roster_catalog_selection
+        # rubric checks whether it picked gold["expected_catalog_role_id"]).
+        catalog = [
+            CatalogRole(c["role_id"], c["label"], c["category"], c["seniority"], float(c["rate"]))
+            for c in case.input.get("custom_roles", [])
+        ]
         stage2 = _stage2_from_input(case.input) or Stage2Context()
         retrieval = [f"raw_input: {raw_input}"]
         retrieval.extend(
@@ -246,7 +252,7 @@ class _RosterAdapter:
             }
         }
         try:
-            proposal = await run_roster_agent(stage2, raw_input)
+            proposal = await run_roster_agent(stage2, raw_input, custom_roles=catalog or None)
         except Exception as exc:  # noqa: BLE001
             return AgentSample(
                 case_id=case.id,
@@ -254,6 +260,7 @@ class _RosterAdapter:
                 task_input=task_input,
                 retrieval_context=retrieval,
                 expected_output=case.expected_output,
+                gold=case.gold,
                 eval_context=eval_context,
                 error=str(exc),
             )
@@ -273,6 +280,7 @@ class _RosterAdapter:
             output_obj=proposal,
             retrieval_context=retrieval,
             expected_output=case.expected_output,
+            gold=case.gold,
             eval_context=eval_context,
         )
 
@@ -361,6 +369,47 @@ class _ConsolidatorAdapter:
         )
 
 
+class _WbsAdapter:
+    async def run(self, case: EvalCase) -> AgentSample:
+        from models.wbs_schema import WbsDraftRequest
+        from wbs_agent import generate_wbs_tree
+
+        raw_input = case.input.get("raw_input", "")
+        stage2 = _stage2_from_input(case.input)
+        req = WbsDraftRequest(raw_input=raw_input, stage2=stage2)
+        roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
+        retrieval = [f"raw_input: {raw_input}"]
+        task_input = "Decompose the project into a Work Breakdown Structure (work packages → tasks)."
+        # wbs_structural checks every leaf's role_id against the roster.
+        eval_context: dict[str, Any] = {"roster_role_ids": [r.role_id for r in roster.roles]}
+        try:
+            # generate_wbs_tree ALWAYS returns a valid tree (deterministic fallback with no API key),
+            # so wbs_structural is a real offline gate; the planner output is scored when a key is set.
+            tree, notes = await generate_wbs_tree(req)
+        except Exception as exc:  # noqa: BLE001
+            return AgentSample(
+                case_id=case.id, agent=case.agent, task_input=task_input,
+                retrieval_context=retrieval, expected_output=case.expected_output,
+                gold=case.gold, eval_context=eval_context, error=str(exc),
+            )
+        from models.wbs_task import count_tasks, iter_leaves
+
+        leaves = list(iter_leaves(tree))
+        output_text = (
+            f"{count_tasks(tree)} tasks ({len(leaves)} leaves); notes: {notes}\n"
+            + "\n".join(
+                f"- [{leaf.phase.value if leaf.phase else '?'}] {leaf.name} "
+                f"({leaf.role_id}) {leaf.optimistic}/{leaf.most_likely}/{leaf.pessimistic}h"
+                for leaf in leaves
+            )
+        )
+        return AgentSample(
+            case_id=case.id, agent=case.agent, task_input=task_input,
+            output_text=output_text, output_obj=tree, retrieval_context=retrieval,
+            expected_output=case.expected_output, gold=case.gold, eval_context=eval_context,
+        )
+
+
 def _build_adapters() -> dict[str, AgentAdapter]:
     from orchestrator.nodes.code_review_sentinel import code_review_pass1
     from orchestrator.nodes.deployment_devops import deployment_pass1
@@ -380,6 +429,7 @@ def _build_adapters() -> dict[str, AgentAdapter]:
         "roster": _RosterAdapter(),
         "tooling": _ToolingAdapter(),
         "consolidator": _ConsolidatorAdapter(),
+        "wbs": _WbsAdapter(),
     }
     return adapters
 

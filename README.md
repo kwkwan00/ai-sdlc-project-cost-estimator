@@ -6,12 +6,19 @@ Multi-agent system that estimates **effort (hours), cost (USD), duration (weeks)
 
 Six specialized LangGraph "twin" agents — each grounded in a formal estimation algorithm — collaborate through a two-pass orchestrator with a human-in-the-loop clarifying-questions step in the middle.
 
+The app ships **two estimation flows** that converge on the same `DualScenarioEstimate`, review page, and history:
+
+- **Quick Estimate (top-down, parametric)** — the six-twin flow above. You describe the project; the twins size it with formal algorithms.
+- **WBS Estimate (bottom-up)** — you (seeded by an LLM-drafted task tree) decompose the project into a Work Breakdown Structure, attach 3-point hours + a role to each leaf, and the backend rolls it up through the **same** Monte-Carlo + cost + staffing tail. See [WBS bottom-up estimation](#wbs-bottom-up-estimation).
+
 > The full design spec (3,462 lines, including worked examples) is in `ai-sdlc-project-cost-estimator-planning-outline.md`. This README summarizes what is implemented in the MVP.
+>
+> **Just want to run it?** See [`QUICKSTART.md`](./QUICKSTART.md) for a complete, step-by-step setup-and-run guide.
 
 **Persistence at a glance** — three stores, distinct jobs:
 
 - **LangGraph in-memory checkpointer** — Pass 1 ↔ Pass 2 interrupt state (in-process only).
-- **Neo4j** — graph-shaped envelope snapshots: one `Estimate` node per run, `INCLUDES_PHASE` edges to phase nodes. Useful for graph queries over the estimate corpus.
+- **Neo4j** — graph-shaped envelope snapshots: one `Estimate` node per run, `INCLUDES_PHASE` edges to phase nodes. Also the graph-native home for **resumable WBS drafts** and committed WBS task trees (`(:WbsDraft)`/`(:Estimate)-[:HAS_CHILD]->(:WbsTask)`). Useful for graph queries over the estimate corpus.
 - **Postgres** — structured history (`estimate_history`, including the full `envelope_json` for verbatim redisplay; `phase_history`), rolling per-(phase, industry, project_type, codebase-context) **calibration aggregates** the twins query during Pass 1 to anchor their LLM-derived numbers, and the admin-tunable `ai_reduction_bands` table.
 
 All three are best-effort: the backend keeps running when any of them is unavailable.
@@ -25,6 +32,7 @@ All three are best-effort: the backend keeps running when any of them is unavail
 - [Monte Carlo uncertainty](#monte-carlo-uncertainty)
 - [Orchestrator architecture](#orchestrator-architecture)
 - [Team-scaling model](#team-scaling-model)
+- [WBS bottom-up estimation](#wbs-bottom-up-estimation)
 - [Tech stack](#tech-stack)
 - [Repository layout](#repository-layout)
 - [Quickstart — local development](#quickstart--local-development)
@@ -182,6 +190,25 @@ Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhea
 
 ---
 
+## WBS bottom-up estimation
+
+The **WBS (Work Breakdown Structure)** flow is the bottom-up complement to the parametric twins, reachable from the front page ("WBS Estimate"). It is a **separate flow** — *not* wired into the twin LangGraph graph — but it deliberately **reuses the same tail** so a WBS estimate produces an identical `DualScenarioEstimate` and renders on the same review page + history (badged `method: "wbs"`).
+
+**Draft → edit → deterministic re-roll.** The numbers the user sees are always a deterministic rollup of the *current* tree; the LLM only seeds the starting draft.
+
+1. **LLM planner** (`backend/wbs_agent.py`, pinned to `ANTHROPIC_MODEL_WBS`, default Sonnet) drafts a two-level WBS (work packages → leaf tasks) from the project description via forced tool-use, assigning each leaf a phase, a roster `role_id`, and 3-point hours. It degrades to a deterministic full-lifecycle skeleton when the LLM is unavailable, so the editor always opens with something editable. Prompt: `orchestrator/prompts/wbs_planner.md`.
+2. **Complexity-aware realism factor** — bottom-up task estimates are systematically optimistic, so `_complexity_effort_factor(...)` scales the drafted leaf hours by a factor derived from the project's hidden complexity (regulatory regimes, integrations, surface area, project type, brownfield codebase — inferred from the parsed description, since the WBS wizard collects only roster + codebase). Clamped to `[1.2, 3.0]` and globally tunable via `WBS_EFFORT_SCALE`.
+3. **User edits the tree** in an interactive MUI X Tree View editor (`frontend/components/WbsTreeViewEditor.tsx`) — add/remove/move tasks, set each leaf's phase, role, and 3-point hours via edit-modal. Debounced autosave persists to the server draft.
+4. **Deterministic rollup** (`backend/orchestrator/wbs/rollup.py`) groups leaves by `Phase`, builds one `PhaseEstimate` per phase via `montecarlo.combine_pert_leaves` (the bottom-up sibling of `propagate_phase` — sums independent leaf Beta-PERT draws + the **same** skewed AI-reduction sampler the twins use), attributes role hours from the leaves' **explicit** assignments, then feeds those phase estimates straight into the twins' typed tail seams `compute_total_costs(...)` + `synthesize_from_phase_estimates(...)` — so cost, Brooks staffing, headcount, durations, and the variance-combined project band are all computed by the **exact same code** as the twin flow. The load-bearing invariants hold (`most_likely` = Σ leaf modes; `ai.most_likely == manual.most_likely × (1 − eff)`; Σ role-hours == `most_likely`).
+
+**WBS-specific contingency.** Because bottom-up estimates run optimistic even after the realism factor, the WBS flow carries its **own** explicit contingency reserve — an editable input on the editor defaulting to **30%** (`WBS_DEFAULT_CONTINGENCY_PCT`) — that uplifts final cost + timeline. It is **independent** of the global `app_settings` contingency the Quick Estimate uses (that one is unchanged).
+
+**Resumable, graph-native drafts.** The WBS hierarchy lives in **Neo4j** as real nodes + relationships: `(:WbsDraft)-[:HAS_CHILD]->(:WbsTask)-[:HAS_CHILD]->…`. Drafts are saved atomically (one managed transaction), so a user can leave and **resume** later (the editor falls back to a localStorage cache when Neo4j is off). A committed estimate hangs the same task subgraph under its `(:Estimate)` node. **Duplicate** clones either an in-progress draft or a completed WBS estimate into a fresh editable draft (new task ids, " (Copy)" name) — duplicating from a completed estimate works even with Neo4j off, sourcing the tree + context from the persisted `envelope_json`.
+
+The WBS compute reuses, unchanged: `commercial_processing` / `synthesize_estimate`'s typed seams, the Monte Carlo `result_to_hour_range` / `make_rng`, the AI-reduction guardrail bands, role attribution, the review page, and the dashboard history. New code is confined to `wbs_agent.py`, `routers/wbs.py`, `orchestrator/wbs/rollup.py`, `models/wbs_schema.py` + `models/wbs_task.py`, the Neo4j WBS-draft functions, and the `frontend/app/wbs/*` pages.
+
+---
+
 ## Tech stack
 
 **Backend**
@@ -234,8 +261,13 @@ Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhea
 │   ├── roster_agent.py        # team-roster proposal agent (Sonnet)
 │   ├── roster_agui.py         # AG-UI endpoint wrapping the roster agent
 │   ├── tooling_classifier.py  # freeform AI-tooling → per-phase levels (+docs-mcp research)
+│   ├── wbs_agent.py           # WBS planner agent (LLM-drafts the bottom-up task tree) + realism factor
 │   ├── reduction_bands_admin.py # GET/PUT /admin/reduction-bands handlers
 │   ├── staffing_admin.py      # GET/PUT /admin/staffing-coefficients handlers
+│   ├── rate_card_admin.py     # GET/PUT /admin/default-rates handlers
+│   ├── contingency_admin.py   # GET/PUT /admin/contingency (+ shared resolve_contingency_pct)
+│   ├── {discovery,dev,qa}_sizing_admin.py # GET/PUT /admin/*-sizing-method (thin wrappers over sizing_method_admin.py)
+│   ├── routers/wbs.py         # WBS HTTP: /wbs/draft(+drafts CRUD, duplicate), /estimates/wbs(+/preview, +duplicate)
 │   ├── pyproject.toml         # uv-managed deps
 │   ├── Dockerfile             # python:3.12-slim + uv, non-root, HEALTHCHECK /health
 │   │
@@ -245,6 +277,7 @@ Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhea
 │   │   ├── ai_acceleration.py # AI-reduction guardrail bands + effective_ai_reduction()
 │   │   ├── montecarlo.py      # Monte Carlo uncertainty propagation (pure stdlib Beta-PERT)
 │   │   ├── staffing.py        # team-scaling model: Brooks coordination + diminishing returns (pure stdlib)
+│   │   ├── wbs/rollup.py      # bottom-up WBS rollup → DualScenarioEstimate (reuses the twin tail seams)
 │   │   ├── usage.py           # per-run Anthropic token-usage capture + cost estimation
 │   │   ├── role_attribution.py# shared role-split with phase-specific overrides
 │   │   ├── smoke.py           # CLI: `uv run python -m orchestrator.smoke [--no-llm]`
@@ -268,7 +301,9 @@ Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhea
 │   ├── models/
 │   │   ├── estimation_state.py  # LangGraph EstimationState TypedDict (incl. reduction_bands, calibration_examples)
 │   │   ├── twin_outputs.py      # Phase, PhaseEstimate, HourRange (+std/mean/percentiles), RiskInput(List), DualScenarioEstimate (+ brooks_overhead_pct/staffing_efficiency_pct/team_size/optimal_team_size), LlmUsage, ...
-│   │   └── project_schema.py    # CreateEstimateRequest, EstimateEnvelope, Stage2Context (roster), Stage3Context (codebase + AI-tooling), CodebaseContext, AiToolingLevel
+│   │   ├── project_schema.py    # CreateEstimateRequest, EstimateEnvelope (+ method/wbs_tree/wbs_stage2/3), Stage2Context (roster), Stage3Context (codebase + AI-tooling), CodebaseContext, AiToolingLevel
+│   │   ├── wbs_schema.py        # WBS request/response models (draft/save/calculate) + WBS_DEFAULT_CONTINGENCY_PCT
+│   │   └── wbs_task.py          # WbsTaskInput tree node + flatten/rebuild/iter helpers (leaf module)
 │   │
 │   ├── db/
 │   │   ├── neo4j_adapter.py   # driver + make_checkpointer (InMemorySaver in MVP) + save_estimate_envelope
@@ -289,25 +324,28 @@ Defaults `DEFAULT_STAFFING_COEFFS = {link_cost: 0.06, free_team_size: 3, overhea
 │   │   ├── logging_config.py  # configure_logging() — root log level + format
 │   │   └── request_logging.py # ASGI middleware: method / path / status / latency per request
 │   │
-│   └── tests/                 # pytest, asyncio auto-mode (~470 tests)
+│   └── tests/                 # pytest, asyncio auto-mode (~640 tests)
 │
 └── frontend/
     ├── app/
     │   ├── layout.tsx / page.tsx / providers.tsx   # landing page lists + redisplays past estimates
-    │   ├── settings/page.tsx  # edit AI-reduction bands + team-scaling coefficients (gear icon)
+    │   ├── settings/page.tsx  # tabbed admin: sizing methods + AI-reduction bands + team-scaling + rates/contingency
     │   ├── globals.css        # html { font-size: 14px } — global UI scale
+    │   ├── wbs/{,new,team,edit/[draftId]}/  # WBS bottom-up flow: landing+resume, describe, team, tree editor
     │   └── estimate/
     │       ├── new/                          # Stage 1
     │       ├── draft/{create,context,maturity}/  # Stages 2-3 wizard (client-side, pre-submit)
-    │       └── [id]/{questions,review}/      # Stages 4-5 (server-driven)
+    │       └── [id]/{questions,review}/      # Stages 4-5 (server-driven; review also renders WBS estimates)
     ├── components/            # PhaseBar, DualScenarioToggle, RoleRosterEditor, StageProgress,
     │                          #   ConfidenceMeter, FanChart (Monte Carlo), AlgorithmBreakdownChart,
     │                          #   AlgorithmTooltip/Badge, AiSavingsSection, BreakdownView, Modal,
     │                          #   Tabs (review-page panels), GanttChart + PertChart (Timeline),
+    │                          #   WbsTreeViewEditor (MUI X Tree View) + WbsTreePanel (read-only review),
     │                          #   DocumentUpload (Stage 1 file upload), RosterRationaleModal, FieldHint
     ├── lib/                   # schemas (Zod), api-client (fetch + SSE), wizard-store, types, format,
     │                          #   algorithms, breakdown, fan-chart (MC math), staffing (team-scaling),
     │                          #   schedule (Gantt/PERT/critical-path + MC finish-risk), document-extract (PDF/Word/text),
+    │                          #   wbs (client PERT rollup + tree helpers) + wbs-store (localStorage cache),
     │                          #   review-ui, estimate-status, roster-agui
     ├── instrumentation.ts     # Next.js startup hook — logs `✓ Frontend ready ...`
     ├── next.config.mjs        # output: "standalone"
@@ -404,6 +442,8 @@ All settings are read by `backend/config.py` (pydantic-settings) from `.env`. Th
 | `ANTHROPIC_MODEL_ROSTER` | no | `claude-sonnet-4-6` | Team-roster proposal agent (knowledge-heavy → Sonnet). |
 | `ANTHROPIC_MODEL_MERGE` | no | `claude-haiku-4-5` | Clarifying-question consolidation in `merge_pass1` (cheap → Haiku; deterministic fallback). |
 | `ANTHROPIC_MODEL_TOOLING` | no | `claude-sonnet-4-6` | AI-tooling classifier (broad tool knowledge → Sonnet). |
+| `ANTHROPIC_MODEL_WBS` | no | `claude-sonnet-4-6` | WBS planner agent that drafts the bottom-up task tree (knowledge-heavy decomposition → Sonnet). |
+| `WBS_EFFORT_SCALE` | no | `1.0` | Global multiplier on the WBS bottom-up realism factor (`_complexity_effort_factor`). Raise to push every WBS estimate up, lower to trust the LLM's hours more. |
 | `OPENAI_API_KEY` | no | `""` | Authenticates the eval harness LLM-as-judge (`make evals`). Not used by the production estimator. Also satisfies the docs-mcp-server embeddings provider when scraping. |
 | `OPENAI_MODEL_EVAL` | no | `gpt-5.5` | Default judge model for the eval harness's LLM rubrics. Override per run with `--judge-model` (an Anthropic id routes to the `call_structured` fallback). |
 | `DOCS_MCP_URL` | no | `http://localhost:6280/mcp` | Self-hosted docs-mcp-server the tooling classifier consults (MCP over streamable HTTP). Blank disables lookups (unknown tools → `none`). Compose overrides this to the in-network hostname. |
@@ -459,8 +499,15 @@ Graceful degradation is intentional — every external dependency (Anthropic, Ne
 | `PUT` | `/admin/development-sizing-method` | Persist the chosen sizing method. No-ops (response `editable: false`) when Postgres is disabled. |
 | `GET` | `/admin/qa-sizing-method` | Read the QA/testing twin's sizing method (`tpa` default \| `test_case_point` \| `defect_removal`) + the allowed choices — backs the Settings screen. |
 | `PUT` | `/admin/qa-sizing-method` | Persist the chosen QA sizing method. No-ops (response `editable: false`) when Postgres is disabled. |
-| `GET` | `/admin/contingency` | Read the global contingency reserve % (uplifts final cost + timeline) + bounds — backs the Settings screen. |
+| `GET` | `/admin/contingency` | Read the global contingency reserve % (uplifts final cost + timeline; **Quick Estimate only**) + bounds — backs the Settings screen. The WBS flow carries its own per-estimate contingency (default 30%) instead. |
 | `PUT` | `/admin/contingency` | Persist the contingency reserve % (`[0, 100]`). No-ops (response `editable: false`) when Postgres is disabled. |
+| `POST` | `/wbs/draft` | WBS: LLM-draft a Work Breakdown Structure tree from a project description and persist it as a resumable draft. Always returns an editable tree (degrades to a deterministic skeleton). |
+| `GET` | `/wbs/drafts` | WBS: the "resume a draft" list (newest first). `resumable: false` signals Neo4j is off (client falls back to its localStorage cache). |
+| `GET` / `PUT` / `DELETE` | `/wbs/drafts/{id}` | WBS: load a draft to resume / autosave the editor state / discard a draft. `GET` 404s when absent / Neo4j off. |
+| `POST` | `/wbs/drafts/{id}/duplicate` | WBS: clone an in-progress draft into a new editable draft (fresh task ids, " (Copy)" name). |
+| `POST` | `/estimates/{id}/wbs/duplicate` | WBS: clone a completed WBS estimate (from its review) into a new draft. Sources the tree + context from `envelope_json`, so it works with Neo4j off. `409` if the estimate isn't a WBS estimate. |
+| `POST` | `/estimates/wbs/preview` | WBS: roll the current tree up into a `DualScenarioEstimate` **without persisting** — powers the editor's "Re-evaluate" button. Body carries `tree`, `stage2?`, `stage3?`, `contingency_pct?` (default 30). |
+| `POST` | `/estimates/wbs` | WBS: commit the tree — computes, persists a `method: "wbs"` envelope (Postgres history + Neo4j subgraph), retires the draft, and returns the envelope. Synchronous (the rollup is fast/deterministic). |
 | `POST` | `/estimates` | Start a new estimation. Body: `CreateEstimateRequest { project_name?, raw_input, stage2?, stage3? }`. Returns the envelope with status `pending`; Pass 1 runs as a background task. |
 | `GET` | `/estimates/history` | Paginated persisted estimates (newest first) for the dashboard history list. Query: `?limit=&offset=`; returns `{ items, total }`. Empty when Postgres is disabled. |
 | `GET` | `/estimates/{id}` | Fetch the current envelope (status, pass1/pass2 estimates, clarifying questions, final). **Authoritative source of truth.** On in-memory cache miss it falls back to the persisted `envelope_json` (when Postgres is connected) so completed estimates redisplay after a restart / in a fresh session. |
@@ -487,6 +534,19 @@ OpenAPI docs are served at `http://localhost:8000/docs` once the backend is up.
 | `/estimate/[id]/review` | 5. Review | Organized into four tabs (`<Tabs>`) — **Cost breakdown**, **Timeline**, **AI assistance**, **Risk & uncertainty** — so it reads as focused views (only the active panel is mounted). Across them: per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout via `lib/staffing.ts`), a **Timeline** (overlapping-phase **Gantt** with a milestone strip + a **PERT** critical-path/slack network + a Monte-Carlo finish-risk readout — P10–P90 weeks, P(finish ≤ target), per-phase criticality — all derived on the client in `lib/schedule.ts`), algorithm tooltips, an AI-assistance-savings section, risks/assumptions in modals off the phase cards, and an LLM cost/token-usage modal. Copy-as-markdown. |
 
 The landing page at `/` lists historical estimates pulled from the backend and redisplays the review page for completed ones. A gear icon opens `/settings`, which edits the AI-reduction guardrail bands (`GET`/`PUT /admin/reduction-bands`), the team-scaling (Brooks's Law + diminishing-returns) coefficients (`GET`/`PUT /admin/staffing-coefficients`), and the default hourly **rate card** per role category × seniority (`GET`/`PUT /admin/default-rates`).
+
+### WBS flow (bottom-up)
+
+A second, separate wizard under `frontend/app/wbs/` (reachable via "WBS Estimate" on the landing page):
+
+| Route | Step | Notes |
+|---|---|---|
+| `/wbs` | Landing + resume | "New WBS estimate" plus a **"Resume a draft"** list (`GET /wbs/drafts`); each row links to the editor and offers Duplicate / Delete. Notes when resume needs Neo4j. |
+| `/wbs/new` | 1. Describe | Project description + codebase-context picker + freeform AI-tooling field (with a prefill helper). |
+| `/wbs/team` | 2. Team | Transition page that prefills the **roster** (roster agent) and classifies the **AI tooling** from the description before drafting; classification is awaited at submit so the per-phase tooling — hence the AI-savings — is never baked in as all-`none`. |
+| `/wbs/edit/[draftId]` | 3. Edit & review | The interactive tree editor (`<WbsTreeViewEditor>`), a **Contingency reserve %** input (default 30%), debounced autosave (`PUT /wbs/drafts/{id}`), a **Re-evaluate** button (`POST /estimates/wbs/preview`, live total + duration), and **Submit** (`POST /estimates/wbs` → redirect to the shared `/estimate/{id}/review`). |
+
+The shared review page (`/estimate/[id]/review`) renders a WBS estimate from the same `DualScenarioEstimate`, hiding the twin-only algorithm badges/breakdown charts and adding a read-only WBS-tree panel; it offers "Duplicate as new draft".
 
 Global font scale: `app/globals.css` sets `html { font-size: 14px; }` so all Tailwind rem-based utilities shrink uniformly. Change it in one place to rescale the whole UI.
 
@@ -533,15 +593,6 @@ The team is a **user-defined roster** — Stage 2 lets the user add/remove roles
 
 All percentages are renormalized to 1.0 after overrides. A roster of `OTHER`/`OTHER`-tagged roles bypasses every override (pure pass-through). Never inline this logic in a twin — call `attribute_roles`.
 
-**Default roster** (used when the user doesn't customize):
-
-| Description | Category | Seniority | Default rate | Default % |
-|---|---|---|---|---|
-| Senior product manager | `product` | `senior` | $220/h | 20% |
-| Junior product manager | `product` | `junior` | $140/h | 10% |
-| Senior software engineer | `engineering` | `senior` | $240/h | 50% |
-| Junior software engineer | `engineering` | `junior` | $150/h | 20% |
-
 The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remove rows, dropdowns for category and seniority, an hourly-rate input, and percentage inputs with a separate **"Auto-adjust to 100%"** button (percentages are not auto-rebalanced on blur). A roster proposal agent (over AG-UI) can pre-populate the whole roster from the project context.
 
 ---
@@ -550,7 +601,8 @@ The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remov
 
 - **LangGraph checkpointer** — `db/neo4j_adapter.py::make_checkpointer()` returns `langgraph.checkpoint.memory.InMemorySaver` in MVP. State survives within a process (so `interrupt()` works) but **not** across restarts. A real Neo4j-backed `BaseCheckpointSaver` is a Phase-3 swap at this exact call site.
 - **Neo4j estimate snapshots** — `save_estimate_envelope(...)` writes one `Estimate` node + N `Phase` nodes via idempotent Cypher `MERGE`. Called at status transitions in `main.py`. **Silently no-ops** when Neo4j is unavailable.
-- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` (including the full `envelope_json` for verbatim redisplay) and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, **codebase-context**) aggregates in `calibration_aggregates`. The codebase-context code (0–3, `-1` = "any") rides in the column historically named `maturity_level` — it no longer holds an AI-maturity level. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. `list_estimate_history(...)` / `get_estimate_envelope(...)` back the history list and the redisplay-after-restart fallback. **Silently no-ops** when Postgres is unavailable. Alembic migrations (`0001`–`0009`) run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
+- **Neo4j WBS drafts** — the bottom-up flow stores its hierarchy graph-natively (`save_wbs_draft` / `load_wbs_draft` / `list_wbs_drafts` / `delete_wbs_draft` / `save_wbs_tree`): a `(:WbsDraft)` node with its `[:HAS_CHILD]` `(:WbsTask)` subgraph, written in a single managed transaction so resume never sees a half-saved tree. The committed estimate hangs the same subgraph under its `(:Estimate)` node. Same never-raise contract — when Neo4j is off, drafts degrade to the client's localStorage cache.
+- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` (including the full `envelope_json` for verbatim redisplay) and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, **codebase-context**) aggregates in `calibration_aggregates`. The codebase-context code (0–3, `-1` = "any") rides in the column historically named `maturity_level` — it no longer holds an AI-maturity level. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. `list_estimate_history(...)` / `get_estimate_envelope(...)` back the history list and the redisplay-after-restart fallback. **Silently no-ops** when Postgres is unavailable. Alembic migrations (`0001`–`0012`) run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
 - **AI-reduction bands** — the admin-tunable `ai_reduction_bands` table holds the per-(phase, tooling) guardrail bands, merged with the in-code defaults and loaded into graph state by `parse_input`. Editable from the `/settings` screen via `GET`/`PUT /admin/reduction-bands`.
 - **Staffing coefficients** — the admin-tunable `staffing_coefficients` table holds the team-scaling parameters (Brooks's Law coordination + diminishing returns), merged with the in-code `DEFAULT_STAFFING_COEFFS` fallback. Read/written by `get_staffing_coefficients` / `upsert_staffing_coefficients` (never-raise) and editable from the `/settings` screen via `GET`/`PUT /admin/staffing-coefficients`.
 - **LLM usage/cost** — `orchestrator/usage.py` captures each Anthropic call's token usage into a per-estimate accumulator (bound around the Pass 1/Pass 2 run), then summarizes it into `DualScenarioEstimate.llm_usage` (per-model token + dollar breakdown) — the meta-cost of producing the estimate, surfaced in the review page's LLM cost modal. Best-effort: a no-op when no accumulator is bound.
@@ -562,7 +614,7 @@ The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remov
 
 ## Testing
 
-Backend (~470 tests, pytest with asyncio auto-mode):
+Backend (~640 tests, pytest with asyncio auto-mode):
 
 ```bash
 cd backend && uv run pytest                              # full suite
@@ -614,7 +666,8 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 
 - Claude (forced tool-use structured output) for all twins, with a **per-agent multi-model strategy** (twins on Sonnet; prefill + question-merge on Haiku; roster + tooling on Sonnet)
 - Two-pass orchestration with LangGraph `interrupt()` for clarifying questions
-- All six twin algorithms (UCP, SCP, COCOMO II, Fagan, CMP, TPA + 3-plan QA)
+- All six twin algorithms (UCP, SCP, COCOMO II, Fagan, CMP, TPA + 3-plan QA), with **admin-switchable sizing methods** for Discovery (UCP / FP-analysis), Development (COCOMO II / FP / COSMIC FP), and QA (TPA / Test Case Point / Capers-Jones defect-removal)
+- A second, **bottom-up WBS estimation flow** (LLM-drafted task tree → user edits → deterministic Monte-Carlo rollup through the same cost/staffing tail), with resumable Neo4j-native drafts, Duplicate, a WBS-specific 30% contingency, and shared review + history
 - AI-reduction guardrail bands (admin-tunable per phase × tooling) replacing the old maturity caps
 - Monte Carlo uncertainty propagation per phase (input-size + AI-effectiveness + discrete risks) with variance-combined project totals + fan-chart visualization (pure stdlib, no numpy)
 - Project-level team-scaling model (Brooks's Law coordination overhead + diminishing returns, admin-tunable) feeding cost, duration, and a recommended team size

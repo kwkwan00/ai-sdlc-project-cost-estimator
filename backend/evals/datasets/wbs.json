@@ -1,0 +1,38 @@
+[
+  {
+    "id": "wbs-healthcare",
+    "agent": "wbs",
+    "input": {
+      "raw_input": "HIPAA-compliant patient scheduling portal for a regional clinic network. Patients view lab results, book/reschedule appointments, message providers, and request prescription refills. Clinic staff manage availability and review messages. ~25 screens, 4 roles. Integrations: Epic FHIR, Stripe, Twilio, Okta. Responsive web, 20-week target.",
+      "stage2": {
+        "industry": "healthcare",
+        "project_type": "greenfield",
+        "screen_count_estimate": 25,
+        "integration_count": 4,
+        "integration_list": ["Epic FHIR", "Stripe", "Twilio", "Okta"],
+        "regulatory_requirements": ["HIPAA"],
+        "target_timeline_weeks": 20
+      }
+    },
+    "expected_output": "A bottom-up Work Breakdown Structure for the portal: work packages spanning discovery/requirements, UX & design, core build (scheduling, messaging, lab-results, refills), the four integrations (Epic FHIR, Stripe, Twilio, Okta), QA/compliance hardening, and deployment — each decomposed into estimable leaf tasks. Every leaf carries a phase, a roster role, and a sensible 3-point hour estimate; the decomposition should be proportional to a ~25-screen regulated build and not omit the integration or compliance work.",
+    "notes": "WBS planner — healthcare. wbs_structural validates the tree is well-formed (leaves carry phase + roster role + ordered positive PERT, ≥3 leaves across ≥2 phases); plan_quality (judge) scores the decomposition against the project."
+  },
+  {
+    "id": "wbs-fintech",
+    "agent": "wbs",
+    "input": {
+      "raw_input": "Fintech KYC onboarding app for a digital bank. New customers complete identity verification, document upload, sanctions/PEP screening, and risk scoring before an account opens. ~18 screens, 3 roles. Integrations: Persona, Plaid, a sanctions-screening API, and a core-banking API. SOC 2 + PCI-DSS. 16-week target.",
+      "stage2": {
+        "industry": "fintech",
+        "project_type": "greenfield",
+        "screen_count_estimate": 18,
+        "integration_count": 4,
+        "integration_list": ["Persona", "Plaid", "sanctions API", "core-banking API"],
+        "regulatory_requirements": ["SOC 2", "PCI-DSS"],
+        "target_timeline_weeks": 16
+      }
+    },
+    "expected_output": "A bottom-up WBS for the KYC onboarding app: packages for discovery, UX & design, the onboarding flow (IDV, document upload, sanctions/PEP screening, risk scoring), the four integrations, SOC 2 / PCI-DSS compliance hardening, QA, and deployment — decomposed into estimable leaf tasks each with a phase, a roster role, and a 3-point estimate. The breakdown should reflect the screening + risk-scoring complexity and the compliance load.",
+    "notes": "WBS planner — fintech."
+  }
+]

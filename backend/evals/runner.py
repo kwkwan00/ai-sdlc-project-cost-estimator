@@ -153,21 +153,21 @@ async def run_evals(
         wants_multi = any(r in NEEDS_MULTI_SAMPLE for r in rubric_names)
         case_repeats = n_repeats if wants_multi else 1
 
-        async def _one_case(case_id: str) -> CaseResult:
+        async def _one_case(case: EvalCase) -> CaseResult:
             samples: list[AgentSample] = []
             for _ in range(case_repeats):
                 async with sem:
-                    samples.append(await _safe_run_adapter(adapter, agent, case_id, cases))
+                    samples.append(await _safe_run_adapter(adapter, agent, case))
             return await _run_case(
                 agent,
-                case_id,
+                case.id,
                 samples,
                 rubric_names,
                 judge_model=judge_model,
                 sem=sem,
             )
 
-        results = await asyncio.gather(*(_one_case(c.id) for c in cases))
+        results = await asyncio.gather(*(_one_case(c) for c in cases))
         report = _aggregate(agent, list(results))
         logger.info(
             "agent=%s scored: %d case(s) x%d run(s), means=%s",
@@ -182,15 +182,20 @@ async def run_evals(
     return EvalReport(judge_model=judge_model, agents=list(agent_reports))
 
 
-async def _safe_run_adapter(adapter, agent, case_id, cases) -> AgentSample:  # type: ignore[no-untyped-def]
-    """Run the adapter for one case id, capturing any failure into the sample."""
-    case = next(c for c in cases if c.id == case_id)
+async def _safe_run_adapter(adapter, agent, case) -> AgentSample:  # type: ignore[no-untyped-def]
+    """Run the adapter for the given resolved case, capturing any failure into the sample.
+
+    Takes the already-resolved ``EvalCase`` (threaded down from ``_one_case``) rather than
+    re-looking it up by id, so a duplicate id (e.g. a synthetic case colliding with an on-disk
+    gold) can't silently scope to the wrong inputs and an unknown id can't raise an unguarded
+    StopIteration that would escape this function's try/except.
+    """
     try:
         return await adapter.run(case)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("adapter for agent=%s case=%s raised: %s", agent, case_id, exc)
+        logger.warning("adapter for agent=%s case=%s raised: %s", agent, case.id, exc)
         return AgentSample(
-            case_id=case_id,
+            case_id=case.id,
             agent=agent,
             expected_output=case.expected_output,
             error=str(exc),

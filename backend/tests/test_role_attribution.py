@@ -11,7 +11,7 @@ import math
 
 from models.project_schema import CustomRole, RoleRoster
 from models.twin_outputs import Phase, RoleCategory, RoleSeniority
-from orchestrator.role_attribution import attribute_roles
+from orchestrator.role_attribution import attribute_roles, default_role_id
 
 
 def _roster(*roles: tuple[str, RoleCategory, RoleSeniority, float]) -> RoleRoster:
@@ -32,6 +32,27 @@ def _roster(*roles: tuple[str, RoleCategory, RoleSeniority, float]) -> RoleRoste
 
 def _close(a: float, b: float, tol: float = 1e-6) -> bool:
     return math.isclose(a, b, abs_tol=tol)
+
+
+def test_default_role_id_prefers_senior_engineer_then_engineer_then_first() -> None:
+    # Senior engineer wins outright.
+    r = _roster(
+        ("pm", RoleCategory.PRODUCT, RoleSeniority.SENIOR, 30.0),
+        ("eng_sr", RoleCategory.ENGINEERING, RoleSeniority.SENIOR, 40.0),
+        ("eng_jr", RoleCategory.ENGINEERING, RoleSeniority.JUNIOR, 30.0),
+    )
+    assert default_role_id(r) == "eng_sr"
+    # No senior engineer → any engineer.
+    r2 = _roster(
+        ("pm", RoleCategory.PRODUCT, RoleSeniority.SENIOR, 50.0),
+        ("eng_jr", RoleCategory.ENGINEERING, RoleSeniority.JUNIOR, 50.0),
+    )
+    assert default_role_id(r2) == "eng_jr"
+    # No engineer at all → first role.
+    r3 = _roster(("pm", RoleCategory.PRODUCT, RoleSeniority.SENIOR, 100.0))
+    assert default_role_id(r3) == "pm"
+    # Empty roster → stable synthetic fallback.
+    assert default_role_id(RoleRoster()) == "sr_engineer"
 
 
 def _total(hours_list) -> float:

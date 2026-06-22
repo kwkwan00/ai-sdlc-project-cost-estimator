@@ -78,9 +78,12 @@ async def upsert_keyed[Model, Item, Key](
 ) -> bool:
     """Snapshot + update-or-insert a small keyed config table under the never-raise contract.
 
-    Snapshots existing rows into ``{key_of_row(row): row}``, then for each item either
-    applies it onto the matching row (``apply``) or inserts a new one (``make``). Returns
-    ``True`` when persisted, ``False`` when Postgres is disabled or the write fails.
+    Snapshots existing rows into ``{key_of_row(row): row}``, then for each item either applies it
+    onto the matching row (``apply``) or inserts a new one (``make``). Purely **additive** — it never
+    deletes; a key absent from ``items`` is left untouched. (For a destructive set-replace, write a
+    dedicated transaction so the deletion is explicit at the call site — see
+    ``rates.replace_rate_card`` — rather than hiding it behind a flag here.) Returns ``True`` when
+    persisted, ``False`` when Postgres is disabled or the write fails.
 
     The ``try`` wraps the **whole** ``async with session_scope()`` block (matching the
     original upsert structure): on error ``session_scope``'s own exit handling rolls back,

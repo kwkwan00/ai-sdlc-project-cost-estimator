@@ -34,10 +34,27 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from models.twin_outputs import HourRange
 
+
 # Default Monte Carlo draws. Env-overridable so tests can drop it (e.g. 200) for
 # speed/determinism. At 2000 the MC-mean standard error on a CoV≈0.3 driver is
 # ~0.7% of the mean — under the eval harness's 2% tolerance.
-DEFAULT_DRAWS = int(os.getenv("MC_DRAWS", "2000"))
+def _draws_from_env(default: int = 2000) -> int:
+    """Parse MC_DRAWS, degrading to the default on a malformed/non-positive value.
+
+    Evaluated at import time, so a bad env value must NOT raise — that would crash the whole
+    orchestrator module import rather than harmlessly falling back.
+    """
+    raw = os.getenv("MC_DRAWS")
+    if raw is None:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return n if n > 0 else default
+
+
+DEFAULT_DRAWS = _draws_from_env()
 
 _EPS = 1e-9
 # Percentiles reported for the fan chart (HourRange.percentiles).
@@ -178,6 +195,42 @@ def propagate_phase(
         ai_draws.append(base * (1.0 - r) + risk)
     manual = _summarize(manual_draws, point=base_point)
     ai = _summarize(ai_draws, point=base_point * (1.0 - eff_point))
+    return manual, ai
+
+
+def combine_pert_leaves(
+    leaves: Sequence[tuple[float, float, float]],
+    *,
+    reduction_sampler: ReductionSampler,
+    eff_point: float,
+    rng: random.Random,
+    n_draws: int = DEFAULT_DRAWS,
+) -> tuple[MCResult, MCResult]:
+    """Bottom-up sibling of ``propagate_phase`` for the WBS flow.
+
+    Each ``leaves`` entry is a leaf's ``(low, mode, high)`` PERT band. Every draw sums one
+    Beta-PERT sample per leaf (the leaves are treated as INDEPENDENT — their variances add
+    in quadrature, narrower than a comonotonic sum) to get that draw's manual hours, then
+    applies a per-draw AI reduction ``ai_i = manual_i · (1 − r)``. The deterministic anchors
+    are the comonotonic sums of the leaf modes: ``point = Σ mode`` for manual and
+    ``point · (1 − eff_point)`` for AI — so ``most_likely`` is exactly Σ leaf modes and the
+    ``ai.most_likely == manual.most_likely · (1 − eff_point)`` identity holds. Returns
+    ``(manual_result, ai_result)`` via ``_summarize`` so ``result_to_hour_range`` consumes
+    them unchanged. Pure stdlib; no risk events at the leaf level (the three-point band already
+    carries the leaf's uncertainty)."""
+    point = sum(mode for (_lo, mode, _hi) in leaves)
+    if not leaves:
+        zero = _summarize([0.0], point=0.0)
+        return zero, zero
+    manual_draws: list[float] = []
+    ai_draws: list[float] = []
+    for _ in range(n_draws):
+        base = sum(sample_pert(lo, mode, hi, rng) for (lo, mode, hi) in leaves)
+        r = reduction_sampler(rng)
+        manual_draws.append(base)
+        ai_draws.append(base * (1.0 - r))
+    manual = _summarize(manual_draws, point=point)
+    ai = _summarize(ai_draws, point=point * (1.0 - eff_point))
     return manual, ai
 
 

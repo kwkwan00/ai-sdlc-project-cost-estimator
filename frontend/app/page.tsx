@@ -1,20 +1,16 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import {
   deleteEstimate,
+  duplicateWbsEstimate,
   listEstimateHistory,
   type EstimateHistoryItem,
 } from "@/lib/api-client";
-import { formatHours, formatUSD } from "@/lib/format";
-
-function formatDate(iso: string | null): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
-}
+import { formatDate, formatHours, formatUSD } from "@/lib/format";
 
 const STATUS_LABEL: Record<string, string> = {
   pending: "Pending",
@@ -49,13 +45,26 @@ function TrashIcon() {
 }
 
 export default function Dashboard() {
+  const router = useRouter();
   const [items, setItems] = useState<EstimateHistoryItem[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0); // zero-based
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
+
+  async function handleDuplicateWbs(it: EstimateHistoryItem) {
+    setDuplicatingId(it.estimate_id);
+    try {
+      const res = await duplicateWbsEstimate(it.estimate_id);
+      router.push(`/wbs/edit/${res.draft_id}`);
+    } catch (e) {
+      setError((e as Error).message);
+      setDuplicatingId(null);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -123,6 +132,9 @@ export default function Dashboard() {
         <Link href="/estimate/new" className="btn-primary">
           Quick Estimate
         </Link>
+        <Link href="/wbs" className="btn-secondary">
+          WBS Estimate
+        </Link>
       </div>
 
       <section className="card space-y-3">
@@ -157,6 +169,11 @@ export default function Dashboard() {
                 <div className="flex flex-wrap items-center justify-between gap-2 py-3">
                   <div className="min-w-0">
                     <p className="font-medium text-slate-900 truncate">
+                      {it.method === "wbs" && (
+                        <span className="mr-2 rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-700 align-middle">
+                          WBS
+                        </span>
+                      )}
                       {it.project_name || "Untitled estimate"}
                     </p>
                     <p className="text-xs muted">
@@ -195,6 +212,17 @@ export default function Dashboard() {
                     </Link>
                   ) : (
                     <div className="flex-1 min-w-0 px-2 -mx-2 opacity-80">{row}</div>
+                  )}
+                  {it.method === "wbs" && done && (
+                    <button
+                      type="button"
+                      onClick={() => handleDuplicateWbs(it)}
+                      disabled={duplicatingId !== null}
+                      title="Duplicate as a new WBS draft"
+                      className="shrink-0 rounded-md px-2 py-1 text-xs text-slate-500 hover:bg-indigo-50 hover:text-indigo-700 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      Duplicate
+                    </button>
                   )}
                   <button
                     type="button"

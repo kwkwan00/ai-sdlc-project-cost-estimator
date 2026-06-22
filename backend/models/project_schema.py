@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -14,6 +15,7 @@ from models.twin_outputs import (
     RoleCategory,
     RoleSeniority,
 )
+from models.wbs_task import WbsTaskInput
 
 
 class EngagementModel(str, Enum):
@@ -275,3 +277,25 @@ class EstimateEnvelope(BaseModel):
     pass2_estimates: list[PhaseEstimate] = Field(default_factory=list)
     final_estimate: DualScenarioEstimate | None = None
     error: str | None = None
+    # Which estimation flow produced this envelope. `twins` is the default top-down
+    # parametric flow; `wbs` is the bottom-up Work Breakdown Structure flow. Defaulted
+    # so persisted pre-WBS envelopes deserialize cleanly.
+    method: Literal["twins", "wbs"] = "twins"
+    # WBS-only: the finalized task tree + the roster/context it was rolled up with, stored
+    # in envelope_json so a completed WBS estimate redisplays its tree and can be DUPLICATED
+    # into a new draft without any dependency on Neo4j being up. None on twin estimates.
+    wbs_tree: list[WbsTaskInput] | None = None
+    wbs_stage2: Stage2Context | None = None
+    wbs_stage3: Stage3Context | None = None
+
+    @model_validator(mode="after")
+    def _coherent_method_and_tree(self) -> EstimateEnvelope:
+        """Keep ``method`` and ``wbs_tree`` in lockstep so the two flows can't produce a malformed
+        envelope: a ``wbs`` estimate must carry its tree (the review page + Duplicate read it back
+        from ``envelope_json``), and a ``twins`` estimate must not (a stray tree would render the
+        WBS panel for a parametric estimate). The WBS-only context fields ride along with the tree."""
+        if self.method == "wbs" and self.wbs_tree is None:
+            raise ValueError("method='wbs' requires wbs_tree to be set")
+        if self.method == "twins" and self.wbs_tree is not None:
+            raise ValueError("method='twins' must not carry a wbs_tree")
+        return self

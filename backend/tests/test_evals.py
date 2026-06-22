@@ -124,7 +124,7 @@ async def _fake_verdict(score_value: float):
 def test_agent_rubrics_matrix_matches_spec() -> None:
     twins = {"discovery", "ux_design", "development", "code_review", "deployment", "qa_testing"}
     assert set(AGENT_RUBRICS) == set(models.ALL_AGENTS)
-    assert len(AGENT_RUBRICS) == 10
+    assert len(AGENT_RUBRICS) == 11  # 6 twins + prefill/roster/tooling/consolidator/wbs
 
     # The deleted RAG rubrics appear nowhere.
     for rubric_list in AGENT_RUBRICS.values():
@@ -145,13 +145,19 @@ def test_agent_rubrics_matrix_matches_spec() -> None:
         assert AGENT_RUBRICS[agent] == twin_set
 
     assert AGENT_RUBRICS["prefill"] == ["summarization", "extraction_accuracy"]
-    assert AGENT_RUBRICS["roster"] == ["plan_quality", "faithfulness", "staffing_adequacy"]
+    assert AGENT_RUBRICS["roster"] == [
+        "plan_quality",
+        "faithfulness",
+        "staffing_adequacy",
+        "roster_catalog_selection",
+    ]
     assert AGENT_RUBRICS["tooling"] == [
         "classification_accuracy",
         "enum_constraint_adherence",
         "consistency",
     ]
     assert AGENT_RUBRICS["consolidator"] == ["plan_quality", "partition_correctness"]
+    assert AGENT_RUBRICS["wbs"] == ["wbs_structural", "plan_quality"]
 
 
 # --------------------------------------------------------------------------- #
@@ -626,6 +632,136 @@ async def test_staffing_adequacy_fails_role_over_60pct() -> None:
     result = await rubrics.score("staffing_adequacy", sample, judge_model="x")
     assert result.passed is False
     assert "60%" in result.reasoning
+
+
+# --------------------------------------------------------------------------- #
+# roster_catalog_selection (roster)
+# --------------------------------------------------------------------------- #
+
+
+def _roster_proposal(*catalog_ids: str | None):
+    from roster_agent import ProposedRole, RosterProposal
+
+    return RosterProposal(
+        project_plan=[],
+        staffing_rationale="r",
+        roles=[
+            ProposedRole(
+                description=f"role {i}",
+                category=RoleCategory.ENGINEERING,
+                seniority=RoleSeniority.SENIOR,
+                percentage=100 / max(1, len(catalog_ids)),
+                catalog_role_id=cid,
+            )
+            for i, cid in enumerate(catalog_ids)
+        ],
+    )
+
+
+async def test_roster_catalog_selection_passes_when_agent_selects_gold_role() -> None:
+    sample = AgentSample(
+        case_id="c", agent="roster",
+        output_obj=_roster_proposal("hipaa_compliance_lead", None),
+        gold={"expected_catalog_role_id": "hipaa_compliance_lead"},
+    )
+    result = await rubrics.score("roster_catalog_selection", sample, judge_model="x")
+    assert result.passed is True and not result.skipped
+
+
+async def test_roster_catalog_selection_fails_when_gold_role_not_selected() -> None:
+    sample = AgentSample(
+        case_id="c", agent="roster",
+        output_obj=_roster_proposal(None, "some_other_role"),
+        gold={"expected_catalog_role_id": "hipaa_compliance_lead"},
+    )
+    result = await rubrics.score("roster_catalog_selection", sample, judge_model="x")
+    assert result.passed is False and not result.skipped
+
+
+async def test_roster_catalog_selection_skips_without_gold_or_output() -> None:
+    # No gold target → not applicable (skip).
+    s1 = AgentSample(case_id="c", agent="roster", output_obj=_roster_proposal(None))
+    r1 = await rubrics.score("roster_catalog_selection", s1, judge_model="x")
+    assert r1.skipped is True
+    # Gold present but no LLM ran (e.g. CI without a key) → skip, not fail.
+    s2 = AgentSample(
+        case_id="c", agent="roster", output_obj=None, error="no api key",
+        gold={"expected_catalog_role_id": "hipaa_compliance_lead"},
+    )
+    r2 = await rubrics.score("roster_catalog_selection", s2, judge_model="x")
+    assert r2.skipped is True
+
+
+# --------------------------------------------------------------------------- #
+# wbs_structural (wbs planner)
+# --------------------------------------------------------------------------- #
+
+
+def _wbs_leaf(tid: str, phase: str, role_id: str, o: float, m: float, p: float):
+    from models.wbs_task import WbsTaskInput
+
+    return WbsTaskInput(
+        id=tid, name=tid, phase=phase, role_id=role_id, optimistic=o, most_likely=m, pessimistic=p
+    )
+
+
+def _wbs_tree(*leaves):
+    from models.wbs_task import WbsTaskInput
+
+    return [WbsTaskInput(id="pkg", name="Work package", children=list(leaves))]
+
+
+async def test_wbs_structural_passes_for_well_formed_tree() -> None:
+    tree = _wbs_tree(
+        _wbs_leaf("l1", "development", "sr_engineer", 4, 8, 16),
+        _wbs_leaf("l2", "qa_testing", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "ux_design", "sr_product", 3, 6, 12),
+    )
+    sample = AgentSample(
+        case_id="c", agent="wbs", output_obj=tree,
+        eval_context={"roster_role_ids": ["sr_engineer", "sr_product"]},
+    )
+    result = await rubrics.score("wbs_structural", sample, judge_model="x")
+    assert result.passed is True
+
+
+async def test_wbs_structural_fails_role_not_in_roster() -> None:
+    tree = _wbs_tree(
+        _wbs_leaf("l1", "development", "ghost_role", 4, 8, 16),
+        _wbs_leaf("l2", "qa_testing", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "ux_design", "sr_engineer", 3, 6, 12),
+    )
+    sample = AgentSample(
+        case_id="c", agent="wbs", output_obj=tree,
+        eval_context={"roster_role_ids": ["sr_engineer"]},
+    )
+    result = await rubrics.score("wbs_structural", sample, judge_model="x")
+    assert result.passed is False and "ghost_role" in result.reasoning
+
+
+async def test_wbs_structural_fails_single_phase_or_too_few_leaves() -> None:
+    # All in one phase → fails the ≥2-phase check.
+    one_phase = _wbs_tree(
+        _wbs_leaf("l1", "development", "sr_engineer", 4, 8, 16),
+        _wbs_leaf("l2", "development", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "development", "sr_engineer", 3, 6, 12),
+    )
+    r1 = await rubrics.score(
+        "wbs_structural",
+        AgentSample(case_id="c", agent="wbs", output_obj=one_phase,
+                    eval_context={"roster_role_ids": ["sr_engineer"]}),
+        judge_model="x",
+    )
+    assert r1.passed is False
+    # Fewer than 3 leaves → fails.
+    tiny = _wbs_tree(_wbs_leaf("l1", "development", "sr_engineer", 4, 8, 16))
+    r2 = await rubrics.score(
+        "wbs_structural",
+        AgentSample(case_id="c", agent="wbs", output_obj=tiny,
+                    eval_context={"roster_role_ids": ["sr_engineer"]}),
+        judge_model="x",
+    )
+    assert r2.passed is False
 
 
 # --------------------------------------------------------------------------- #

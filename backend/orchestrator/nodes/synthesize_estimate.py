@@ -9,7 +9,7 @@ from collections import defaultdict
 
 from db.repositories import get_staffing_coefficients
 from models.estimation_state import EstimationState
-from models.project_schema import CustomRole, RoleRoster
+from models.project_schema import CustomRole, RoleRoster, Stage2Context
 from models.twin_outputs import (
     DualScenarioEstimate,
     HourRange,
@@ -17,7 +17,7 @@ from models.twin_outputs import (
     RoleHeadcount,
 )
 from observability.langfuse_wrapper import traced
-from orchestrator.nodes._twin_base import rate_by_role, roster_for
+from orchestrator.nodes._twin_base import rate_by_role
 from orchestrator.staffing import (
     coordination_overhead,
     optimal_team_size,
@@ -227,14 +227,25 @@ def _headcounts_for_target(
     return out
 
 
-@traced(name="synthesize_estimate")
-async def synthesize_estimate(state: EstimationState) -> dict:
-    pass2: list[PhaseEstimate] = state.get("pass2_estimates", [])
-    total_cost_ai = state.get("total_cost_ai_assisted_usd", 0.0)
-    total_cost_manual = state.get("total_cost_manual_only_usd", 0.0)
-    consistency_warnings = state.get("consistency_warnings", [])
-    stage2 = state.get("stage2")
-    roster = roster_for(state)
+async def synthesize_from_phase_estimates(
+    phases: list[PhaseEstimate],
+    *,
+    stage2: Stage2Context | None,
+    total_cost_ai_assisted_usd: float,
+    total_cost_manual_only_usd: float,
+    contingency_pct: float = 0.0,
+    consistency_warnings: list[str] | None = None,
+) -> DualScenarioEstimate:
+    """Typed core of the synthesize tail: combine per-phase ``PhaseEstimate``s + their base labor
+    costs into the final ``DualScenarioEstimate`` (variance-combine, Brooks staffing, contingency,
+    headcount, durations). Shared by the graph node ``synthesize_estimate`` (which adapts the
+    untyped ``EstimationState``) and the WBS rollup — so neither hand-builds a state dict or needs a
+    ``# type: ignore``."""
+    pass2 = phases
+    total_cost_ai = total_cost_ai_assisted_usd
+    total_cost_manual = total_cost_manual_only_usd
+    consistency_warnings = consistency_warnings or []
+    roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
 
     target_weeks = (stage2.target_timeline_weeks if stage2 and stage2.target_timeline_weeks else 0)
 
@@ -313,7 +324,7 @@ async def synthesize_estimate(state: EstimationState) -> dict:
     # band, which models estimation uncertainty). It uplifts BOTH cost scenarios and stretches the
     # timeline, mirroring how Brooks overhead affects both. Hours, role-hours, and headcount are
     # intentionally left untouched (so the twin eval rubrics are unaffected). Default 0% → no-op.
-    contingency_pct = max(0.0, state.get("contingency_pct", 0.0))
+    contingency_pct = max(0.0, contingency_pct)
     contingency = contingency_pct / 100.0
     total_cost_ai *= 1.0 + contingency
     total_cost_manual *= 1.0 + contingency
@@ -345,10 +356,24 @@ async def synthesize_estimate(state: EstimationState) -> dict:
         consistency_warnings=consistency_warnings,
     )
     logger.info(
-        "synthesize_estimate complete: ai_assisted=%.0fh manual_only=%.0fh (most likely) across %d phase(s); %d role(s) in headcount",
+        "synthesize complete: ai_assisted=%.0fh manual_only=%.0fh (most likely) across %d phase(s); %d role(s) in headcount",
         ai_range.most_likely,
         manual_range.most_likely,
         len(pass2),
         len(headcount_rows),
+    )
+    return final
+
+
+@traced(name="synthesize_estimate")
+async def synthesize_estimate(state: EstimationState) -> dict:
+    """Graph node: adapt the untyped ``EstimationState`` onto the typed synthesize core."""
+    final = await synthesize_from_phase_estimates(
+        state.get("pass2_estimates", []),
+        stage2=state.get("stage2"),
+        total_cost_ai_assisted_usd=state.get("total_cost_ai_assisted_usd", 0.0),
+        total_cost_manual_only_usd=state.get("total_cost_manual_only_usd", 0.0),
+        contingency_pct=state.get("contingency_pct", 0.0),
+        consistency_warnings=state.get("consistency_warnings", []),
     )
     return {"final_estimate": final}

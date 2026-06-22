@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 from models.estimation_state import EstimationState
+from models.project_schema import RoleRoster
 from models.twin_outputs import PhaseEstimate, RoleHours
 from observability.langfuse_wrapper import traced
 from orchestrator.nodes._twin_base import rate_by_role, roster_for
@@ -28,19 +29,27 @@ def _phase_cost(phase: PhaseEstimate, rate_by_role: dict[str, float], ai: bool) 
     return sum(rh.hours * rate_by_role.get(rh.role_id, 0.0) for rh in rows)
 
 
+def compute_total_costs(
+    phases: list[PhaseEstimate], roster: RoleRoster
+) -> tuple[float, float]:
+    """Base labor cost (ai_assisted, manual_only) = Σ per-phase role_hours × roster rate. Typed
+    core shared by the ``commercial_processing`` node and the WBS rollup."""
+    rates = rate_by_role(roster)
+    total_ai_cost = sum(_phase_cost(p, rates, ai=True) for p in phases)
+    total_manual_cost = sum(_phase_cost(p, rates, ai=False) for p in phases)
+    return total_ai_cost, total_manual_cost
+
+
 @traced(name="commercial_processing")
 async def commercial_processing(state: EstimationState) -> dict:
-    pass2 = state.get("pass2_estimates", [])
     roster = roster_for(state)
-
-    rates = rate_by_role(roster)
-
-    total_ai_cost = sum(_phase_cost(p, rates, ai=True) for p in pass2)
-    total_manual_cost = sum(_phase_cost(p, rates, ai=False) for p in pass2)
+    total_ai_cost, total_manual_cost = compute_total_costs(
+        state.get("pass2_estimates", []), roster
+    )
 
     logger.info(
         "commercial_processing complete: %d role(s) priced; cost ai_assisted=$%.0f manual_only=$%.0f",
-        len(rates),
+        len(roster.roles),
         total_ai_cost,
         total_manual_cost,
     )

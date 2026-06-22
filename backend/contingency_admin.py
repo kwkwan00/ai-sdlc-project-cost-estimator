@@ -24,6 +24,20 @@ DEFAULT_CONTINGENCY_PCT = 0.0
 CONTINGENCY_BOUNDS = (0.0, 100.0)
 
 
+def resolve_contingency_pct(raw: object) -> float:
+    """Parse a stored/raw ``contingency_pct`` value and clamp it to ``CONTINGENCY_BOUNDS``.
+
+    The single source of truth for reading the setting — shared by ``get_contingency`` (admin GET),
+    ``parse_input`` (twin graph) and the WBS rollup, so every read floors AND ceils identically
+    (the admin PUT bounds writes to ``[0, 100]``; a hand-edited / legacy row can't exceed it and
+    over-inflate cost + duration). Returns the default (0.0) when the value is unset/non-numeric."""
+    lo, hi = CONTINGENCY_BOUNDS
+    try:
+        return max(lo, min(hi, float(raw)))  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return DEFAULT_CONTINGENCY_PCT
+
+
 class ContingencyResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # True when Postgres is connected and edits will persist.
@@ -42,10 +56,7 @@ class ContingencyUpdate(BaseModel):
 async def get_contingency() -> ContingencyResponse:
     """The current contingency reserve % (DB → 0 default), plus the editable bounds."""
     raw = await get_app_setting(_SETTING_KEY, str(DEFAULT_CONTINGENCY_PCT))
-    try:
-        pct = float(raw)
-    except (ValueError, TypeError):
-        pct = DEFAULT_CONTINGENCY_PCT
+    pct = resolve_contingency_pct(raw)
     lo, hi = CONTINGENCY_BOUNDS
     return ContingencyResponse(
         editable=get_settings().postgres_enabled,

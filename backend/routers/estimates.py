@@ -73,6 +73,9 @@ class EstimateHistoryItem(BaseModel):
     estimate_id: str
     project_name: str
     status: str
+    # "twins" (default top-down flow) or "wbs" (bottom-up). Lets the dashboard badge + offer
+    # the WBS-only Duplicate action. Defaulted so pre-WBS history rows deserialize.
+    method: str = "twins"
     industry: str | None = None
     project_type: str | None = None
     total_ai_assisted_hours: float | None = None

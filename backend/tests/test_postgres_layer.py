@@ -20,6 +20,7 @@ from datetime import datetime
 
 import pytest
 import pytest_asyncio
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -38,8 +39,8 @@ from db.repositories import (
     get_staffing_coefficients,
     list_estimate_history,
     refresh_calibration_for_phase,
+    replace_rate_card,
     save_estimate_history,
-    upsert_default_rates,
     upsert_staffing_coefficients,
 )
 from models.project_schema import (
@@ -267,6 +268,62 @@ async def test_history_list_and_envelope_roundtrip(in_memory_db) -> None:
 
 
 @pytest.mark.asyncio
+async def test_wbs_envelope_roundtrips_with_new_fields(in_memory_db) -> None:
+    """A method='wbs' envelope (with wbs_tree + wbs_stage2/3) survives save → get verbatim, so a
+    completed WBS estimate redisplays its tree and stays duplicable from envelope_json."""
+    from models.wbs_task import WbsTaskInput
+
+    env = _make_envelope(estimate_id="wbs-roundtrip")
+    env.method = "wbs"
+    env.wbs_tree = [
+        WbsTaskInput(
+            id="p1",
+            name="Build",
+            children=[
+                WbsTaskInput(
+                    id="l1", name="task", phase=Phase.DEVELOPMENT, role_id="sr_engineer",
+                    optimistic=8, most_likely=16, pessimistic=32,
+                )
+            ],
+        )
+    ]
+    await save_estimate_history(env, stage2=None, stage3=None)
+
+    data = await get_estimate_envelope(env.estimate_id)
+    assert data is not None
+    restored = EstimateEnvelope.model_validate(data)
+    assert restored.method == "wbs"
+    assert restored.wbs_tree is not None
+    assert restored.wbs_tree[0].children[0].role_id == "sr_engineer"
+    assert restored.wbs_tree[0].children[0].phase == Phase.DEVELOPMENT
+
+
+def test_envelope_rejects_incoherent_method_and_tree() -> None:
+    """The model validator keeps method ↔ wbs_tree in lockstep: a 'wbs' envelope must carry a tree,
+    and a 'twins' envelope must not (else the review page renders the WBS panel for a parametric
+    estimate, or a WBS estimate redisplays with no tree)."""
+    from models.wbs_task import WbsTaskInput
+
+    leaf_tree = [WbsTaskInput(id="p1", name="Build", children=[
+        WbsTaskInput(id="l1", name="t", phase=Phase.DEVELOPMENT, role_id="sr_engineer",
+                     optimistic=8, most_likely=16, pessimistic=32)])]
+
+    def _env(**kw: object) -> EstimateEnvelope:
+        return EstimateEnvelope(
+            estimate_id="x", project_name="p", status=EstimateStatus.COMPLETED,
+            created_at=datetime.utcnow(), **kw,  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValidationError):
+        _env(method="wbs")  # wbs without a tree
+    with pytest.raises(ValidationError):
+        _env(method="twins", wbs_tree=leaf_tree)  # twins with a tree
+    # The coherent combinations construct cleanly.
+    assert _env(method="wbs", wbs_tree=leaf_tree).method == "wbs"
+    assert _env().method == "twins"
+
+
+@pytest.mark.asyncio
 async def test_history_paging_and_count(in_memory_db) -> None:
     for i in range(5):
         await save_estimate_history(
@@ -310,6 +367,95 @@ async def test_delete_estimate_history_removes_rows(in_memory_db) -> None:
 
 
 @pytest.mark.asyncio
+async def test_custom_rate_roles_add_update_delete(in_memory_db) -> None:
+    # The rate card's custom roles support add / edit / delete via the atomic full set-replace
+    # (replace_rate_card with grid=[] touches only the custom-role table).
+    from db.repositories import CustomRoleRecord, get_custom_roles, replace_rate_card
+
+    assert await get_custom_roles() == []
+    ok = await replace_rate_card(
+        [],
+        [
+            CustomRoleRecord("principal_architect", "Principal Architect", "engineering", "senior", 300.0),
+            CustomRoleRecord("scrum_master", "Scrum Master", "product", "mid", 175.0),
+        ],
+    )
+    assert ok is True
+    got = await get_custom_roles()
+    assert {r.role_id for r in got} == {"principal_architect", "scrum_master"}
+
+    # Replace with a single edited row → the other is DELETED, the survivor is UPDATED.
+    ok = await replace_rate_card(
+        [], [CustomRoleRecord("principal_architect", "Principal Architect", "engineering", "senior", 320.0)]
+    )
+    assert ok is True
+    got = await get_custom_roles()
+    assert len(got) == 1
+    assert got[0].role_id == "principal_architect"
+    assert got[0].rate == 320.0  # updated in place
+
+    # An explicit empty set clears all custom roles; None would leave them untouched.
+    assert await replace_rate_card([], []) is True
+    assert await get_custom_roles() == []
+
+
+@pytest.mark.asyncio
+async def test_replace_rate_card_writes_grid_and_custom_together(in_memory_db) -> None:
+    # One call applies BOTH the grid override and the custom-role set (atomic transaction).
+    from db.repositories import (
+        CustomRoleRecord,
+        get_custom_roles,
+        get_default_rates,
+        replace_rate_card,
+    )
+    from models.twin_outputs import RoleCategory as RC
+    from models.twin_outputs import RoleSeniority as RS
+
+    ok = await replace_rate_card(
+        [(RC.ENGINEERING, RS.SENIOR, 275.0)],
+        [CustomRoleRecord("scrum_master", "Scrum Master", "product", "mid", 175.0)],
+    )
+    assert ok is True
+    assert (await get_default_rates())[(RC.ENGINEERING, RS.SENIOR)] == 275.0
+    assert {r.role_id for r in await get_custom_roles()} == {"scrum_master"}
+
+    # custom=None leaves the custom roles UNTOUCHED while still updating the grid.
+    ok = await replace_rate_card([(RC.QA, RS.JUNIOR, 90.0)], None)
+    assert ok is True
+    assert (await get_default_rates())[(RC.QA, RS.JUNIOR)] == 90.0
+    assert {r.role_id for r in await get_custom_roles()} == {"scrum_master"}  # not cleared
+
+
+@pytest.mark.asyncio
+async def test_get_custom_roles_skips_unrecognized_enum_rows(in_memory_db) -> None:
+    # A row whose stored category/seniority is no longer a valid enum (rename / hand-edited row)
+    # is dropped on read — mirroring get_default_rates — so the frontend never gets an out-of-enum
+    # tag it can't render.
+    from db.orm_models import CustomRateRole
+    from db.repositories import get_custom_roles
+
+    async with in_memory_db() as session:
+        session.add(CustomRateRole(role_id="good", label="Good", category="engineering",
+                                   seniority="senior", rate=200.0))
+        session.add(CustomRateRole(role_id="bad", label="Bad", category="wizardry",
+                                   seniority="senior", rate=200.0))
+        await session.commit()
+
+    got = await get_custom_roles()
+    assert [r.role_id for r in got] == ["good"]  # the invalid-enum row is skipped
+
+
+@pytest.mark.asyncio
+async def test_custom_rate_roles_empty_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from db.repositories import CustomRoleRecord, get_custom_roles, replace_rate_card
+
+    _force_postgres_disabled(monkeypatch)
+    assert await get_custom_roles() == []
+    # Write degrades to False (not persisted), never raises.
+    assert await replace_rate_card([], [CustomRoleRecord("x", "X", "engineering", "senior", 100.0)]) is False
+
+
+@pytest.mark.asyncio
 async def test_history_helpers_empty_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_postgres_disabled(monkeypatch)
     assert await list_estimate_history() == []
@@ -337,17 +483,19 @@ async def test_default_rates_roundtrip(in_memory_db) -> None:
     from models.twin_outputs import RoleCategory as RC
     from models.twin_outputs import RoleSeniority as RS
 
+    # The grid is upserted via replace_rate_card (the production path); custom=None leaves the
+    # custom-role table untouched.
     # Empty table → no overrides (callers fall back to pricing.DEFAULT_RATES per cell).
     assert await get_default_rates() == {}
     assert (
-        await upsert_default_rates([(RC.ENGINEERING, RS.SENIOR, 300.0), (RC.QA, RS.JUNIOR, 95.0)])
+        await replace_rate_card([(RC.ENGINEERING, RS.SENIOR, 300.0), (RC.QA, RS.JUNIOR, 95.0)], None)
         is True
     )
     rates = await get_default_rates()
     assert rates[(RC.ENGINEERING, RS.SENIOR)] == 300.0
     assert rates[(RC.QA, RS.JUNIOR)] == 95.0
-    # Upsert updates an existing (category, seniority) cell in place.
-    assert await upsert_default_rates([(RC.ENGINEERING, RS.SENIOR, 320.0)]) is True
+    # A subsequent edit updates an existing (category, seniority) cell in place.
+    assert await replace_rate_card([(RC.ENGINEERING, RS.SENIOR, 320.0)], None) is True
     assert (await get_default_rates())[(RC.ENGINEERING, RS.SENIOR)] == 320.0
 
 

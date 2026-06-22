@@ -140,6 +140,46 @@ def test_proposal_to_roster_empty_roles_falls_back_to_default() -> None:
     assert [r.role_id for r in roster.roles] == [r.role_id for r in RoleRoster.default().roles]
 
 
+def test_proposal_to_roster_prices_and_ids_a_selected_catalog_role() -> None:
+    # A proposed role that SELECTS a catalog role (valid catalog_role_id) takes that role's exact
+    # rate AND carries its id into the roster; unselected roles get the grid rate + a tag-derived id.
+    from roster_agent import CatalogRole
+
+    selected = ProposedRole(
+        description="Lead architect", category=RoleCategory.ENGINEERING,
+        seniority=RoleSeniority.SENIOR, percentage=60, catalog_role_id="principal_architect",
+    )
+    proposal = RosterProposal(
+        project_plan=[], staffing_rationale="r",
+        roles=[selected, _role(RoleCategory.QA, RoleSeniority.MID, 40, "QA")],
+    )
+    catalog = [CatalogRole("principal_architect", "Principal Architect", "engineering", "senior", 333.0)]
+    roster = proposal_to_roster(proposal, None, catalog)
+    by_desc = {r.description: r for r in roster.roles}
+    assert by_desc["Lead architect"].rate_per_hour == 333.0  # exact catalog rate
+    assert by_desc["Lead architect"].role_id == "principal_architect"  # catalog identity carried (#4)
+    assert by_desc["QA"].rate_per_hour != 333.0  # unselected → grid rate
+    assert by_desc["QA"].role_id != "principal_architect"
+
+
+def test_proposal_to_roster_unknown_catalog_id_falls_back_to_grid() -> None:
+    # An unknown/hallucinated catalog_role_id deterministically falls back to grid pricing + a
+    # tag-derived id — no silent fuzzy match (#3).
+    from roster_agent import CatalogRole
+
+    proposal = RosterProposal(
+        project_plan=[], staffing_rationale="r",
+        roles=[
+            ProposedRole(description="X", category=RoleCategory.QA, seniority=RoleSeniority.JUNIOR,
+                         percentage=100, catalog_role_id="does_not_exist"),
+        ],
+    )
+    catalog = [CatalogRole("principal_architect", "Principal Architect", "engineering", "senior", 999.0)]
+    roster = proposal_to_roster(proposal, None, catalog)
+    assert roster.roles[0].rate_per_hour != 999.0  # unknown id → grid, no hijack
+    assert roster.roles[0].role_id == "junior_qa"  # tag-derived id
+
+
 # ---------- run_roster_agent (LLM wiring) ----------
 
 
