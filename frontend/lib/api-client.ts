@@ -6,7 +6,14 @@ import type {
   Stage2Input,
   Stage3Input,
 } from "./schemas";
-import type { DualScenarioEstimate, EstimateEnvelope } from "./types";
+import type {
+  DualScenarioEstimate,
+  EstimateEnvelope,
+  Phase,
+  SowDocument,
+  SowGenerateResponse,
+  SowScenario,
+} from "./types";
 import type {
   WbsDraft,
   WbsDraftList,
@@ -343,6 +350,44 @@ export function streamUrl(id: string): string {
   return `${API_BASE}/estimates/${encodeURIComponent(id)}/stream`;
 }
 
+/** Generate a Statement of Work from a completed estimate (one LLM call). */
+export async function generateSow(
+  id: string,
+  scenario: SowScenario = "ai_assisted"
+): Promise<SowGenerateResponse> {
+  return jsonFetch(
+    `/estimates/${encodeURIComponent(id)}/sow?scenario=${scenario}`,
+    { method: "POST" }
+  );
+}
+
+/** Render a (possibly edited) SOW document to a downloadable .docx blob. No LLM. */
+export async function downloadSowDocx(
+  id: string,
+  document: SowDocument
+): Promise<Blob> {
+  const res = await fetch(
+    `${API_BASE}/estimates/${encodeURIComponent(id)}/sow/docx`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document }),
+    }
+  );
+  if (!res.ok) {
+    // Mirror jsonFetch's single-read error extraction (this path returns a blob, not JSON).
+    const raw = await res.text();
+    let detail = raw;
+    try {
+      detail = JSON.parse(raw).detail || raw;
+    } catch {
+      // not JSON — keep the raw text
+    }
+    throw new Error(`${res.status} ${res.statusText} — ${detail}`);
+  }
+  return res.blob();
+}
+
 // --- WBS (Work Breakdown Structure) flow ---------------------------------------------------
 
 export interface WbsDraftInput {
@@ -435,12 +480,16 @@ export function buildCreatePayload(
   rawInput: string,
   projectName: string | undefined,
   stage2: Stage2Input | undefined,
-  stage3: Stage3Input | undefined
+  stage3: Stage3Input | undefined,
+  selectedPhases?: Phase[]
 ): CreateEstimateInput {
   return {
     raw_input: rawInput,
     project_name: projectName,
     stage2,
     stage3,
+    // Omitted (undefined) ⇒ the backend estimates all six phases. Callers pass undefined when
+    // every phase is selected so the request stays identical to the pre-feature shape.
+    selected_phases: selectedPhases,
   };
 }

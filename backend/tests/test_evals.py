@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import pytest
 
+from agents.prefill import IndustryOption, NormalizedProjectContext, RegulatoryRequirement
+from agents.tooling_classifier import ToolingClassification
 from evals import models, report, rubrics, runner
 from evals.agents import _is_stub_estimate  # noqa: F401  (behavior under test)
 from evals.models import (
@@ -30,8 +32,6 @@ from models.twin_outputs import (
     RoleSeniority,
 )
 from orchestrator.nodes._twin_base import stub_phase_estimate
-from prefill import IndustryOption, NormalizedProjectContext, RegulatoryRequirement
-from tooling_classifier import ToolingClassification
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -640,7 +640,7 @@ async def test_staffing_adequacy_fails_role_over_60pct() -> None:
 
 
 def _roster_proposal(*catalog_ids: str | None):
-    from roster_agent import ProposedRole, RosterProposal
+    from agents.roster_agent import ProposedRole, RosterProposal
 
     return RosterProposal(
         project_plan=[],

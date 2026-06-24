@@ -22,6 +22,8 @@ All other constants live here and are tunable; the six twins call
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from models.project_schema import AiToolingLevel, CodebaseContext, RoleRoster
 from models.twin_outputs import Phase, RoleSeniority
 
@@ -113,6 +115,32 @@ def seniority_factor(roster: RoleRoster | None) -> float:
     junior = sum(r.percentage for r in roster.roles if r.seniority == RoleSeniority.JUNIOR)
     factor = 1.0 + 0.2 * (junior / total) - 0.2 * (senior / total)
     return max(0.6, min(1.25, factor))
+
+
+@dataclass(frozen=True)
+class ReductionContext:
+    """The constant (per-phase) inputs to ``effective_ai_reduction`` — everything except the
+    per-draw ``proposed_reduction``. Built once per phase and threaded through the Monte Carlo
+    reduction sampler so the moderation/clamp re-runs on every draw without re-deriving these.
+    Replaces the untyped dict that was duplicated in ``_twin_base`` and the WBS rollup."""
+
+    phase: Phase
+    codebase: CodebaseContext
+    tooling: AiToolingLevel
+    roster: RoleRoster | None
+    regulated: bool
+    bands: dict | None
+
+    def reduction_kwargs(self) -> dict:
+        """The keyword args to splat into ``effective_ai_reduction`` (all but ``proposed_reduction``)."""
+        return {
+            "phase": self.phase,
+            "codebase": self.codebase,
+            "tooling": self.tooling,
+            "roster": self.roster,
+            "regulated": self.regulated,
+            "bands": self.bands,
+        }
 
 
 def effective_ai_reduction(

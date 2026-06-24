@@ -15,7 +15,11 @@ import {
   type PhaseTooling,
   type Stage3Input,
 } from "@/lib/schemas";
-import { clearDraft, loadDraft, saveSession } from "@/lib/wizard-store";
+import { PHASE_LABELS, type Phase } from "@/lib/types";
+import { clearDraft, loadDraft, saveDraft, saveSession } from "@/lib/wizard-store";
+
+// Canonical phase order for the scope picker (mirrors the review page's label source).
+const ALL_PHASES = Object.keys(PHASE_LABELS) as Phase[];
 
 const NO_TOOLING: PhaseTooling = {
   discovery: "none",
@@ -30,13 +34,24 @@ const DEFAULT: Stage3Input = {
   codebase_context: "greenfield",
   ai_tooling_description: "",
   ai_tooling: { ...NO_TOOLING },
+  technology_stack: "",
 };
 
 export default function Stage3DraftPage() {
   const router = useRouter();
   const [stage3, setStage3] = useState<Stage3Input>(DEFAULT);
+  // Which SDLC phases to estimate. All selected by default; the request omits the field entirely
+  // when all six remain checked, so a full-scope estimate is byte-identical to the pre-feature one.
+  const [selectedPhases, setSelectedPhases] = useState<Phase[]>(ALL_PHASES);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const togglePhase = (phase: Phase) =>
+    setSelectedPhases((prev) =>
+      prev.includes(phase)
+        ? prev.filter((p) => p !== phase)
+        : ALL_PHASES.filter((p) => p === phase || prev.includes(p)) // keep canonical order
+    );
 
   useEffect(() => {
     const draft = loadDraft();
@@ -50,6 +65,9 @@ export default function Stage3DraftPage() {
       base.ai_tooling_description = draft.prefill_ai_tooling;
     }
     setStage3(base);
+    // Restore a previously-chosen phase subset (e.g. after navigating Back and returning) so the
+    // scope isn't silently reset to all six. Absent/empty ⇒ keep the all-selected default.
+    if (draft.selected_phases?.length) setSelectedPhases(draft.selected_phases);
   }, []);
 
   const persistAndCreate = async () => {
@@ -75,11 +93,15 @@ export default function Stage3DraftPage() {
       }
       const classifiedStage3: Stage3Input = { ...stage3, ai_tooling };
 
+      // Omit selected_phases when every phase is chosen so the full-scope request is unchanged.
+      const phasesArg =
+        selectedPhases.length === ALL_PHASES.length ? undefined : selectedPhases;
       const payload = buildCreatePayload(
         draft.raw_input,
         draft.project_name,
         draft.stage2,
-        classifiedStage3
+        classifiedStage3,
+        phasesArg
       );
       const envelope = await createEstimate(payload);
       saveSession(envelope.estimate_id, {
@@ -143,6 +165,25 @@ export default function Stage3DraftPage() {
             </p>
           </div>
 
+          <div>
+            <label className="label" htmlFor="technology-stack">
+              Existing / proposed technologies
+            </label>
+            <textarea
+              id="technology-stack"
+              className="textarea mt-1 min-h-[4.5rem]"
+              placeholder="e.g. React + Node, Java/Spring, Postgres, AWS, a Kafka pipeline. Leave blank if undecided."
+              value={stage3.technology_stack}
+              onChange={(e) =>
+                setStage3({ ...stage3, technology_stack: e.target.value })
+              }
+            />
+            <p className="help">
+              Languages, frameworks, cloud, and datastores the client already uses or
+              plans to use. Helps size the effort and lets the estimate reference the
+              real stack.
+            </p>
+          </div>
         </div>
 
         <div className="space-y-3">
@@ -179,6 +220,40 @@ export default function Stage3DraftPage() {
             </p>
           </div>
         </div>
+
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <h2 className="text-lg font-semibold text-slate-900">
+              Phases to estimate
+            </h2>
+            <p className="muted">
+              By default we estimate the full SDLC. Uncheck any phases to leave them
+              out — cost, timeline, and team are rolled up from only the phases you
+              keep.
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {ALL_PHASES.map((phase) => (
+              <label
+                key={phase}
+                className="flex cursor-pointer items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm hover:bg-slate-50"
+              >
+                <input
+                  type="checkbox"
+                  className="h-4 w-4"
+                  checked={selectedPhases.includes(phase)}
+                  onChange={() => togglePhase(phase)}
+                />
+                <span className="text-slate-800">{PHASE_LABELS[phase]}</span>
+              </label>
+            ))}
+          </div>
+          {selectedPhases.length === 0 && (
+            <p className="text-sm text-rose-600">
+              Select at least one phase to estimate.
+            </p>
+          )}
+        </div>
       </div>
 
       {error && (
@@ -190,7 +265,15 @@ export default function Stage3DraftPage() {
       <div className="flex items-center justify-between">
         <button
           type="button"
-          onClick={() => router.push("/estimate/draft/context")}
+          onClick={() => {
+            // Persist the Stage-3 edits + phase selection so returning to this page restores
+            // them instead of silently resetting (notably the scope back to all six phases).
+            const draft = loadDraft();
+            if (draft) {
+              saveDraft({ ...draft, stage3, selected_phases: selectedPhases });
+            }
+            router.push("/estimate/draft/context");
+          }}
           className="btn-secondary"
         >
           Back
@@ -198,7 +281,7 @@ export default function Stage3DraftPage() {
         <button
           type="button"
           onClick={persistAndCreate}
-          disabled={submitting}
+          disabled={submitting || selectedPhases.length === 0}
           className="btn-primary"
         >
           {submitting ? "Starting Pass 1..." : "Generate estimate"}

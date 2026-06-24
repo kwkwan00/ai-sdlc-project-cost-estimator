@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     anthropic_model_wbs: str = Field(
         default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_WBS"
     )
+    # Writes the project-specific prose of an exported Statement of Work (the SOW "feature
+    # agent") and extracts client facts. A knowledge/writing task → defaults to Sonnet, like
+    # the roster/tooling/wbs agents, independent of the twins' ANTHROPIC_MODEL.
+    anthropic_model_sow: str = Field(
+        default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_SOW"
+    )
+    # The delivering firm's name printed on exported Statements of Work. Injected here (or in
+    # the SOW template's `branding.company`) so no firm name is hardcoded in the repo. When set,
+    # it OVERRIDES the template's company. Empty → use the template's `branding.company` value.
+    sow_company_name: str = Field(default="", alias="SOW_COMPANY_NAME")
     # Global tuning scale on the WBS bottom-up realism factor. LLM/human bottom-up task estimates
     # are systematically OPTIMISTIC, and the optimism grows with hidden complexity, so the drafted
     # leaf hours are scaled up by a COMPLEXITY-AWARE factor derived from the project's own signals

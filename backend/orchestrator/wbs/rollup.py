@@ -20,9 +20,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any
 
-from contingency_admin import resolve_contingency_pct
+from admin.contingency_admin import resolve_contingency_pct
 from db.repositories import get_reduction_bands
 from models.project_schema import RoleRoster, Stage2Context, Stage3Context
 from models.twin_outputs import (
@@ -33,7 +32,7 @@ from models.twin_outputs import (
 )
 from models.wbs_schema import WBS_DEFAULT_CONTINGENCY_PCT, WbsCalculateRequest
 from models.wbs_task import WbsTaskInput, count_tasks, iter_leaves
-from orchestrator.ai_acceleration import effective_ai_reduction
+from orchestrator.ai_acceleration import ReductionContext, effective_ai_reduction
 from orchestrator.montecarlo import combine_pert_leaves, make_rng, result_to_hour_range
 from orchestrator.nodes._twin_base import make_reduction_sampler, tooling_for
 from orchestrator.nodes.commercial_processing import compute_total_costs
@@ -126,19 +125,17 @@ def _phase_estimate(
     estimate_id: str,
 ) -> PhaseEstimate:
     """Roll one phase's leaves into a PhaseEstimate via the shared MC + reduction machinery."""
-    reduction_ctx: dict[str, Any] = {
-        "phase": phase,
-        "codebase": stage3.codebase_context,
-        "tooling": tooling_for(stage3, phase),
-        "roster": roster,
-        "regulated": regulated,
-        "bands": reduction_bands,
-    }
-    # WBS proposes no LLM reduction (like Discovery/UX): use the guardrail band midpoint.
-    eff = effective_ai_reduction(proposed_reduction=None, **reduction_ctx)
-    sampler = make_reduction_sampler(
-        reduction_ctx=reduction_ctx, proposed_point=None, reduction_range=None
+    reduction_ctx = ReductionContext(
+        phase=phase,
+        codebase=stage3.codebase_context,
+        tooling=tooling_for(stage3, phase),
+        roster=roster,
+        regulated=regulated,
+        bands=reduction_bands,
     )
+    # WBS proposes no LLM reduction (like Discovery/UX): use the guardrail band midpoint.
+    eff = effective_ai_reduction(proposed_reduction=None, **reduction_ctx.reduction_kwargs())
+    sampler = make_reduction_sampler(ctx=reduction_ctx, proposed_point=None, reduction_range=None)
     rng = make_rng(f"{estimate_id}:{phase.value}:wbs")
     bands = [
         (leaf.optimistic or 0.0, leaf.most_likely or 0.0, leaf.pessimistic or 0.0)

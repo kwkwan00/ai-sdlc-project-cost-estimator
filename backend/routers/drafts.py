@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from prefill import DraftPrefillRequest, Stage2Prefill, prefill_stage2_from_raw
-from roster_agui import roster_agui_endpoint
-from tooling_classifier import (
+from agents.prefill import DraftPrefillRequest, Stage2Prefill, prefill_stage2_from_raw
+from agents.roster_agui import roster_agui_endpoint
+from agents.tooling_classifier import (
     ClassifyToolingRequest,
     ToolingClassification,
     classify_ai_tooling,

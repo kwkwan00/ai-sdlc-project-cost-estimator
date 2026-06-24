@@ -31,7 +31,7 @@ from config import get_settings
 from models.project_schema import CustomRole, RoleRoster, Stage2Context
 from models.twin_outputs import RoleCategory, RoleSeniority
 from orchestrator.llm import call_structured, render_context_block
-from orchestrator.nodes._twin_base import load_prompt
+from orchestrator.prompts import load_prompt
 from pricing import resolve_rate
 from slug import unique_slug
 

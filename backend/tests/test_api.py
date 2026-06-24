@@ -302,7 +302,7 @@ async def test_spawn_background_logs_and_discards_on_failure(caplog) -> None:
     assert any("unit-test" in r.getMessage() for r in caplog.records)
 
 
-# --- _persist calibration refresh iterates the Phase enum ---------------------
+# --- persist_completed_estimate calibration refresh iterates the Phase enum ---
 
 
 def test_persist_refreshes_calibration_for_every_phase(monkeypatch) -> None:
@@ -320,7 +320,7 @@ def test_persist_refreshes_calibration_for_every_phase(monkeypatch) -> None:
     async def _fake_save_history(*args, **kwargs) -> None:
         return None
 
-    async def _fake_save_envelope(*args, **kwargs) -> None:  # now async (awaited in _persist)
+    async def _fake_save_envelope(*args, **kwargs) -> None:  # awaited in persist_completed_estimate
         return None
 
     monkeypatch.setattr(runtime, "refresh_calibration_for_phase", _fake_refresh)
@@ -333,6 +333,6 @@ def test_persist_refreshes_calibration_for_every_phase(monkeypatch) -> None:
         status=EstimateStatus.COMPLETED,
         created_at=datetime.now(UTC),
     )
-    asyncio.run(runtime._persist(env, "", stage2=None, stage3=None))
+    asyncio.run(runtime.persist_completed_estimate(env, raw_input="", stage2=None, stage3=None))
 
     assert sorted(refreshed) == sorted(p.value for p in Phase)

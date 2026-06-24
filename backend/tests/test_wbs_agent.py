@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
-import wbs_agent
+from agents import wbs_agent
+from agents.wbs_agent import (
+    WbsPlannerLeaf,
+    WbsPlannerPackage,
+    WbsPlannerResponse,
+    _complexity_effort_factor,
+    _effective_stage2_for_factor,
+    _fallback_tree,
+    _planner_to_tree,
+    generate_wbs_tree,
+    run_wbs_planner,
+)
 from models.project_schema import (
     CodebaseContext,
     ProjectType,
@@ -14,17 +25,6 @@ from models.twin_outputs import Phase
 from models.wbs_schema import WbsDraftRequest
 from models.wbs_task import iter_leaves
 from orchestrator.nodes.parse_input import ParsedContext
-from wbs_agent import (
-    WbsPlannerLeaf,
-    WbsPlannerPackage,
-    WbsPlannerResponse,
-    _complexity_effort_factor,
-    _effective_stage2_for_factor,
-    _fallback_tree,
-    _planner_to_tree,
-    generate_wbs_tree,
-    run_wbs_planner,
-)
 
 
 def test_fallback_tree_is_leaf_complete() -> None:

@@ -10,7 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import db.postgres_adapter as postgres_adapter
-from reduction_bands_admin import (
+from admin.reduction_bands_admin import (
     ReductionBandInput,
     ReductionBandsUpdate,
     get_effective_bands,

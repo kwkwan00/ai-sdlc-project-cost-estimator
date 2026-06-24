@@ -13,10 +13,8 @@ import random
 
 import pytest
 
-import roster_agent
-from models.project_schema import RoleRoster
-from models.twin_outputs import RoleCategory, RoleSeniority
-from roster_agent import (
+from agents import roster_agent
+from agents.roster_agent import (
     ProposedRole,
     RosterProposal,
     _make_unique_ids,
@@ -24,6 +22,8 @@ from roster_agent import (
     proposal_to_roster,
     run_roster_agent,
 )
+from models.project_schema import RoleRoster
+from models.twin_outputs import RoleCategory, RoleSeniority
 
 
 def _role(category: RoleCategory, seniority: RoleSeniority, pct: float, desc: str = "X") -> ProposedRole:
@@ -143,7 +143,7 @@ def test_proposal_to_roster_empty_roles_falls_back_to_default() -> None:
 def test_proposal_to_roster_prices_and_ids_a_selected_catalog_role() -> None:
     # A proposed role that SELECTS a catalog role (valid catalog_role_id) takes that role's exact
     # rate AND carries its id into the roster; unselected roles get the grid rate + a tag-derived id.
-    from roster_agent import CatalogRole
+    from agents.roster_agent import CatalogRole
 
     selected = ProposedRole(
         description="Lead architect", category=RoleCategory.ENGINEERING,
@@ -165,7 +165,7 @@ def test_proposal_to_roster_prices_and_ids_a_selected_catalog_role() -> None:
 def test_proposal_to_roster_unknown_catalog_id_falls_back_to_grid() -> None:
     # An unknown/hallucinated catalog_role_id deterministically falls back to grid pricing + a
     # tag-derived id — no silent fuzzy match (#3).
-    from roster_agent import CatalogRole
+    from agents.roster_agent import CatalogRole
 
     proposal = RosterProposal(
         project_plan=[], staffing_rationale="r",

@@ -17,6 +17,7 @@ import { Modal } from "@/components/Modal";
 import { PertChart } from "@/components/PertChart";
 import { PhaseBar } from "@/components/PhaseBar";
 import { RiskRegister } from "@/components/RiskRegister";
+import { SowExportModal } from "@/components/SowExportModal";
 import { StageProgress } from "@/components/StageProgress";
 import { Tabs } from "@/components/Tabs";
 import { TornadoChart } from "@/components/TornadoChart";
@@ -54,6 +55,7 @@ export default function ReviewPage({ params }: PageProps) {
   const [mode, setMode] = useState<"ai_assisted" | "manual_only">("ai_assisted");
   const [openPhase, setOpenPhase] = useState<number | null>(null);
   const [showLlmUsage, setShowLlmUsage] = useState(false);
+  const [showSow, setShowSow] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
   const { data, isLoading, error } = useQuery({
     queryKey: ["estimate", id],
@@ -469,6 +471,14 @@ export default function ReviewPage({ params }: PageProps) {
               {duplicating ? "Duplicating…" : "Duplicate as new draft"}
             </button>
           )}
+          <button
+            type="button"
+            onClick={() => setShowSow(true)}
+            className="btn-secondary text-sm"
+            title="Generate a Statement of Work from this estimate"
+          >
+            Export SOW
+          </button>
           {fe.llm_usage && fe.llm_usage.call_count > 0 && (
             <button
               type="button"
@@ -584,6 +594,14 @@ export default function ReviewPage({ params }: PageProps) {
             content: riskPanel,
           },
         ]}
+      />
+
+      <SowExportModal
+        open={showSow}
+        onClose={() => setShowSow(false)}
+        estimateId={data.estimate_id}
+        projectName={data.project_name}
+        scenario={mode}
       />
 
       {fe.llm_usage && fe.llm_usage.call_count > 0 && (

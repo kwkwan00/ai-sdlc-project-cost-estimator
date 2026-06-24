@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from models.twin_outputs import (
     ClarifyingQuestion,
     DualScenarioEstimate,
+    Phase,
     PhaseEstimate,
     RoleCategory,
     RoleSeniority,
@@ -215,6 +216,12 @@ class Stage3Context(BaseModel):
     # for dev, CodeRabbit for review, Figma AI for design"). Persisted for audit /
     # transparency; the classified `ai_tooling` above is what drives the estimate.
     ai_tooling_description: str = Field(default="", max_length=2000)
+    # Freeform: the technologies the client already uses or proposes (languages,
+    # frameworks, cloud, datastores). An ESTIMATION SIGNAL the twins read — a legacy or
+    # unfamiliar stack raises effort, a modern/well-supported one can lower it — and the
+    # one place the user explicitly names their stack, so the twins (and downstream
+    # planners) may reference those specific technologies rather than staying agnostic.
+    technology_stack: str = Field(default="", max_length=2000)
 
 
 class CreateEstimateRequest(BaseModel):
@@ -227,6 +234,22 @@ class CreateEstimateRequest(BaseModel):
     )
     stage2: Stage2Context | None = None
     stage3: Stage3Context | None = None
+    # Phases to estimate. None / omitted ⇒ all six (back-compat). A non-empty list runs exactly
+    # those twins; the others are skipped and contribute nothing to hours/cost/headcount/timeline.
+    selected_phases: list[Phase] | None = Field(
+        default=None,
+        description="Subset of SDLC phases to estimate; null ⇒ all six.",
+    )
+
+    @model_validator(mode="after")
+    def _normalize_selected_phases(self) -> CreateEstimateRequest:
+        if self.selected_phases is not None:
+            # Order-preserving dedup; an explicit empty list is a client error.
+            deduped = list(dict.fromkeys(self.selected_phases))
+            if not deduped:
+                raise ValueError("selected_phases, when provided, must be non-empty")
+            self.selected_phases = deduped
+        return self
 
 
 class AnswerSubmission(BaseModel):

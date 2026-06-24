@@ -21,6 +21,7 @@ export default function NewWbsPage() {
   const [projectName, setProjectName] = useState("");
   const [rawInput, setRawInput] = useState("");
   const [codebase, setCodebase] = useState<CodebaseContext>("greenfield");
+  const [technology, setTechnology] = useState("");
   const [tooling, setTooling] = useState("");
   const [pick, setPick] = useState("");
 
@@ -32,7 +33,7 @@ export default function NewWbsPage() {
   }
 
   function handleContinue() {
-    saveWbsNewDraft({ project_name: projectName, raw_input: rawInput, tooling, codebase });
+    saveWbsNewDraft({ project_name: projectName, raw_input: rawInput, tooling, codebase, technology });
     router.push("/wbs/team");
   }
 
@@ -104,6 +105,16 @@ export default function NewWbsPage() {
               </option>
             ))}
           </select>
+        </label>
+
+        <label className="block">
+          <span className="label">Existing / proposed technologies (optional)</span>
+          <textarea
+            className="input min-h-[4rem]"
+            value={technology}
+            onChange={(e) => setTechnology(e.target.value)}
+            placeholder="Languages, frameworks, cloud, datastores the client uses or plans to use — e.g. React + Node, Java/Spring, Postgres, AWS"
+          />
         </label>
 
         <label className="block">

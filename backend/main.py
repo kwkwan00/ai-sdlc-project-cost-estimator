@@ -55,6 +55,7 @@ from routers import admin as admin_router
 from routers import catalog as catalog_router
 from routers import drafts as drafts_router
 from routers import estimates as estimates_router
+from routers import sow as sow_router
 from routers import wbs as wbs_router
 from runtime import set_graph
 
@@ -113,3 +114,6 @@ app.include_router(estimates_router.router)
 # WBS bottom-up flow (separate from the twin orchestrator). Mounted after estimates so its
 # literal /estimates/wbs* routes coexist with /estimates/{id} (distinct methods/paths).
 app.include_router(wbs_router.router)
+# SOW export: POST /estimates/{id}/sow + /sow/docx. Literal sub-paths under /estimates/{id};
+# distinct methods so they coexist with the estimate routes.
+app.include_router(sow_router.router)

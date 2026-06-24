@@ -43,12 +43,7 @@ async def create_estimate(req: CreateEstimateRequest) -> EstimateEnvelope:
         status=EstimateStatus.PENDING,
         created_at=datetime.now(UTC),
     )
-    # TODO(review-fix-refactor): cross-partition refactor: promote runtime public API
-    # (these handlers reach into runtime's underscore-private members — _envelopes,
-    # _event_streams, _EventBroker, _spawn_background, _run_pass1, _resume_pass2 — which
-    # is a coupling smell; the fix lives in runtime.py, outside this partition).
-    runtime._envelopes[estimate_id] = env
-    runtime._event_streams[estimate_id] = runtime._EventBroker()
+    runtime.register_envelope(estimate_id, env, with_event_stream=True)
 
     initial_state: dict[str, Any] = {
         "estimate_id": estimate_id,
@@ -58,14 +53,16 @@ async def create_estimate(req: CreateEstimateRequest) -> EstimateEnvelope:
         "stage3": req.stage3,
         "parsed_context": {},
     }
+    # Omit the key entirely when None so the twin guard's "absent ⇒ all phases" back-compat path
+    # runs (rather than seeding an empty list, which would skip every twin).
+    if req.selected_phases:
+        initial_state["selected_phases"] = req.selected_phases
     logger.info(
         "estimate %s created (project=%r); starting pass 1 in background",
         estimate_id,
         env.project_name,
     )
-    runtime._spawn_background(
-        runtime._run_pass1(estimate_id, initial_state), label=f"pass1:{estimate_id}"
-    )
+    runtime.start_pass1(estimate_id, initial_state)
     return env
 
 
@@ -114,17 +111,12 @@ async def estimate_history(
 
 @router.get("/estimates/{estimate_id}", response_model=EstimateEnvelope)
 async def get_estimate(estimate_id: str) -> EstimateEnvelope:
-    env = runtime._envelopes.get(estimate_id)
-    if env is not None:
-        return env
-    # Fall back to persisted history so a completed estimate redisplays even after a
-    # restart / in a fresh session (when Postgres is connected).
-    from db.repositories import get_estimate_envelope
-
-    data = await get_estimate_envelope(estimate_id)
-    if data is not None:
-        return EstimateEnvelope.model_validate(data)
-    raise HTTPException(404, "Estimate not found")
+    # The authoritative state: in-memory if retained, else the persisted snapshot (so a
+    # completed estimate redisplays after a restart / in a fresh session).
+    env = await runtime.resolve_envelope(estimate_id)
+    if env is None:
+        raise HTTPException(404, "Estimate not found")
+    return env
 
 
 @router.delete("/estimates/{estimate_id}", status_code=204)
@@ -141,7 +133,7 @@ async def delete_estimate(estimate_id: str) -> Response:
 
 @router.post("/estimates/{estimate_id}/answers", response_model=EstimateEnvelope)
 async def submit_answers(estimate_id: str, body: AnswerSubmission) -> EstimateEnvelope:
-    env = runtime._envelopes.get(estimate_id)
+    env = runtime.get_envelope(estimate_id)
     if env is None:
         raise HTTPException(404, "Estimate not found")
     if env.status != EstimateStatus.AWAITING_ANSWERS:
@@ -151,9 +143,7 @@ async def submit_answers(estimate_id: str, body: AnswerSubmission) -> EstimateEn
         estimate_id,
         len(body.answers),
     )
-    runtime._spawn_background(
-        runtime._resume_pass2(estimate_id, body.answers), label=f"pass2:{estimate_id}"
-    )
+    runtime.resume_pass2(estimate_id, body.answers)
     return env
 
 
@@ -168,9 +158,9 @@ async def stream_estimate(estimate_id: str):
     full copy — no event stealing. For authoritative current state use
     `GET /estimates/{estimate_id}`.
     """
-    if estimate_id not in runtime._envelopes:
+    if not runtime.has_envelope(estimate_id):
         raise HTTPException(404, "Estimate not found")
-    broker = runtime._event_streams[estimate_id]
+    broker = runtime.get_event_stream(estimate_id)
     # Subscribe and snapshot the backlog together with no `await` in between so a
     # concurrently-published event can't slip through the gap. Because asyncio is
     # single-threaded and publish() appends to history *and* fans out to every
@@ -186,7 +176,7 @@ async def stream_estimate(estimate_id: str):
             # The estimate may have been evicted or DELETEd between subscription and
             # the generator starting — short-circuit cleanly instead of KeyError'ing
             # inside the stream (mirrors the get-with-fallback pattern above).
-            env = runtime._envelopes.get(estimate_id)
+            env = runtime.get_envelope(estimate_id)
             if env is None:
                 yield {"event": "error", "data": json.dumps({"error": "Estimate not found"})}
                 return

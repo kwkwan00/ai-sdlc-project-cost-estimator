@@ -21,6 +21,8 @@ export interface WbsNewDraft {
   raw_input: string;
   tooling: string;
   codebase: CodebaseContext;
+  /** Existing/proposed technologies (estimation signal → stage3.technology_stack). */
+  technology?: string;
 }
 
 export function loadWbsNewDraft(): WbsNewDraft | null {

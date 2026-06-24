@@ -72,6 +72,22 @@ def test_build_twin_user_prompt_includes_raw_and_pass_marker() -> None:
     assert "healthcare" in prompt_p1
 
 
+def test_build_twin_user_prompt_surfaces_technology_stack() -> None:
+    from models.project_schema import Stage3Context
+
+    state = {
+        "raw_input": "Build a thing.",
+        "parsed_context": {},
+        "stage2": None,
+        "stage3": Stage3Context(technology_stack="Legacy COBOL mainframe + DB2"),
+        "clarifying_questions": [],
+    }
+    prompt = build_twin_user_prompt(state, pass_num=1)
+    # The user-specified stack reaches the twin (it's an estimation signal it may use).
+    assert "Legacy COBOL mainframe + DB2" in prompt
+    assert "technology_stack" in prompt
+
+
 def test_build_twin_user_prompt_includes_calibration_for_matching_phase() -> None:
     state = {
         "raw_input": "Build a thing.",

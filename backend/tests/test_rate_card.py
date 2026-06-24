@@ -10,10 +10,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import db.postgres_adapter as postgres_adapter
-from models.twin_outputs import RoleCategory as RC
-from models.twin_outputs import RoleSeniority as RS
-from pricing import DEFAULT_RATES, resolve_rate
-from rate_card_admin import (
+from admin.rate_card_admin import (
     CustomRoleInputRow,
     RateCardUpdate,
     RateInput,
@@ -22,6 +19,9 @@ from rate_card_admin import (
     get_role_catalog,
     update_rates,
 )
+from models.twin_outputs import RoleCategory as RC
+from models.twin_outputs import RoleSeniority as RS
+from pricing import DEFAULT_RATES, resolve_rate
 
 
 def test_resolve_rate_override_then_default() -> None:

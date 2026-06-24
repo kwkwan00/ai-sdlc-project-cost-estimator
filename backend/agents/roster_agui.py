@@ -29,9 +29,9 @@ from ag_ui.encoder import EventEncoder
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
+from agents.roster_agent import CatalogRole, proposal_to_roster, run_roster_agent
 from db.repositories import get_custom_roles, get_default_rates
 from models.project_schema import Stage2Context
-from roster_agent import CatalogRole, proposal_to_roster, run_roster_agent
 
 logger = logging.getLogger(__name__)
 

@@ -20,8 +20,7 @@ from models.estimation_state import EstimationState
 from models.twin_outputs import ClarifyingQuestion, Gap, Phase
 from observability.langfuse_wrapper import traced
 from orchestrator.llm import call_structured
-
-from ._twin_base import load_prompt
+from orchestrator.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 

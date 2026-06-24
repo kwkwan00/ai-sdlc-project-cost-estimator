@@ -187,7 +187,7 @@ def _render_estimate(est: PhaseEstimate) -> str:
 
 class _PrefillAdapter:
     async def run(self, case: EvalCase) -> AgentSample:
-        from prefill import run_prefill_agent
+        from agents.prefill import run_prefill_agent
 
         raw_input = case.input.get("raw_input", "")
         task_input = f"Extract + normalize Stage 2 context from:\n{raw_input}"
@@ -221,7 +221,7 @@ class _PrefillAdapter:
 
 class _RosterAdapter:
     async def run(self, case: EvalCase) -> AgentSample:
-        from roster_agent import CatalogRole, run_roster_agent
+        from agents.roster_agent import CatalogRole, run_roster_agent
 
         raw_input = case.input.get("raw_input", "")
         # Optional org rate-card catalog the agent may SELECT from (the roster_catalog_selection
@@ -287,7 +287,7 @@ class _RosterAdapter:
 
 class _ToolingAdapter:
     async def run(self, case: EvalCase) -> AgentSample:
-        from tooling_classifier import classify_ai_tooling
+        from agents.tooling_classifier import classify_ai_tooling
 
         description = case.input.get("description", "")
         task_input = f"Classify per-phase AI tooling levels from:\n{description}"
@@ -371,8 +371,8 @@ class _ConsolidatorAdapter:
 
 class _WbsAdapter:
     async def run(self, case: EvalCase) -> AgentSample:
+        from agents.wbs_agent import generate_wbs_tree
         from models.wbs_schema import WbsDraftRequest
-        from wbs_agent import generate_wbs_tree
 
         raw_input = case.input.get("raw_input", "")
         stage2 = _stage2_from_input(case.input)

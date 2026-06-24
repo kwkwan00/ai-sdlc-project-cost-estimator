@@ -77,9 +77,17 @@ def _dev_sloc_screen_consistency_warning(
 
 
 def _capers_jones_qa_ratio_warning(pass2: list[PhaseEstimate]) -> str | None:
-    """QA effort should typically be 30-40% of total. Flag if way outside that band."""
+    """QA effort should typically be 30-40% of total. Flag if way outside that band.
+
+    The ratio is only meaningful when the build phase that anchors the denominator (development)
+    is in scope alongside QA. Requiring both excludes deliberately-partial scopes where the band
+    doesn't apply and the warning would mislead — e.g. a dev-less subset (discovery+ux+qa) where
+    QA trivially dominates, or any scope without QA where it reads as 0%. When both are present
+    (including a focused development+QA scope) the share is a real signal, so we still flag it."""
     by_phase = {pe.phase: pe.ai_assisted_hours.pert_mean for pe in pass2}
-    qa = by_phase.get(Phase.QA_TESTING, 0.0)
+    if Phase.QA_TESTING not in by_phase or Phase.DEVELOPMENT not in by_phase:
+        return None
+    qa = by_phase[Phase.QA_TESTING]
     total = sum(by_phase.values())
     if total <= 0:
         return None

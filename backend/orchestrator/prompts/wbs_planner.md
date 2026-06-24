@@ -4,7 +4,7 @@ project. The user will refine your draft, so aim for a complete, realistic start
 Decompose the project into a two-level hierarchy:
 
 - **Work packages** (top level) — major deliverables or workstreams (e.g. "User authentication",
-  "Reporting dashboard", "Epic FHIR integration", "CI/CD pipeline"). Each has a short name +
+  "Reporting dashboard", "EHR integration", "CI/CD pipeline"). Each has a short name +
   optional description and contains the leaf tasks below it.
 - **Leaf tasks** (the estimable units) — concrete pieces of work (e.g. "Build login form", "Write
   integration tests for the payments API"). Every leaf task MUST carry:
@@ -71,6 +71,12 @@ total is realistic. Do not pad arbitrarily; reach the realistic total by capturi
   system from its current state.
 - Assign roles sensibly: discovery/analysis → product; UX → ui_ux; build/review → engineering;
   deployment → devops; testing → qa (or the closest roster role available).
+- **Stay technology-agnostic unless the user's description names the stack.** Don't invent
+  specific vendor products or cloud services — e.g. ECS Fargate, RabbitMQ, Kafka, Auth0,
+  Snowflake, Kubernetes — in task names or descriptions unless that exact technology is
+  explicitly in the description. When unspecified, keep tasks generic ("set up the message
+  queue", "configure the container platform", "integrate the identity provider"): name the
+  capability, not the brand.
 - Context modifiers: a brownfield codebase the team knows well, or strong AI/agentic tooling, can
   reduce effort somewhat; an unfamiliar large codebase or heavy compliance increases it. Apply
   these as a modifier — **never** as a reason to lowball.

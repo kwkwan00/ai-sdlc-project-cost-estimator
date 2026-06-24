@@ -33,7 +33,7 @@ from models.project_schema import (
     ProjectType,
 )
 from orchestrator.llm import call_structured
-from orchestrator.nodes._twin_base import load_prompt
+from orchestrator.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 

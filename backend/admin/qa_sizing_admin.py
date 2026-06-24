@@ -8,19 +8,19 @@ function-point-driven test points) and Test Case Point Analysis (test-case-count
 
 from __future__ import annotations
 
+from admin.sizing_method_admin import (
+    SizingMethodResponse as QaSizingResponse,
+)
+from admin.sizing_method_admin import (
+    SizingMethodUpdate as QaSizingUpdate,
+)
+from admin.sizing_method_admin import (
+    get_sizing_method,
+    update_sizing_method,
+)
 from orchestrator.nodes.qa_testing_strategist import (
     DEFAULT_QA_SIZING_METHOD,
     QA_SIZING_METHODS,
-)
-from sizing_method_admin import (
-    SizingMethodResponse as QaSizingResponse,
-)
-from sizing_method_admin import (
-    SizingMethodUpdate as QaSizingUpdate,
-)
-from sizing_method_admin import (
-    get_sizing_method,
-    update_sizing_method,
 )
 
 __all__ = [

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-import tooling_classifier as tc
+from agents import tooling_classifier as tc
 from models.project_schema import AiToolingLevel as T
 from models.project_schema import PhaseToolingLevels
 

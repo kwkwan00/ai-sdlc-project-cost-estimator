@@ -12,7 +12,7 @@ import logging
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from contingency_admin import resolve_contingency_pct
+from admin.contingency_admin import resolve_contingency_pct
 from db.repositories import (
     get_app_settings_map,
     get_calibration_for_all_phases,
@@ -21,6 +21,10 @@ from db.repositories import (
 from models.estimation_state import EstimationState
 from observability.langfuse_wrapper import traced
 from orchestrator.llm import call_structured
+from orchestrator.nodes.development_architect import DEFAULT_DEV_SIZING_METHOD
+from orchestrator.nodes.discovery_analyst import DEFAULT_DISCOVERY_SIZING_METHOD
+from orchestrator.nodes.qa_testing_strategist import DEFAULT_QA_SIZING_METHOD
+from orchestrator.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +51,6 @@ class ParsedContext(BaseModel):
         le=1,
         description="How ambiguous is the input? 1.0 = highly ambiguous, 0.0 = fully specified",
     )
-
-
-SYSTEM = """You are the intake analyst for a software project cost estimator.
-
-Read the user's raw project description and extract structured signals. Be conservative:
-when something is not stated, leave the field empty / 0 rather than guessing. The
-downstream twin agents will surface gaps and ask follow-up questions.
-
-Constrain these fields to their allowed values:
-- `project_type_hint` — exactly one of: greenfield, legacy_replacement, enhancement,
-  integration, data_migration, ai_ml_build. Default to `greenfield` if unclear.
-- `industry_hint` — a short lowercase label (e.g. healthcare, fintech, retail) or "" if unstated.
-- `ambiguity_score` — 0.0 = fully specified (explicit scope, screens, integrations), ~0.5 = partial,
-  ~0.8 = a vague one-liner. Calibrate honestly; it gates how many clarifying questions are asked.
-"""
 
 
 def _fallback_context(raw_input: str) -> dict:
@@ -136,9 +125,13 @@ def _load_sizing_methods(settings_map: dict[str, str]) -> dict[str, str]:
     resolved from a shared ``app_settings`` snapshot, each falling back to its code default.
     Returned as the state fields to splat into parse_input's result."""
     return {
-        "discovery_sizing_method": settings_map.get("discovery_sizing_method", "ucp"),
-        "development_sizing_method": settings_map.get("development_sizing_method", "cocomo"),
-        "qa_sizing_method": settings_map.get("qa_sizing_method", "tpa"),
+        "discovery_sizing_method": settings_map.get(
+            "discovery_sizing_method", DEFAULT_DISCOVERY_SIZING_METHOD
+        ),
+        "development_sizing_method": settings_map.get(
+            "development_sizing_method", DEFAULT_DEV_SIZING_METHOD
+        ),
+        "qa_sizing_method": settings_map.get("qa_sizing_method", DEFAULT_QA_SIZING_METHOD),
     }
 
 
@@ -211,7 +204,7 @@ async def extract_context_from_raw(raw_input: str) -> ParsedContext:
     user_prompt = f"Project description:\n\n{raw_input}\n\nExtract structured signals."
     try:
         return await call_structured(
-            system=SYSTEM,
+            system=load_prompt("parse_input"),
             user=user_prompt,
             response_model=ParsedContext,
             tool_name="extract_context",

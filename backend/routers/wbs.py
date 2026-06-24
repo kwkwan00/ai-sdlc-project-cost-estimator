@@ -22,19 +22,13 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, HTTPException, Response
 
 import runtime
+from agents.wbs_agent import generate_wbs_tree
 from db.neo4j_adapter import (
     delete_wbs_draft,
     get_driver,
     list_wbs_drafts,
     load_wbs_draft,
-    save_estimate_envelope,
     save_wbs_draft,
-    save_wbs_tree,
-)
-from db.repositories import (
-    get_estimate_envelope,
-    refresh_calibration_for_phase,
-    save_estimate_history,
 )
 from models.project_schema import (
     EstimateEnvelope,
@@ -43,7 +37,7 @@ from models.project_schema import (
     Stage2Context,
     Stage3Context,
 )
-from models.twin_outputs import DualScenarioEstimate, Phase
+from models.twin_outputs import DualScenarioEstimate
 from models.wbs_schema import (
     WbsCalculateRequest,
     WbsDraft,
@@ -55,7 +49,6 @@ from models.wbs_schema import (
 )
 from models.wbs_task import WbsTaskInput, flatten_tree, rebuild_tree, regenerate_ids
 from orchestrator.wbs.rollup import build_wbs_estimate
-from wbs_agent import generate_wbs_tree
 
 logger = logging.getLogger(__name__)
 
@@ -226,12 +219,9 @@ async def duplicate_from_estimate(estimate_id: str) -> WbsDraftResponse:
 
     Sources the tree + context from the envelope (in-memory or persisted `envelope_json`), so it
     works even with Neo4j off. 409 if the estimate isn't a WBS estimate."""
-    env = runtime._envelopes.get(estimate_id)
+    env = await runtime.resolve_envelope(estimate_id)
     if env is None:
-        data = await get_estimate_envelope(estimate_id)
-        if data is None:
-            raise HTTPException(404, "Estimate not found")
-        env = EstimateEnvelope.model_validate(data)
+        raise HTTPException(404, "Estimate not found")
     if env.method != "wbs" or not env.wbs_tree:
         raise HTTPException(409, "Estimate is not a WBS estimate")
     # The applied contingency rides on the final estimate; carry it so the clone matches the source.
@@ -271,18 +261,11 @@ async def preview_wbs(req: WbsCalculateRequest) -> DualScenarioEstimate:
 
     Seeds the MC off ``_stable_seed(req)`` so re-evaluating then committing the SAME tree
     yields identical numbers (see ``_stable_seed``)."""
-    return await build_wbs_estimate(req, estimate_id=_stable_seed(req))
+    from observability.correlation import bind_estimate_id
 
-
-async def _persist_neo4j_estimate(env: EstimateEnvelope, tree: list[WbsTaskInput]) -> None:
-    """Write the Estimate snapshot then attach the WBS subgraph.
-
-    `save_estimate_envelope` MERGEs the (:Estimate) node, `save_wbs_tree` then hangs the tasks off,
-    so this order matters (awaited sequentially). The snapshot dict shape is shared with the twin
-    flow via `runtime.build_estimate_snapshot`."""
-    phases = env.final_estimate.phases if env.final_estimate else []
-    await save_estimate_envelope(runtime.build_estimate_snapshot(env, raw_input="", phases=phases))
-    await save_wbs_tree(env.estimate_id, flatten_tree(tree, env.estimate_id))
+    seed = _stable_seed(req)
+    bind_estimate_id(f"wbs-preview:{seed}")
+    return await build_wbs_estimate(req, estimate_id=seed)
 
 
 @router.post("/estimates/wbs", response_model=EstimateEnvelope)
@@ -291,7 +274,10 @@ async def calculate_wbs(req: WbsCalculateRequest) -> EstimateEnvelope:
 
     Synchronous — the rollup is deterministic and fast, so unlike the twin flow there's no
     background task / SSE / interrupt. The frontend redirects to the existing review page."""
+    from observability.correlation import bind_estimate_id
+
     estimate_id = str(uuid.uuid4())
+    bind_estimate_id(estimate_id)
     # Normalize the roster BEFORE the rollup so the roster the estimate is costed against is the
     # SAME one persisted as wbs_stage2 — otherwise an empty-roster request rolls up against the
     # default team but saves the empty roster, and a later Duplicate re-rolls a different number.
@@ -314,21 +300,16 @@ async def calculate_wbs(req: WbsCalculateRequest) -> EstimateEnvelope:
         wbs_stage2=req.stage2,
         wbs_stage3=req.stage3,
     )
-    runtime._envelopes[estimate_id] = env
-    runtime._evict_if_over_capacity()
+    runtime.register_envelope(estimate_id, env, evict=True)
 
-    # Persist (Postgres history + Neo4j snapshot) and retire the source draft — three independent,
-    # best-effort writes; run them concurrently rather than serially on the commit response.
+    # Persist via the shared runtime seam — Postgres history + Neo4j snapshot + the WBS task
+    # subgraph + calibration refresh, the SAME contract as the twin flow (no duplication). Run it
+    # concurrently with retiring the source draft.
     persists: list = [
-        save_estimate_history(env, stage2=req.stage2, stage3=req.stage3),
-        _persist_neo4j_estimate(env, req.tree),
+        runtime.persist_completed_estimate(env, stage2=req.stage2, stage3=req.stage3, wbs_tree=req.tree),
     ]
     if req.draft_id:
         persists.append(delete_wbs_draft(req.draft_id))
     await asyncio.gather(*persists)
-
-    # Calibration parity with the twin flow (runtime._persist): refresh the per-phase aggregates
-    # from the just-written phase_history so WBS estimates are reflected in calibration like twins.
-    await asyncio.gather(*(refresh_calibration_for_phase(p.value) for p in Phase))
     logger.info("WBS estimate %s committed (project=%r)", estimate_id, env.project_name)
     return env

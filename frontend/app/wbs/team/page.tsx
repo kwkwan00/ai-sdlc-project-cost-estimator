@@ -108,6 +108,7 @@ export default function WbsTeamPage() {
         codebase_context: draft.codebase,
         ai_tooling_description: draft.tooling,
         ai_tooling: aiTooling,
+        technology_stack: draft.technology ?? "",
       };
       const res = await draftWbs({
         raw_input: draft.raw_input,

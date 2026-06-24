@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from rate_card_admin import RoleCatalogResponse, get_role_catalog
+from admin.rate_card_admin import RoleCatalogResponse, get_role_catalog
 
 router = APIRouter(tags=["catalog"])
 

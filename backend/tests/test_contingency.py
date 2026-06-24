@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import db.postgres_adapter as postgres_adapter
-from contingency_admin import (
+from admin.contingency_admin import (
     CONTINGENCY_BOUNDS,
     DEFAULT_CONTINGENCY_PCT,
     ContingencyUpdate,

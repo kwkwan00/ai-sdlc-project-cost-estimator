@@ -35,8 +35,8 @@ def test_streaming_endpoint_still_streams_through_middleware(
 ) -> None:
     """A pure-ASGI middleware must NOT buffer/break SSE. The AG-UI roster endpoint
     must still stream its full event sequence AND get an access-log line."""
+    from agents.roster_agent import ProposedRole, RosterProposal
     from models.twin_outputs import RoleCategory, RoleSeniority
-    from roster_agent import ProposedRole, RosterProposal
 
     async def fake_agent(stage2, raw_input: str, custom_roles=None) -> RosterProposal:
         return RosterProposal(
@@ -52,7 +52,7 @@ def test_streaming_endpoint_still_streams_through_middleware(
             ],
         )
 
-    monkeypatch.setattr("roster_agui.run_roster_agent", fake_agent)
+    monkeypatch.setattr("agents.roster_agui.run_roster_agent", fake_agent)
 
     body = {
         "threadId": "t",

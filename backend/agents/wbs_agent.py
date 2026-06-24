@@ -18,7 +18,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from functools import cache
+from pathlib import Path
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from config import get_settings
@@ -33,22 +36,26 @@ from models.twin_outputs import Phase, RoleCategory
 from models.wbs_schema import WbsDraftRequest
 from models.wbs_task import WbsTaskInput
 from orchestrator.llm import call_structured, render_context_block
-from orchestrator.nodes._twin_base import load_prompt
 from orchestrator.nodes.parse_input import ParsedContext, extract_context_from_raw
+from orchestrator.prompts import load_prompt
 from orchestrator.role_attribution import default_role_id
 
 logger = logging.getLogger(__name__)
 
-# Nominal per-phase fallback skeleton: (phase, preferred role category, 3-point hours). Used
-# when the LLM is unavailable so the editor always opens with a full-lifecycle starting point.
-_FALLBACK_SKELETON: list[tuple[Phase, RoleCategory, tuple[float, float, float]]] = [
-    (Phase.DISCOVERY, RoleCategory.PRODUCT, (8, 16, 32)),
-    (Phase.UX_DESIGN, RoleCategory.UI_UX, (8, 16, 32)),
-    (Phase.DEVELOPMENT, RoleCategory.ENGINEERING, (40, 80, 160)),
-    (Phase.CODE_REVIEW, RoleCategory.ENGINEERING, (8, 16, 24)),
-    (Phase.DEPLOYMENT, RoleCategory.DEVOPS, (8, 16, 32)),
-    (Phase.QA_TESTING, RoleCategory.QA, (16, 24, 40)),
-]
+# The per-phase fallback skeleton (used when the LLM is unavailable so the editor always opens
+# with a full-lifecycle starting point) is config, not code — it lives in the YAML below.
+_FALLBACK_PATH = Path(__file__).parent.parent / "orchestrator" / "wbs" / "fallback_skeleton.yaml"
+
+
+@cache
+def _load_fallback_config() -> dict:
+    """Load the deterministic WBS fallback skeleton from its YAML config. Degrades to an empty
+    config (a 1-task safety net kicks in) rather than crashing a draft."""
+    try:
+        return yaml.safe_load(_FALLBACK_PATH.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("WBS fallback skeleton config unreadable (%s); using a minimal skeleton", exc)
+        return {}
 
 
 class WbsPlannerLeaf(BaseModel):
@@ -226,27 +233,49 @@ def _planner_to_tree(
 
 
 def _fallback_tree(roster: RoleRoster) -> list[WbsTaskInput]:
-    """Deterministic full-lifecycle skeleton (one package + leaf per phase). LLM-free."""
+    """Deterministic full-lifecycle skeleton (one package + leaf per phase), LLM-free. The task
+    data + wording come from `orchestrator/wbs/fallback_skeleton.yaml`."""
+    cfg = _load_fallback_config()
     default_role = default_role_id(roster)
+    default_desc = str(cfg.get("default_task_description") or "Placeholder task — edit or replace.")
     leaves: list[WbsTaskInput] = []
-    for phase, category, (lo, ml, hi) in _FALLBACK_SKELETON:
+    for t in cfg.get("tasks", []):
+        phase = _coerce_phase(str(t.get("phase", "")))
+        try:
+            category = RoleCategory(str(t.get("category", "other")).strip().lower())
+        except ValueError:
+            category = RoleCategory.OTHER
         leaves.append(
             WbsTaskInput(
                 id=_new_id(),
-                name=f"{phase.value.replace('_', ' ').title()} work",
-                description="Placeholder task — edit or replace.",
+                name=str(t.get("name") or f"{phase.value.replace('_', ' ').title()} work"),
+                description=str(t.get("description") or default_desc),
                 phase=phase,
                 role_id=_role_for_category(roster, category, default_role),
-                optimistic=lo,
-                most_likely=ml,
-                pessimistic=hi,
+                optimistic=float(t.get("optimistic", 0)),
+                most_likely=float(t.get("most_likely", 0)),
+                pessimistic=float(t.get("pessimistic", 0)),
             )
         )
+    if not leaves:  # config unreadable/empty — keep the draft openable with a minimal leaf
+        leaves = [
+            WbsTaskInput(
+                id=_new_id(),
+                name="Development work",
+                description=default_desc,
+                phase=Phase.DEVELOPMENT,
+                role_id=default_role,
+                optimistic=40,
+                most_likely=80,
+                pessimistic=160,
+            )
+        ]
+    pkg = cfg.get("package") or {}
     return [
         WbsTaskInput(
             id=_new_id(),
-            name="Project work breakdown",
-            description="Auto-generated starting point — refine the tasks, hours, and roles.",
+            name=str(pkg.get("name") or "Project work breakdown"),
+            description=str(pkg.get("description") or "Auto-generated starting point."),
             children=leaves,
         )
     ]

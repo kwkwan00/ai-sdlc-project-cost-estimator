@@ -14,8 +14,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from models.project_schema import EngagementModel, ProjectType
-from prefill import (
+from agents.prefill import (
     IndustryOption,
     NormalizedProjectContext,
     RegulatoryRequirement,
@@ -24,6 +23,7 @@ from prefill import (
     _normalize_regulatory,
     _normalized_to_fields,
 )
+from models.project_schema import EngagementModel, ProjectType
 
 # ---------- _normalize_regulatory ----------
 
@@ -253,7 +253,7 @@ def test_prefill_endpoint_returns_stage2_when_agent_succeeds(
             ai_tooling_description="Claude Code for development, CodeRabbit for review",
         )
 
-    monkeypatch.setattr("prefill.run_prefill_agent", fake_agent)
+    monkeypatch.setattr("agents.prefill.run_prefill_agent", fake_agent)
 
     res = client.post(
         "/estimates/draft/prefill",
@@ -284,7 +284,7 @@ def test_prefill_endpoint_returns_defaults_when_agent_fails(
     async def failing_agent(raw_input: str) -> NormalizedProjectContext:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
 
-    monkeypatch.setattr("prefill.run_prefill_agent", failing_agent)
+    monkeypatch.setattr("agents.prefill.run_prefill_agent", failing_agent)
 
     res = client.post(
         "/estimates/draft/prefill",
@@ -303,7 +303,7 @@ def test_prefill_endpoint_returns_defaults_when_agent_fails(
 async def test_run_prefill_agent_pins_haiku_model(monkeypatch: pytest.MonkeyPatch) -> None:
     """The prefill agent must pin its configured (Haiku) model, not inherit the
     Opus ANTHROPIC_MODEL the six estimation twins use."""
-    import prefill
+    from agents import prefill
 
     captured: dict = {}
 
@@ -311,7 +311,7 @@ async def test_run_prefill_agent_pins_haiku_model(monkeypatch: pytest.MonkeyPatc
         captured.update(kwargs)
         return NormalizedProjectContext(summary="x", ambiguity_score=0.5)
 
-    monkeypatch.setattr("prefill.call_structured", fake_call_structured)
+    monkeypatch.setattr("agents.prefill.call_structured", fake_call_structured)
 
     await prefill.run_prefill_agent("Build a thing for a clinic.")
     from config import get_settings

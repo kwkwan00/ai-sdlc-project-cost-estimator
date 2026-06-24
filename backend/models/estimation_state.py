@@ -9,6 +9,7 @@ from models.project_schema import Stage2Context, Stage3Context
 from models.twin_outputs import (
     ClarifyingQuestion,
     DualScenarioEstimate,
+    Phase,
     PhaseEstimate,
 )
 
@@ -25,6 +26,10 @@ class EstimationState(TypedDict, total=False):
     raw_input: str
     stage2: Stage2Context | None
     stage3: Stage3Context
+    # Phases the user chose to estimate. Absent/empty ⇒ all six (back-compat). Set once at graph
+    # entry (single-writer, no reducer); read by the twin scaffold to skip unselected twins and
+    # by consistency_check to gate cross-phase sanity checks.
+    selected_phases: list[Phase]
 
     parsed_context: dict
     calibration_examples: list[dict]

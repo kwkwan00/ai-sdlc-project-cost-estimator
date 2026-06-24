@@ -6,6 +6,7 @@ import logging
 import math
 import os
 from collections import defaultdict
+from dataclasses import dataclass
 
 from db.repositories import get_staffing_coefficients
 from models.estimation_state import EstimationState
@@ -227,69 +228,81 @@ def _headcounts_for_target(
     return out
 
 
-async def synthesize_from_phase_estimates(
-    phases: list[PhaseEstimate],
+def _headcount_row(
+    r: CustomRole,
+    headcount: int,
     *,
-    stage2: Stage2Context | None,
-    total_cost_ai_assisted_usd: float,
-    total_cost_manual_only_usd: float,
-    contingency_pct: float = 0.0,
-    consistency_warnings: list[str] | None = None,
-) -> DualScenarioEstimate:
-    """Typed core of the synthesize tail: combine per-phase ``PhaseEstimate``s + their base labor
-    costs into the final ``DualScenarioEstimate`` (variance-combine, Brooks staffing, contingency,
-    headcount, durations). Shared by the graph node ``synthesize_estimate`` (which adapts the
-    untyped ``EstimationState``) and the WBS rollup — so neither hand-builds a state dict or needs a
-    ``# type: ignore``."""
-    pass2 = phases
-    total_cost_ai = total_cost_ai_assisted_usd
-    total_cost_manual = total_cost_manual_only_usd
-    consistency_warnings = consistency_warnings or []
-    roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
+    rates: dict[str, float],
+    ai_hours_by_role: dict[str, float],
+    manual_hours_by_role: dict[str, float],
+) -> RoleHeadcount:
+    """One staffing/cost table row for a roster role (hours × rate, both scenarios)."""
+    rate = rates.get(r.role_id, 0.0)
+    ai_h = ai_hours_by_role.get(r.role_id, 0.0)
+    manual_h = manual_hours_by_role.get(r.role_id, 0.0)
+    return RoleHeadcount(
+        role_id=r.role_id,
+        role_description=r.description,
+        category=r.category,
+        seniority=r.seniority,
+        headcount=headcount,
+        rate_per_hour=rate,
+        ai_assisted_hours=ai_h,
+        manual_only_hours=manual_h,
+        ai_assisted_cost_usd=ai_h * rate,
+        manual_only_cost_usd=manual_h * rate,
+    )
 
-    target_weeks = (stage2.target_timeline_weeks if stage2 and stage2.target_timeline_weeks else 0)
 
-    ai_range = _combine_range(pass2, ai=True)
-    manual_range = _combine_range(pass2, ai=False)
+@dataclass
+class _StaffingPlan:
+    """One coherent team: the headcount table, its size + overhead, weekly burn, and the schedule
+    (which already embeds the Brooks overhead — explicitly in the target regime, via
+    ``team_throughput``'s ``(1−o(n))`` otherwise)."""
 
-    ai_hours_by_role = _sum_hours_by_role(pass2, ai=True)
-    manual_hours_by_role = _sum_hours_by_role(pass2, ai=False)
-    rates = rate_by_role(roster)
+    headcount_rows: list[RoleHeadcount]
+    weekly_burn: float
+    team_size: int
+    optimal_team_size: int
+    overhead: float
+    duration_low: float
+    duration_high: float
 
-    def _row(r: CustomRole, headcount: int) -> RoleHeadcount:
-        rate = rates.get(r.role_id, 0.0)
-        ai_h = ai_hours_by_role.get(r.role_id, 0.0)
-        manual_h = manual_hours_by_role.get(r.role_id, 0.0)
-        return RoleHeadcount(
-            role_id=r.role_id,
-            role_description=r.description,
-            category=r.category,
-            seniority=r.seniority,
-            headcount=headcount,
-            rate_per_hour=rate,
-            ai_assisted_hours=ai_h,
-            manual_only_hours=manual_h,
-            ai_assisted_cost_usd=ai_h * rate,
-            manual_only_cost_usd=manual_h * rate,
-        )
 
-    # Team-scaling (Brooks's Law + diminishing returns), applied at the project level so the six
-    # twins stay independent. `opt` is the recommended team size (scaled to project effort); it is
-    # the no-target team, while in the target regime team_size is the deadline-derived headcount.
-    # Either way, team_size, the headcount table, the Brooks overhead, the burn, and the duration
-    # all describe ONE coherent team.
-    coeffs = await get_staffing_coefficients()
+def _resolve_staffing(
+    roster: RoleRoster,
+    *,
+    ai_hours_by_role: dict[str, float],
+    manual_hours_by_role: dict[str, float],
+    rates: dict[str, float],
+    ai_range: HourRange,
+    target_weeks: int,
+    coeffs: dict[str, float],
+) -> _StaffingPlan:
+    """Team-scaling (Brooks's Law + diminishing returns) at the project level (so the six twins stay
+    independent): the headcount table, team size, coordination overhead, weekly burn, and schedule —
+    all describing ONE coherent team. With a target timeline, headcount = deadline-derived ceilings
+    and the overhead stretches that window; otherwise the recommended team ``opt`` distributed by
+    effort share, with the duration derived from that team's throughput."""
     opt = optimal_team_size(ai_range.most_likely, WORK_HOURS_PER_WEEK, coeffs)
 
-    # Per-regime headcount: deadline-derived ceilings with a target, else the recommended team
-    # `opt` distributed across the roster by effort share (≥ 1 per active role). Both yield a
-    # {role_id: headcount} map that the shared row/burn loop below turns into the table.
+    # Per-regime headcount: deadline-derived ceilings with a target, else `opt` distributed across
+    # the roster by effort share (≥ 1 per active role). Both yield a {role_id: headcount} map.
     if target_weeks > 0:
         headcounts = _headcounts_for_target(roster, ai_hours_by_role, target_weeks)
     else:
         headcounts = _distribute_team(opt, ai_hours_by_role, roster.roles)
 
-    headcount_rows = [_row(r, headcounts.get(r.role_id, 0)) for r in roster.roles]
+    headcount_rows = [
+        _headcount_row(
+            r,
+            headcounts.get(r.role_id, 0),
+            rates=rates,
+            ai_hours_by_role=ai_hours_by_role,
+            manual_hours_by_role=manual_hours_by_role,
+        )
+        for r in roster.roles
+    ]
     weekly_burn = sum(
         headcounts.get(r.role_id, 0) * WORK_HOURS_PER_WEEK * rates.get(r.role_id, 0.0)
         for r in roster.roles
@@ -314,53 +327,133 @@ async def synthesize_from_phase_estimates(
         duration_low = ai_range.optimistic / weekly_throughput
         duration_high = ai_range.pessimistic / weekly_throughput
 
-    # Brooks coordination tax on cost (both scenarios); `commercial_processing` kept the base
-    # labor cost. Diminishing returns does NOT inflate cost — the algorithm estimates already
-    # embed a normal team's productivity (see orchestrator/staffing.py).
-    total_cost_ai *= 1.0 + overhead
-    total_cost_manual *= 1.0 + overhead
+    return _StaffingPlan(
+        headcount_rows=headcount_rows,
+        weekly_burn=weekly_burn,
+        team_size=team_size,
+        optimal_team_size=opt,
+        overhead=overhead,
+        duration_low=duration_low,
+        duration_high=duration_high,
+    )
 
-    # Contingency reserve: a deliberate, admin-set management buffer (distinct from the Monte Carlo
-    # band, which models estimation uncertainty). It uplifts BOTH cost scenarios and stretches the
-    # timeline, mirroring how Brooks overhead affects both. Hours, role-hours, and headcount are
-    # intentionally left untouched (so the twin eval rubrics are unaffected). Default 0% → no-op.
-    contingency_pct = max(0.0, contingency_pct)
+
+def _apply_cost_and_duration_uplifts(
+    *,
+    cost_ai: float,
+    cost_manual: float,
+    duration_low: float,
+    duration_high: float,
+    overhead: float,
+    contingency_pct: float,
+) -> tuple[float, float, float, float]:
+    """Apply the two project-level uplifts and return ``(cost_ai, cost_manual, dur_low, dur_high)``:
+
+    1. **Brooks coordination tax** on cost (both scenarios; ``commercial_processing`` kept the base
+       labor cost). NOT on duration — the schedule already embeds the overhead. Diminishing returns
+       does NOT inflate cost (the algorithm estimates already embed a normal team's productivity —
+       see orchestrator/staffing.py).
+    2. **Contingency reserve** — a deliberate admin-set management buffer (distinct from the Monte
+       Carlo band) on BOTH cost scenarios AND the timeline. Hours / role-hours / headcount are
+       intentionally untouched (so the twin eval rubrics are unaffected). 0% → no-op.
+
+    ``contingency_pct`` is assumed already clamped ``≥ 0`` by the caller. The operation order is
+    preserved exactly so results are bit-identical to the prior inline form."""
+    cost_ai *= 1.0 + overhead
+    cost_manual *= 1.0 + overhead
     contingency = contingency_pct / 100.0
-    total_cost_ai *= 1.0 + contingency
-    total_cost_manual *= 1.0 + contingency
+    cost_ai *= 1.0 + contingency
+    cost_manual *= 1.0 + contingency
     duration_low *= 1.0 + contingency
     duration_high *= 1.0 + contingency
+    return cost_ai, cost_manual, duration_low, duration_high
 
-    avg_confidence = (
-        sum(p.confidence for p in pass2) / len(pass2) if pass2 else 0.0
+
+async def synthesize_from_phase_estimates(
+    phases: list[PhaseEstimate],
+    *,
+    stage2: Stage2Context | None,
+    total_cost_ai_assisted_usd: float,
+    total_cost_manual_only_usd: float,
+    contingency_pct: float = 0.0,
+    consistency_warnings: list[str] | None = None,
+) -> DualScenarioEstimate:
+    """Typed core of the synthesize tail: combine per-phase ``PhaseEstimate``s + their base labor
+    costs into the final ``DualScenarioEstimate``. A thin coordinator over ``_combine_range``
+    (variance-combine), ``_resolve_staffing`` (Brooks + diminishing-returns team/headcount/schedule),
+    and ``_apply_cost_and_duration_uplifts`` (overhead + contingency). Shared by the graph node
+    ``synthesize_estimate`` (which adapts the untyped ``EstimationState``) and the WBS rollup — so
+    neither hand-builds a state dict or needs a ``# type: ignore``."""
+    pass2 = phases
+    consistency_warnings = consistency_warnings or []
+    contingency_pct = max(0.0, contingency_pct)
+    roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
+    target_weeks = stage2.target_timeline_weeks if stage2 and stage2.target_timeline_weeks else 0
+
+    ai_range = _combine_range(pass2, ai=True)
+    manual_range = _combine_range(pass2, ai=False)
+    ai_hours_by_role = _sum_hours_by_role(pass2, ai=True)
+    manual_hours_by_role = _sum_hours_by_role(pass2, ai=False)
+    rates = rate_by_role(roster)
+    coeffs = await get_staffing_coefficients()
+
+    plan = _resolve_staffing(
+        roster,
+        ai_hours_by_role=ai_hours_by_role,
+        manual_hours_by_role=manual_hours_by_role,
+        rates=rates,
+        ai_range=ai_range,
+        target_weeks=target_weeks,
+        coeffs=coeffs,
     )
+    cost_ai, cost_manual, duration_low, duration_high = _apply_cost_and_duration_uplifts(
+        cost_ai=total_cost_ai_assisted_usd,
+        cost_manual=total_cost_manual_only_usd,
+        duration_low=plan.duration_low,
+        duration_high=plan.duration_high,
+        overhead=plan.overhead,
+        contingency_pct=contingency_pct,
+    )
+
+    avg_confidence = sum(p.confidence for p in pass2) / len(pass2) if pass2 else 0.0
 
     final = DualScenarioEstimate(
         total_ai_assisted_hours=ai_range,
         total_manual_only_hours=manual_range,
         ai_hours_saved_pert=manual_range.pert_mean - ai_range.pert_mean,
-        ai_cost_saved_usd=total_cost_manual - total_cost_ai,
+        ai_cost_saved_usd=cost_manual - cost_ai,
         phases=pass2,
         confidence=avg_confidence,
         duration_weeks_low=duration_low,
         duration_weeks_high=duration_high,
-        headcount_by_role=headcount_rows,
-        weekly_burn_rate_usd=weekly_burn,
-        brooks_overhead_pct=round(overhead * 100.0, 1),
+        headcount_by_role=plan.headcount_rows,
+        weekly_burn_rate_usd=plan.weekly_burn,
+        brooks_overhead_pct=round(plan.overhead * 100.0, 1),
         contingency_pct=round(contingency_pct, 1),
-        staffing_efficiency_pct=round(staffing_efficiency(team_size, coeffs) * 100.0, 1),
-        team_size=team_size,
-        optimal_team_size=opt,
-        total_cost_ai_assisted_usd=total_cost_ai,
-        total_cost_manual_only_usd=total_cost_manual,
+        staffing_efficiency_pct=round(staffing_efficiency(plan.team_size, coeffs) * 100.0, 1),
+        team_size=plan.team_size,
+        optimal_team_size=plan.optimal_team_size,
+        total_cost_ai_assisted_usd=cost_ai,
+        total_cost_manual_only_usd=cost_manual,
         consistency_warnings=consistency_warnings,
     )
     logger.info(
-        "synthesize complete: ai_assisted=%.0fh manual_only=%.0fh (most likely) across %d phase(s); %d role(s) in headcount",
+        "synthesize determine: combined %d phase(s) [%s] → ai=%.0fh manual=%.0fh (most likely); "
+        "Brooks overhead=%.1f%% contingency=%.1f%% team_size=%d (optimal=%d) → "
+        "cost ai=$%.0f manual=$%.0f duration=%.0f–%.0fwk; %d role(s) in headcount",
+        len(pass2),
+        "MC variance-combine" if ai_range.std is not None else "comonotonic",
         ai_range.most_likely,
         manual_range.most_likely,
-        len(pass2),
-        len(headcount_rows),
+        plan.overhead * 100.0,
+        contingency_pct,
+        plan.team_size,
+        plan.optimal_team_size,
+        cost_ai,
+        cost_manual,
+        duration_low,
+        duration_high,
+        len(plan.headcount_rows),
     )
     return final
 

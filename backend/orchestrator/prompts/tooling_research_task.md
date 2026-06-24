@@ -1,0 +1,1 @@
+Then, for each tool, state in one line: what it does, which SDLC phase it serves (discovery, ux_design, development, code_review, deployment, or qa_testing), and how autonomous it is (autocomplete, chat, or agentic). If a tool genuinely cannot be found or indexed, say so.

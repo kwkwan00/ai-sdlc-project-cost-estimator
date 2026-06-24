@@ -1,0 +1,278 @@
+# Statement of Work — baseline template spec.
+#
+# Synthesized as a COMPOSITE of the executed SOWs in docs/examples/ (the numbered
+# "Master Service Agreement / Contractor" family, which carries the most complete
+# contractual structure). Boilerplate text is reproduced close to verbatim from that
+# corpus; client/project/cost specifics are tokens or agent/estimate-filled sections.
+#
+# The delivering firm's name is NOT hardcoded anywhere in code: it lives ONCE here, in
+# `branding.company`, and every other reference uses the `[COMPANY]` token (resolved to
+# `branding.company` at build time). Change `branding.company` to re-brand the whole SOW.
+#
+# Section sources:
+#   boilerplate — deterministic legal / branding wording (static; may contain [TOKENS]).
+#   llm         — project-specific prose written by the SOW agent (guidance below).
+#   estimate    — deterministic data mapped from the estimate (renderer in sow/mapper.py).
+#   hybrid      — static `bullets` PLUS the renderer's estimate-derived items.
+#
+# This file is the tunable artifact: edit wording / sections here, not in code.
+
+id: default_sow
+name: Statement of Work
+title: STATEMENT OF WORK
+
+branding:
+  # The delivering firm's name — [COMPANY] resolves to this everywhere. Set your firm here,
+  # or inject it at deploy time via the SOW_COMPANY_NAME env var (which overrides this). No
+  # specific firm is shipped in the repo.
+  company: Your Company
+  tagline: connect. build. enable.
+  commitment: >-
+    At [COMPANY], Your Success is our success. On behalf of everyone at [COMPANY], thank
+    you for the opportunity to present this Statement of Work to assist with your [YEAR]
+    initiatives and goals.
+  confidential_footer: >-
+    [COMPANY] Confidential — This document contains confidential information and is subject
+    to the terms of any applicable non-disclosure agreements.
+
+style:
+  font: Calibri
+  font_size_pt: 10
+  heading_color: "1F3864"
+  margin_inch: 1.0
+
+# Bracketed tokens. `fact_key` says where a value comes from when available:
+#   a SowClientFacts field (agent-extracted) or an `estimate.*` key (derived from the
+#   envelope). No fact_key, or no value found ⇒ the token stays literal for the user.
+# ([COMPANY] is resolved separately from branding.company, never a user placeholder.)
+placeholders:
+  - token: "[CLIENT NAME]"
+    label: Client name
+    fact_key: client_name
+  - token: "[SOW NUMBER]"
+    label: SOW number
+    fact_key: sow_number
+  - token: "[MSA DATE]"
+    label: Master Service Agreement date
+    fact_key: msa_date
+  - token: "[EFFECTIVE DATE]"
+    label: Effective date
+    fact_key: effective_date
+  - token: "[CLIENT REPRESENTATIVE]"
+    label: Client representative
+    fact_key: client_representative
+  - token: "[PROVIDER REPRESENTATIVE]"
+    label: Provider representative
+    fact_key: provider_representative
+  - token: "[YEAR]"
+    label: Initiative year
+    fact_key: estimate.year
+  - token: "[TOTAL INVESTMENT]"
+    label: Total estimated investment
+    fact_key: estimate.total_investment
+
+sections:
+  - id: cover
+    heading: ""
+    source: boilerplate
+    style: cover
+    text: >-
+      This Statement of Work (this "SOW") No. [SOW NUMBER], dated [EFFECTIVE DATE], is
+      entered into by and between [CLIENT NAME] ("[CLIENT NAME]") and [COMPANY]
+      ("Contractor") under and pursuant to that Master Service Agreement dated [MSA DATE]
+      between these Parties (the "Agreement"). The definitions, terms and conditions in
+      the Agreement will apply to this SOW. In the event of a conflict between the
+      definitions, terms and conditions in this SOW and in the Agreement, the definitions,
+      terms and conditions in this SOW will govern, supersede and control but only on the
+      Project and Services identified in this SOW.
+
+  - id: representatives
+    heading: "Project Representatives"
+    source: boilerplate
+    style: table
+    table:
+      columns: ["Client Representative", "[COMPANY] Representative"]
+      rows:
+        - ["[CLIENT REPRESENTATIVE]", "[PROVIDER REPRESENTATIVE]"]
+
+  - id: project
+    heading: "1. Project"
+    source: llm
+    style: paragraph
+    max_chars: 1200
+    guidance: >-
+      Write a one-line project title, then 2-3 sentences of business context: what
+      [CLIENT NAME] does, the business driver behind this initiative, and the outcome they
+      want. Ground every claim in the provided estimate/brief. Always refer to the client as
+      the literal token [CLIENT NAME] — never "the Client" and never a guessed name.
+    fallback: >-
+      {name}. [COMPANY] will partner with [CLIENT NAME] to deliver {name} through a
+      structured, agile engagement aligned to [CLIENT NAME]'s business goals.
+
+  - id: services
+    heading: "2. Services"
+    source: llm
+    style: paragraph
+    max_chars: 4000
+    guidance: >-
+      Write 2-4 paragraphs describing the services [COMPANY] will provide: [COMPANY]'s role
+      and expertise, the delivery approach (agile, blended local team), and how the work maps
+      to the project's delivery phases. Use a professional, partnership-oriented voice. Ground
+      everything in the provided estimate.
+    fallback: >-
+      [COMPANY] will provide a blended team of local consultants to deliver {name} across
+      {phase_list}. Work is performed iteratively using agile methodology, with regular demos
+      and close collaboration with [CLIENT NAME]'s stakeholders so scope and priorities stay
+      aligned throughout the engagement.
+
+  - id: approach
+    heading: "3. Approach"
+    source: llm
+    style: paragraph
+    max_chars: 2500
+    guidance: >-
+      Describe [COMPANY]'s delivery methodology in 1-2 paragraphs: iterative/agile cadence,
+      collaboration and communication model, and quality practices. Keep it specific to
+      this project's scope rather than generic.
+    fallback: >-
+      [COMPANY] delivers in short, iterative cycles with continuous stakeholder feedback,
+      transparent progress reporting, and engineering quality practices (code review,
+      automated testing, and CI/CD) applied throughout.
+
+  - id: activities
+    heading: "Key Activities"
+    source: llm
+    style: bullets
+    max_chars: 2000
+    guidance: >-
+      List 4-8 key activities [COMPANY] will perform, ONE PER LINE, each a short imperative
+      phrase (e.g. "Facilitate discovery workshops with key stakeholders"). Derive them
+      from the project's delivery phases. Do not number them.
+    fallback_item: "Execute the {label} workstream"
+    fallback: "Execute the agreed delivery workstreams"
+
+  - id: deliverables
+    heading: "4. Performance Standards, Schedule, and Deliverables"
+    source: llm
+    style: bullets
+    max_chars: 3000
+    guidance: >-
+      List the concrete deliverables, ONE PER LINE, each formatted as
+      "Title – one-sentence description". Derive them from the delivery phases present in
+      the estimate (e.g. discovery findings, design artifacts, implemented features,
+      test plans, deployment runbooks). Do not number them.
+    fallback_item: "{label} deliverables – the artifacts and outcomes produced during the {label} phase"
+    fallback: "Project deliverables – the agreed artifacts and outcomes for the engagement"
+
+  - id: schedule
+    heading: "Schedule & Level of Effort"
+    source: estimate
+    style: table
+    renderer: schedule_table
+
+  - id: fees
+    heading: "5. Fees"
+    source: estimate
+    style: table
+    renderer: fee_table
+
+  - id: resource_summary
+    heading: "Resource Summary"
+    source: estimate
+    style: paragraph
+    renderer: resource_summary
+
+  - id: assumptions
+    heading: "Assumptions"
+    source: hybrid
+    style: bullets
+    renderer: assumptions
+    bullets:
+      - "[CLIENT NAME] will provide timely access to business stakeholders and key users."
+      - "[CLIENT NAME] will provide timely access to any systems and/or assets needed."
+      - "[CLIENT NAME] will provide timely feedback on all deliverables tied to this Statement of Work."
+      - "The [COMPANY] team will work remotely. There may be occasional in-person meetings, but they will be kept to a minimum."
+      - "Partial hours will be pro-rated by rounding off to the nearest 1/10th of an hour. Travel time will not be included. The amount to be charged by Contractor for the Services under this SOW will not exceed [TOTAL INVESTMENT] without an approved change order."
+
+  - id: expenses
+    heading: "6. Expenses"
+    source: boilerplate
+    style: paragraph
+    text: >-
+      Check whether or not [CLIENT NAME] is required to reimburse the Contractor for
+      out-of-pocket expenses in connection with the Services under this SOW: Yes ☐  No ☐.
+      If the "no" box is checked or neither box is checked, then no additional amounts
+      will be paid or reimbursed by [CLIENT NAME] except for the Fees provided in the
+      prior Section.
+
+  - id: completion_criteria
+    heading: "Completion Criteria"
+    source: boilerplate
+    style: paragraph
+    text: >-
+      [COMPANY] shall have satisfied its responsibilities under this Statement of Work when
+      1) the Deliverables have been provided; or 2) [COMPANY] has provided the specified
+      number of person-days/hours of services; or 3) the mutually agreed upon project end
+      date expires; or (4) [CLIENT NAME] terminates this Statement of Work with a minimum
+      of fifteen (15) business days' notice, whichever occurs first. For the avoidance of
+      doubt, all invoicing by [COMPANY] and payments by [CLIENT NAME] shall operate in
+      accordance with the procedures outlined in the Agreement.
+
+  - id: change_control
+    heading: "Change Control"
+    source: boilerplate
+    style: paragraph
+    text: >-
+      If at any point it appears as though the deliverables and/or cost under this SOW
+      will require adjustments, [COMPANY] will deliver a change order to [CLIENT NAME]
+      outlining the changes in scope and/or estimates for approval. Changes to this
+      Statement of Work will be processed in accordance with the procedure described in
+      the Agreement.
+
+  - id: agreement_parameters
+    heading: "Agreement Parameters"
+    source: boilerplate
+    style: paragraph
+    text: >-
+      This Statement of Work is governed by and incorporated into the Agreement identified
+      above, which contains the general contract terms — including payment terms, intellectual
+      property rights, warranty, insurance, and confidentiality — that govern the performance
+      of the Services under this SOW. This Statement of Work and the Agreement, together with
+      any applicable Attachments, represent the complete agreement between the parties
+      regarding this engagement and supersede any prior oral or written communications. The
+      investigation and implementation of any change may result in modifications to the
+      estimated schedule, charges, or other terms of this SOW, processed in accordance with
+      the procedure described in the Agreement. Under this SOW, [COMPANY] will guide, assist,
+      and materially contribute to the Project by providing the Services and Deliverables set
+      forth herein.
+
+  - id: approval
+    heading: "Approval"
+    source: boilerplate
+    style: paragraph
+    text: |-
+      By signing below, [CLIENT NAME] and [COMPANY] agree that the complete agreement between
+      the two companies regarding these Services consists of (1) this Statement of Work, (2)
+      the [COMPANY] non-disclosure agreement (or any equivalent agreement signed by both
+      parties), and (3) the Agreement. Once signed, any reproduction of this SOW by reliable
+      means (for example, photocopy or facsimile) is considered an original, unless prohibited
+      by local law.
+
+      By signing below, [CLIENT NAME] also agrees that this proposal will become the Statement
+      of Work effective for this Project. No work shall begin under this SOW until an executed
+      SOW is returned to [COMPANY].
+
+      If [CLIENT NAME]'s internal processes require a purchase order for [COMPANY] to invoice
+      for the Services rendered under this SOW, the purchase order — which must reference SOW
+      No. [SOW NUMBER] — should be provided to [COMPANY] before work commences.
+
+  - id: signatures
+    heading: ""
+    source: boilerplate
+    style: signature_block
+    text: ""
+    signatories:
+      - party: "[CLIENT NAME]"
+        fields: ["Signature", "Name", "Title", "Date"]
+      - party: "[COMPANY]"
+        fields: ["Signature", "Name", "Title", "Date"]

@@ -817,8 +817,8 @@ async def test_upsert_reduction_bands_returns_false_when_disabled(
 
 @pytest.mark.asyncio
 async def test_admin_effective_bands_merge_db_override(in_memory_db) -> None:
+    from admin.reduction_bands_admin import get_effective_bands
     from db.repositories import upsert_reduction_bands
-    from reduction_bands_admin import get_effective_bands
 
     await upsert_reduction_bands([("development", "agentic", 0.30, 0.45)])
     resp = await get_effective_bands()

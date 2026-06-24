@@ -152,6 +152,10 @@ export const stage3Schema = z.object({
   // (all "none" until classified, so a blank description never inflates the estimate).
   ai_tooling_description: z.string().max(2000).default(""),
   ai_tooling: phaseToolingSchema.default({ ...NO_TOOLING }),
+  // Technologies the client already uses or proposes (languages, frameworks, cloud,
+  // datastores). An estimation signal the twins read, and the one place the user names
+  // their stack so the estimate may reference those specific technologies.
+  technology_stack: z.string().max(2000).default(""),
 });
 
 // Response of POST /estimates/draft/classify-tooling.
@@ -173,11 +177,30 @@ export const stage1Schema = z.object({
     .min(10, "Please describe the project in at least a sentence or two."),
 });
 
+// The six SDLC phases a user may choose to estimate (matches the backend `Phase` enum and the
+// `Phase` union in lib/types.ts). Omitted from a request ⇒ the backend estimates all six.
+export const phaseEnum = z.enum([
+  "discovery",
+  "ux_design",
+  "development",
+  "code_review",
+  "deployment",
+  "qa_testing",
+]);
+
+// Canonical source for the SDLC phase identifiers. `lib/types.ts` re-exports this `Phase` (the
+// same schema-as-source-of-truth pattern as RoleCategory/RoleSeniority), so request validation
+// (selected_phases) and every UI consumer stay in lock-step — adding a phase here updates both.
+export type Phase = z.infer<typeof phaseEnum>;
+
 export const createEstimateSchema = z.object({
   project_name: z.string().optional(),
   raw_input: z.string().min(10),
   stage2: stage2Schema.optional(),
   stage3: stage3Schema.optional(),
+  // Subset of phases to estimate; omitted ⇒ all six. The wizard sends `undefined` when the user
+  // leaves every phase selected, so existing estimate requests stay byte-identical.
+  selected_phases: z.array(phaseEnum).optional(),
 });
 
 export type Stage1Input = z.infer<typeof stage1Schema>;

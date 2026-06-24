@@ -9,7 +9,7 @@
  * create call; this means navigation flow is: 1 → 2 → 3 → POST → 4 → 5.
  */
 
-import type { Stage2Input, Stage3Input } from "./schemas";
+import type { Phase, Stage2Input, Stage3Input } from "./schemas";
 
 const KEY = (id: string) => `sdlc-est:${id}`;
 
@@ -18,6 +18,9 @@ interface WizardSession {
   project_name?: string;
   stage2?: Stage2Input;
   stage3?: Stage3Input;
+  /** Phases the user chose to estimate on the Stage 3 page. Persisted so navigating away and
+   *  back doesn't silently reset the scope to all six (which would estimate more than asked). */
+  selected_phases?: Phase[];
   /** Set when the Stage 2 values came from the LLM prefill endpoint so the
    *  Stage 2 page can surface a "Prefilled from your description" banner.
    *  Cleared once the user has visited Stage 2 (they own the values now). */

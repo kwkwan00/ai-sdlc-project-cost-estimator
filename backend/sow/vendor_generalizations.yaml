@@ -1,0 +1,33 @@
+# Deterministic vendor-name safety guard — CONFIG (data, not code).
+#
+# Each entry maps a list of vendor product / cloud-service brand names to the CAPABILITY they
+# implement. At load time (sow/vendor_guard.py) each `products` list is ASSEMBLED into a single
+# regex alternation string; any match in SOW prose is replaced by the capability, so no brand
+# the user didn't ask for appears in the document. Add a brand to a `products` list to cover it
+# — no code change.
+#
+# Notes:
+#   * `cloud_prefixes` are optional leading provider words allowed before any product
+#     (so "AWS ECS Fargate" and bare "ECS Fargate" both match).
+#   * Order matters: entries are applied top-to-bottom, so specific services come BEFORE the
+#     bare cloud-provider entry (otherwise "AWS ECS Fargate" would lose its "AWS" first).
+#   * Matching is case-insensitive; multi-word brands match across flexible whitespace.
+
+cloud_prefixes: [AWS, Amazon, Azure, Google, Apache, Microsoft]
+
+generalizations:
+  - capability: managed container orchestration
+    products: [ECS Fargate, Fargate, ECS, EKS, AKS, GKE, Kubernetes, OpenShift, K8s]
+  - capability: serverless compute
+    products: [Lambda functions, Lambda, Cloud Functions, Azure Functions]
+  - capability: message queuing
+    products: [RabbitMQ, Kafka, SQS, SNS, Pub/Sub, PubSub, Service Bus]
+  - capability: cloud data warehousing
+    products: [Snowflake, Redshift, BigQuery]
+  - capability: identity and access management
+    products: [Auth0, Okta, Cognito, Azure AD B2C, Azure AD]
+  - capability: centralized monitoring and observability
+    products: [Datadog, New Relic, Splunk, PagerDuty]
+  # Bare cloud providers — keep LAST so prefixed services above are generalized first.
+  - capability: cloud infrastructure
+    products: [Amazon Web Services, Microsoft Azure, Google Cloud Platform, Google Cloud, AWS, Azure, GCP]

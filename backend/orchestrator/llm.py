@@ -243,6 +243,25 @@ def _iter_strings(value: Any) -> list[str]:
     return []
 
 
+def _summarize_tool_args(arguments: dict | None, *, max_len: int = 80) -> str:
+    """One-line, truncated, injection-safe summary of MCP tool arguments for the tool-call log.
+
+    The arguments derive from untrusted LLM/tool text (the same reason ``_GuardedMcpSession``
+    SSRF-checks them), so never log them verbatim: collapse whitespace, truncate long strings,
+    and summarize non-strings by type. Keeps the operational log readable and non-abusable."""
+    if not arguments:
+        return "{}"
+    parts: list[str] = []
+    for k, v in arguments.items():
+        if isinstance(v, str):
+            flat = " ".join(v.split())
+            shown = flat if len(flat) <= max_len else flat[:max_len] + "…"
+            parts.append(f"{k}={shown!r}")
+        else:
+            parts.append(f"{k}=<{type(v).__name__}>")
+    return "{" + ", ".join(parts) + "}"
+
+
 class _GuardedMcpSession:
     """Wraps an MCP ``ClientSession`` for the in-process research loop so the LLM can't turn it
     into an SSRF/abuse primitive: it (1) restricts which tools may be called, (2) validates every
@@ -273,8 +292,12 @@ class _GuardedMcpSession:
 
         self._calls += 1
         if self._calls > self._max_calls:
+            logger.warning(
+                "tool call ✗ %s — docs-mcp tool-call budget exhausted (%d)", name, self._max_calls
+            )
             raise PermissionError(f"docs-mcp research tool-call budget exhausted ({self._max_calls})")
         if self._allowed is not None and name not in self._allowed:
+            logger.warning("tool call ✗ %s — not permitted in research (allowed=%s)", name, sorted(self._allowed))
             raise PermissionError(f"docs-mcp tool {name!r} is not permitted in research")
         for candidate in _iter_strings(arguments or {}):
             if looks_like_url(candidate):
@@ -283,9 +306,24 @@ class _GuardedMcpSession:
                         assert_url_allowed, candidate, allowlist=self._url_allowlist
                     )
                 except UrlNotAllowed as exc:
-                    logger.warning("docs-mcp research blocked URL in %s: %s", name, exc)
+                    logger.warning("tool call ✗ %s — blocked URL by SSRF guard: %s", name, exc)
                     raise PermissionError(f"URL blocked by SSRF guard: {exc}") from exc
-        return await self._session.call_tool(name, arguments, *args, **kwargs)
+        logger.info(
+            "tool call → %s [%d/%d] args=%s",
+            name, self._calls, self._max_calls, _summarize_tool_args(arguments),
+        )
+        started = time.perf_counter()
+        result = await self._session.call_tool(name, arguments, *args, **kwargs)
+        logger.info(
+            "tool call ✓ %s [%d/%d] latency=%dms is_error=%s content_blocks=%d",
+            name,
+            self._calls,
+            self._max_calls,
+            int((time.perf_counter() - started) * 1000),
+            getattr(result, "isError", None),
+            len(getattr(result, "content", None) or []),
+        )
+        return result
 
 
 @traced(name="claude-mcp-research", as_type="generation")
@@ -335,6 +373,10 @@ async def research_with_local_mcp(
             exposed = [
                 t for t in tools_result.tools if allowed_tools is None or t.name in allowed_tools
             ]
+            logger.info(
+                "local mcp research → model=%s exposed_tools=%s budget=%d",
+                use_model, [t.name for t in exposed], max_tool_calls,
+            )
             guarded = _GuardedMcpSession(
                 session,
                 allowed_tools=allowed_tools,
