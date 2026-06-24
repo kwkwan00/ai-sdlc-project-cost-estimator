@@ -26,7 +26,7 @@ branding:
   # or inject it at deploy time via the SOW_COMPANY_NAME env var (which overrides this). No
   # specific firm is shipped in the repo.
   company: Your Company
-  tagline: connect. build. enable.
+  tagline: Your Company Tagline
   commitment: >-
     At [COMPANY], Your Success is our success. On behalf of everyone at [COMPANY], thank
     you for the opportunity to present this Statement of Work to assist with your [YEAR]
