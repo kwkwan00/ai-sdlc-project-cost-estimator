@@ -16,6 +16,21 @@ describe("algorithmInfo", () => {
     expect(algorithmInfo("TPA_Plan_C")?.name).toBe("Test Point Analysis (TPA)");
   });
 
+  it("resolves the admin-switchable sizing-method labels (regression: these used to fall back to gray)", () => {
+    // Development: COCOMO_II ↔ FUNCTION_POINTS ↔ COSMIC_FFP.
+    expect(algorithmInfo("FUNCTION_POINTS")?.name).toBe("Function Point Analysis (IFPUG)");
+    expect(algorithmInfo("COSMIC_FFP")?.name).toBe("COSMIC Function Points (ISO 19761)");
+    // Discovery: UCP ↔ FP_ANALYSIS.
+    expect(algorithmInfo("FP_ANALYSIS")?.name).toBe("Function Point analysis effort");
+    // QA: TPA ↔ TCPA ↔ DEFECT, each with a Plan_{A,B,C} suffix.
+    expect(algorithmInfo("TCPA_Plan_A")?.name).toBe("Test Case Point Analysis (TCPA)");
+    expect(algorithmInfo("DEFECT_Plan_B")?.name).toBe("Defect-removal (Capers-Jones)");
+    // Critical substring-collision guard: "TCPA" must NOT be swallowed by the "TPA" abbr.
+    expect(algorithmInfo("TCPA_Plan_C")?.name).not.toBe("Test Point Analysis (TPA)");
+    // ...and COSMIC must not be swallowed by COCOMO, nor vice-versa.
+    expect(algorithmInfo("COCOMO_II")?.name).toBe("COCOMO II");
+  });
+
   it("is case-insensitive", () => {
     expect(algorithmInfo("fagan")?.name).toBe("Fagan inspection");
     expect(algorithmInfo("cocomo_ii")?.name).toBe("COCOMO II");

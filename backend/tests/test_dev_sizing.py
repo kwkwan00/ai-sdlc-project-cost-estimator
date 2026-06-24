@@ -24,13 +24,13 @@ from sqlalchemy.ext.asyncio import (
 )
 
 import db.postgres_adapter as postgres_adapter
-from db.orm_models import Base
-from db.repositories import get_app_setting, set_app_setting
-from dev_sizing_admin import (
+from admin.dev_sizing_admin import (
     DevSizingUpdate,
     get_dev_sizing_method,
     update_dev_sizing_method,
 )
+from db.orm_models import Base
+from db.repositories import get_app_setting, set_app_setting
 from models.project_schema import RoleRoster
 from models.twin_outputs import PhaseEstimate
 from orchestrator.montecarlo import make_rng

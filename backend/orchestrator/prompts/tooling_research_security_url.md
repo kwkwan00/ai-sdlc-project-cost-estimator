@@ -1,0 +1,1 @@
+Only retrieve PUBLIC official documentation websites for the named tools, over https; NEVER request internal hostnames, IP addresses, localhost, 169.254.x.x / cloud-metadata endpoints, or any non-documentation URL. Blocked URLs fail by design — do not retry them.

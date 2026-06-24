@@ -20,7 +20,7 @@ from pydantic import BaseModel, ValidationError
 
 from models.project_schema import AiToolingLevel, CodebaseContext, RoleRoster
 from models.twin_outputs import HourRange, Phase
-from orchestrator.ai_acceleration import effective_ai_reduction
+from orchestrator.ai_acceleration import ReductionContext, effective_ai_reduction
 from orchestrator.montecarlo import (
     DEFAULT_DRAWS,
     MCResult,
@@ -127,19 +127,17 @@ def test_reduction_prior_is_downside_weighted() -> None:
     """The reshaped AI-effectiveness prior leans toward the pessimistic (lower-reduction) side, so
     the EXPECTED realized reduction sits BELOW the deterministic point. The point (most_likely) is
     computed separately and unchanged; only the band leans down — and it still brackets the point."""
-    ctx = {
-        "phase": Phase.DEVELOPMENT,
-        "codebase": CodebaseContext.GREENFIELD,
-        "tooling": AiToolingLevel.AGENTIC,  # dev/agentic has a real band → sampler isn't constant 0
-        "roster": RoleRoster.default(),
-        "regulated": False,
-        "bands": None,
-    }
-    point = 0.55
-    r_point = effective_ai_reduction(proposed_reduction=point, **ctx)
-    sampler = make_reduction_sampler(
-        reduction_ctx=ctx, proposed_point=point, reduction_range=None
+    ctx = ReductionContext(
+        phase=Phase.DEVELOPMENT,
+        codebase=CodebaseContext.GREENFIELD,
+        tooling=AiToolingLevel.AGENTIC,  # dev/agentic has a real band → sampler isn't constant 0
+        roster=RoleRoster.default(),
+        regulated=False,
+        bands=None,
     )
+    point = 0.55
+    r_point = effective_ai_reduction(proposed_reduction=point, **ctx.reduction_kwargs())
+    sampler = make_reduction_sampler(ctx=ctx, proposed_point=point, reduction_range=None)
     rng = make_rng("reduction-skew")
     draws = [sampler(rng) for _ in range(4000)]
     assert statistics.fmean(draws) < r_point         # downside-weighted (heavier low tail)

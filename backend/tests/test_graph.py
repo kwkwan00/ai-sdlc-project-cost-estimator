@@ -12,6 +12,7 @@ import pytest
 from langgraph.types import Command
 
 from models.project_schema import Stage2Context, Stage3Context
+from models.twin_outputs import Phase
 
 
 @pytest.fixture
@@ -99,3 +100,61 @@ async def test_graph_resumes_to_final_estimate(graph) -> None:
     # Stub estimates are all positive.
     assert fe.total_ai_assisted_hours.most_likely > 0
     assert fe.total_manual_only_hours.most_likely > fe.total_ai_assisted_hours.most_likely
+
+
+@pytest.mark.asyncio
+async def test_graph_runs_only_selected_phases(graph) -> None:
+    """selected_phases restricts which twins contribute — the others return {} (no LLM call),
+    and synthesize rolls up only the chosen phases."""
+    config = {"configurable": {"thread_id": "test-subset"}}
+    initial = {
+        "estimate_id": "test-subset",
+        "project_name": "Patient portal",
+        "raw_input": "Build a HIPAA-compliant patient portal.",
+        "stage2": Stage2Context(industry="healthcare", target_timeline_weeks=20),
+        "stage3": Stage3Context(),
+        "parsed_context": {},
+        "selected_phases": [Phase.DEVELOPMENT, Phase.QA_TESTING],
+    }
+
+    result = await graph.ainvoke(initial, config=config)
+    # Only the two selected twins appended a Pass-1 estimate; the other four returned {}.
+    assert {p.phase for p in result["pass1_estimates"]} == {Phase.DEVELOPMENT, Phase.QA_TESTING}
+
+    final = await graph.ainvoke(Command(resume={"answers": {}}), config=config)
+    fe = final["final_estimate"]
+    assert fe is not None
+    assert {p.phase for p in fe.phases} == {Phase.DEVELOPMENT, Phase.QA_TESTING}
+    # Project total == Σ of just the selected phases' mids (the load-bearing invariant survives).
+    assert fe.total_ai_assisted_hours.most_likely == pytest.approx(
+        sum(p.ai_assisted_hours.most_likely for p in fe.phases)
+    )
+    assert fe.total_manual_only_hours.most_likely > fe.total_ai_assisted_hours.most_likely
+
+
+@pytest.mark.asyncio
+async def test_graph_single_phase_subset_synthesizes_cleanly(graph) -> None:
+    """The degenerate single-phase case must reach a finite, positive final estimate end-to-end.
+
+    NOTE: the graph fixture forces every twin onto its stub path (``HourRange.std is None``), so
+    this exercises synthesize's comonotonic combine + the staffing model for one phase. The
+    single-phase *variance-combine* (lognormal) branch is covered directly by
+    ``test_phase_selection.test_combine_range_single_phase_variance_path_is_finite``."""
+    config = {"configurable": {"thread_id": "test-single"}}
+    initial = {
+        "estimate_id": "test-single",
+        "project_name": "Patient portal",
+        "raw_input": "Build a HIPAA-compliant patient portal.",
+        "stage2": Stage2Context(industry="healthcare", target_timeline_weeks=20),
+        "stage3": Stage3Context(),
+        "parsed_context": {},
+        "selected_phases": [Phase.DEVELOPMENT],
+    }
+    await graph.ainvoke(initial, config=config)
+    final = await graph.ainvoke(Command(resume={"answers": {}}), config=config)
+
+    fe = final["final_estimate"]
+    assert fe is not None
+    assert {p.phase for p in fe.phases} == {Phase.DEVELOPMENT}
+    assert fe.total_ai_assisted_hours.most_likely > 0
+    assert fe.team_size >= 1

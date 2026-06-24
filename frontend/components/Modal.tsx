@@ -7,11 +7,13 @@ interface Props {
   onClose: () => void;
   title: string;
   children: ReactNode;
+  /** Tailwind max-width class for the panel (default "max-w-2xl"). */
+  widthClass?: string;
 }
 
 /** Lightweight, dependency-free modal: backdrop, centered scrollable panel,
  *  closes on Escape or backdrop click. */
-export function Modal({ open, onClose, title, children }: Props) {
+export function Modal({ open, onClose, title, children, widthClass = "max-w-2xl" }: Props) {
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -41,7 +43,9 @@ export function Modal({ open, onClose, title, children }: Props) {
         onClick={onClose}
         aria-hidden="true"
       />
-      <div className="relative z-10 max-h-[85vh] w-full max-w-2xl overflow-y-auto rounded-xl bg-white p-5 shadow-xl">
+      <div
+        className={`relative z-10 max-h-[85vh] w-full ${widthClass} overflow-y-auto rounded-xl bg-white p-5 shadow-xl`}
+      >
         <div className="mb-3 flex items-start justify-between gap-4">
           <h2 className="section-title">{title}</h2>
           <button

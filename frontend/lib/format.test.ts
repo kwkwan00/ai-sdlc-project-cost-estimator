@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  formatDate,
   formatHours,
   formatPct,
   formatTokens,
@@ -40,6 +41,19 @@ describe("formatUSDPrecise", () => {
     expect(formatUSDPrecise(0.0051)).toBe("$0.01");
     expect(formatUSDPrecise(0)).toBe("$0.00");
     expect(formatUSDPrecise(12345)).toBe("$12,345");
+  });
+});
+
+describe("formatDate", () => {
+  it("returns '' for null or invalid input", () => {
+    expect(formatDate(null)).toBe("");
+    expect(formatDate("not-a-date")).toBe("");
+  });
+
+  it("formats a valid ISO string via toLocaleString", () => {
+    const iso = "2026-06-15T12:00:00.000Z";
+    expect(formatDate(iso)).toBe(new Date(iso).toLocaleString());
+    expect(formatDate(iso)).not.toBe("");
   });
 });
 

@@ -25,7 +25,7 @@ from evals.synthetic import (
     generate_cases_by_agent,
 )
 from models.twin_outputs import Phase
-from orchestrator.ai_acceleration import effective_ai_reduction
+from orchestrator.ai_acceleration import ReductionContext, effective_ai_reduction
 from orchestrator.montecarlo import make_rng
 from orchestrator.nodes import (
     code_review_sentinel,
@@ -196,16 +196,16 @@ def test_true_inputs_produce_band_bracketing_gold(phase: Phase) -> None:
             proposed_reduction=_proposed_reduction_for(proj, phase),
             regulated=proj.regulated,
         )
-        reduction_ctx = {
-            "phase": phase,
-            "codebase": proj.codebase,
-            "tooling": proj.tooling[phase],
-            "roster": proj.roster,
-            "regulated": proj.regulated,
-            "bands": None,
-        }
+        reduction_ctx = ReductionContext(
+            phase=phase,
+            codebase=proj.codebase,
+            tooling=proj.tooling[phase],
+            roster=proj.roster,
+            regulated=proj.regulated,
+            bands=None,
+        )
         sampler = make_reduction_sampler(
-            reduction_ctx=reduction_ctx,
+            ctx=reduction_ctx,
             proposed_point=_proposed_reduction_for(proj, phase),
             reduction_range=None,
         )

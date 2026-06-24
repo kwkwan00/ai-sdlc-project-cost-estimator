@@ -24,7 +24,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from db.neo4j_adapter import save_estimate_envelope
+from db.neo4j_adapter import save_estimate_envelope, save_wbs_tree
 from db.repositories import refresh_calibration_for_phase, save_estimate_history
 from models.project_schema import (
     EstimateEnvelope,
@@ -135,6 +135,73 @@ def remove_estimate(estimate_id: str) -> None:
     _llm_usage.pop(estimate_id, None)
 
 
+# --- Public API for the HTTP layer (routers) ---------------------------------------------
+# Routers use these instead of reaching into the private registries / coroutines, so the
+# in-memory state stays owned by runtime and the module boundary is explicit.
+
+
+def get_envelope(estimate_id: str) -> EstimateEnvelope | None:
+    """The in-memory envelope for an estimate, or None when it isn't retained here (the
+    caller then falls back to persisted history)."""
+    return _envelopes.get(estimate_id)
+
+
+def has_envelope(estimate_id: str) -> bool:
+    return estimate_id in _envelopes
+
+
+def register_envelope(
+    estimate_id: str,
+    env: EstimateEnvelope,
+    *,
+    with_event_stream: bool = False,
+    evict: bool = False,
+) -> None:
+    """Store a new estimate envelope in the in-memory registry. Optionally create its SSE
+    event broker (the twin flow streams) and/or evict the oldest non-in-flight entry over
+    capacity (the WBS commit path, which doesn't go through `_run_graph_phase`)."""
+    _envelopes[estimate_id] = env
+    if with_event_stream:
+        _event_streams[estimate_id] = _EventBroker()
+    if evict:
+        _evict_if_over_capacity()
+
+
+def get_event_stream(estimate_id: str) -> _EventBroker:
+    """The SSE event broker for an estimate. Callers gate on `has_envelope` first."""
+    return _event_streams[estimate_id]
+
+
+def spawn_background(coro: Any, *, label: str) -> asyncio.Task:
+    """Schedule a fire-and-forget coroutine with a retained reference + escaped-exception
+    logging (never use a bare `asyncio.create_task`)."""
+    return _spawn_background(coro, label=label)
+
+
+def start_pass1(estimate_id: str, initial_state: dict[str, Any]) -> None:
+    """Kick off Pass 1 for a freshly-created estimate in the background."""
+    _spawn_background(_run_pass1(estimate_id, initial_state), label=f"pass1:{estimate_id}")
+
+
+def resume_pass2(estimate_id: str, answers: dict[str, str]) -> None:
+    """Resume the interrupted graph with the user's Stage-4 answers (runs Pass 2)."""
+    _spawn_background(_resume_pass2(estimate_id, answers), label=f"pass2:{estimate_id}")
+
+
+async def resolve_envelope(estimate_id: str) -> EstimateEnvelope | None:
+    """The authoritative current envelope: the in-memory copy if retained, else the persisted
+    Postgres ``envelope_json`` snapshot (so a completed estimate resolves after a restart /
+    eviction / in a fresh session). Returns None when neither has it. This is the single
+    in-memory→Postgres fallback the read/duplicate/export routes share."""
+    env = _envelopes.get(estimate_id)
+    if env is not None:
+        return env
+    from db.repositories import get_estimate_envelope
+
+    data = await get_estimate_envelope(estimate_id)
+    return EstimateEnvelope.model_validate(data) if data is not None else None
+
+
 def _evict_if_over_capacity() -> None:
     """Drop the oldest non-in-flight estimates once the registry is over capacity.
 
@@ -227,10 +294,12 @@ async def _run_graph_phase(
     inputs, and the usage-retention rule differ between Pass 1 and Pass 2 — everything else
     was byte-identical and lives here.
     """
+    from observability.correlation import bind_estimate_id
     from orchestrator.usage import bind_usage_accumulator
 
     env = _envelopes[estimate_id]
     try:
+        bind_estimate_id(estimate_id)
         bind_usage_accumulator(_llm_usage.setdefault(estimate_id, []))
         env.status = running_status
         await _emit(estimate_id, "status", {"status": env.status.value})
@@ -246,8 +315,11 @@ async def _run_graph_phase(
         logger.exception(fail_log)
         await _emit(estimate_id, "error", {"message": str(exc)})
     finally:
-        await _persist(
-            env, persist["raw_input"], stage2=persist["stage2"], stage3=persist["stage3"]
+        await persist_completed_estimate(
+            env,
+            raw_input=persist["raw_input"],
+            stage2=persist["stage2"],
+            stage3=persist["stage3"],
         )
         if not keep_usage_when(env.status):
             _llm_usage.pop(estimate_id, None)
@@ -337,57 +409,76 @@ async def _resume_pass2(estimate_id: str, answers: dict[str, str]) -> None:
     )
 
 
-async def _persist(
+def build_estimate_snapshot(
+    env: EstimateEnvelope, *, raw_input: str, phases: list
+) -> dict[str, Any]:
+    """The denormalized dict ``neo4j_adapter.save_estimate_envelope`` consumes (one Estimate node +
+    its Phase nodes). Shared by the twin persistence path (``_persist``) and the WBS commit so the
+    snapshot shape stays in one place."""
+    return {
+        "estimate_id": env.estimate_id,
+        "project_name": env.project_name,
+        "status": env.status.value,
+        "raw_input": raw_input,
+        "phases": [
+            {
+                "phase": p.phase.value,
+                "twin_name": p.twin_name,
+                "algorithm": p.algorithm,
+                "ai_mid": p.ai_assisted_hours.most_likely,
+                "manual_mid": p.manual_only_hours.most_likely,
+                "confidence": p.confidence,
+            }
+            for p in phases
+        ],
+    }
+
+
+async def persist_completed_estimate(
     env: EstimateEnvelope,
-    raw_input: str,
     *,
+    raw_input: str = "",
     stage2: Stage2Context | None,
     stage3: Stage3Context | None,
+    wbs_tree: list | None = None,
 ) -> None:
-    """Persist the envelope to both Neo4j (graph snapshot) and Postgres (history).
+    """Persist an estimate to both stores + refresh calibration — the single fan-out shared by the
+    twin flow and the WBS commit (so neither re-implements the persist/calibration contract).
 
-    Both writes are best-effort — failures are logged inside the adapters and
-    don't propagate so the HTTP layer never fails because of persistence.
-    """
-    # Neo4j — graph snapshot for the calibration/history features.
-    save_estimate_envelope(
-        {
-            "estimate_id": env.estimate_id,
-            "project_name": env.project_name,
-            "status": env.status.value,
-            "raw_input": raw_input,
-            "phases": [
-                {
-                    "phase": p.phase.value,
-                    "twin_name": p.twin_name,
-                    "algorithm": p.algorithm,
-                    "ai_mid": p.ai_assisted_hours.most_likely,
-                    "manual_mid": p.manual_only_hours.most_likely,
-                    "confidence": p.confidence,
-                }
-                for p in (env.pass2_estimates or env.pass1_estimates)
-            ],
-        }
+    * **Neo4j**: the denormalized Estimate+Phase snapshot, plus (WBS only) the task subgraph hung
+      off the Estimate node (``wbs_tree`` → ``save_wbs_tree``; the envelope MERGE must precede it).
+    * **Postgres**: denormalized history; and on ``COMPLETED`` a refresh of the per-phase
+      calibration aggregates (so WBS estimates feed calibration exactly like twins).
+
+    All best-effort — failures are logged and don't propagate, so the HTTP layer never fails on
+    persistence. The two stores are written concurrently (they're independent)."""
+    # Twin estimates carry their phases on pass2/pass1; WBS estimates carry them on final_estimate.
+    phases = (
+        env.pass2_estimates
+        or env.pass1_estimates
+        or (env.final_estimate.phases if env.final_estimate else [])
     )
 
-    # Postgres — denormalized history + refresh of twin calibration aggregates.
-    try:
-        await save_estimate_history(env, stage2=stage2, stage3=stage3)
-        if env.status == EstimateStatus.COMPLETED:
-            # Iterate the Phase enum so a future 7th twin is picked up automatically
-            # instead of silently missing calibration refresh. The per-phase refreshes
-            # write disjoint rows, so run them concurrently.
-            await asyncio.gather(
-                *(refresh_calibration_for_phase(phase.value) for phase in Phase)
-            )
-            logger.info(
-                "estimate %s: history persisted + calibration refreshed", env.estimate_id
-            )
-        else:
-            logger.debug(
-                "estimate %s: history persisted (status=%s)",
-                env.estimate_id,
-                env.status.value,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Postgres history write failed (%s); continuing", exc)
+    async def _graph() -> None:
+        await save_estimate_envelope(build_estimate_snapshot(env, raw_input=raw_input, phases=phases))
+        if wbs_tree is not None:
+            from models.wbs_task import flatten_tree
+
+            await save_wbs_tree(env.estimate_id, flatten_tree(wbs_tree, env.estimate_id))
+
+    async def _history() -> None:
+        try:
+            await save_estimate_history(env, stage2=stage2, stage3=stage3)
+            if env.status == EstimateStatus.COMPLETED:
+                # Iterate the Phase enum so a future 7th twin is picked up automatically instead of
+                # silently missing calibration refresh. The per-phase refreshes write disjoint rows.
+                await asyncio.gather(*(refresh_calibration_for_phase(phase.value) for phase in Phase))
+                logger.info("estimate %s: history persisted + calibration refreshed", env.estimate_id)
+            else:
+                logger.debug(
+                    "estimate %s: history persisted (status=%s)", env.estimate_id, env.status.value
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Postgres history write failed (%s); continuing", exc)
+
+    await asyncio.gather(_graph(), _history())

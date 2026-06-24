@@ -232,10 +232,13 @@ async def test_merge_pass1_skips_llm_below_candidate_threshold(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_consistency_warns_when_qa_share_is_below_15_percent() -> None:
+    # The QA-share heuristic is whole-lifecycle, so it requires ≥3 phases present (see
+    # _capers_jones_qa_ratio_warning); a realistic spread keeps QA the offending ~4%.
     state = {
         "pass2_estimates": [
             _phase(Phase.DEVELOPMENT, ai_mid=1000),
-            _phase(Phase.QA_TESTING, ai_mid=50),  # ~5% — too low
+            _phase(Phase.CODE_REVIEW, ai_mid=100),
+            _phase(Phase.QA_TESTING, ai_mid=50),  # ~4% of total — too low
         ]
     }
     result = await consistency_check(state)
@@ -249,7 +252,8 @@ async def test_consistency_warns_when_qa_share_is_above_55_percent() -> None:
     state = {
         "pass2_estimates": [
             _phase(Phase.DEVELOPMENT, ai_mid=100),
-            _phase(Phase.QA_TESTING, ai_mid=200),  # ~67%
+            _phase(Phase.UX_DESIGN, ai_mid=30),
+            _phase(Phase.QA_TESTING, ai_mid=250),  # ~66% of total
         ]
     }
     result = await consistency_check(state)
@@ -262,11 +266,46 @@ async def test_consistency_emits_no_warning_when_qa_share_is_healthy() -> None:
     state = {
         "pass2_estimates": [
             _phase(Phase.DEVELOPMENT, ai_mid=600),
-            _phase(Phase.QA_TESTING, ai_mid=300),  # 33%
+            _phase(Phase.CODE_REVIEW, ai_mid=100),
+            _phase(Phase.QA_TESTING, ai_mid=300),  # 30% of total — healthy
         ]
     }
     result = await consistency_check(state)
     assert result["consistency_warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_consistency_qa_ratio_suppressed_without_development_or_qa() -> None:
+    # The QA-share ratio is only meaningful when development (the denominator anchor) and QA are
+    # both in scope. Partial scopes missing either must not emit the anomaly warning.
+    # (a) development with no QA selected — would otherwise read as "QA share 0%".
+    only_dev = {"pass2_estimates": [_phase(Phase.DEVELOPMENT, ai_mid=1000)]}
+    assert (await consistency_check(only_dev))["consistency_warnings"] == []
+
+    # (b) a dev-less subset (discovery + ux_design + qa_testing) where QA trivially dominates —
+    #     would otherwise misfire as "QA share unusually high" even though there's no build phase.
+    no_dev = {
+        "pass2_estimates": [
+            _phase(Phase.DISCOVERY, ai_mid=40),
+            _phase(Phase.UX_DESIGN, ai_mid=30),
+            _phase(Phase.QA_TESTING, ai_mid=250),  # ~78%, but no development in scope
+        ]
+    }
+    assert (await consistency_check(no_dev))["consistency_warnings"] == []
+
+
+@pytest.mark.asyncio
+async def test_consistency_warns_on_focused_dev_qa_scope_with_bad_ratio() -> None:
+    # A deliberate development+QA-only scope still has a meaningful QA share (development anchors
+    # the denominator), so an off-band ratio is a real signal and is flagged.
+    state = {
+        "pass2_estimates": [
+            _phase(Phase.DEVELOPMENT, ai_mid=1000),
+            _phase(Phase.QA_TESTING, ai_mid=50),  # ~5% — too low
+        ]
+    }
+    warnings = (await consistency_check(state))["consistency_warnings"]
+    assert any("QA share" in w for w in warnings)
 
 
 def _dev_with_ksloc(ksloc: float) -> PhaseEstimate:

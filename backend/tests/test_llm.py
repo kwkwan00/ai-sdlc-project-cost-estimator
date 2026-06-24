@@ -425,3 +425,46 @@ async def test_guard_delegates_unknown_attrs() -> None:
     fake = _FakeMcpSession()
     g = _guard(fake)
     assert await g.list_tools() == "TOOLS"
+
+
+# ---------- tool-call logging ----------
+
+
+def test_summarize_tool_args_is_injection_safe_and_truncated() -> None:
+    from orchestrator.llm import _summarize_tool_args
+
+    assert _summarize_tool_args(None) == "{}"
+    assert _summarize_tool_args({}) == "{}"
+    # whitespace/newlines collapsed; long strings truncated with an ellipsis.
+    out = _summarize_tool_args({"query": "claude  code\nguide"}, max_len=80)
+    assert out == "{query='claude code guide'}"
+    long = _summarize_tool_args({"q": "x" * 200}, max_len=10)
+    assert long == "{q='" + "x" * 10 + "…'}"
+    # non-string values are summarized by type, never dumped verbatim.
+    assert _summarize_tool_args({"n": 5, "items": [1, 2]}) == "{n=<int>, items=<list>}"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_logs_invocation_and_result(caplog) -> None:
+    import logging
+
+    fake = _FakeMcpSession()
+    g = _guard(fake, allowed=frozenset({"search_docs"}))
+    with caplog.at_level(logging.INFO, logger="orchestrator.llm"):
+        await g.call_tool("search_docs", {"query": "claude code"})
+    msgs = " ".join(r.getMessage() for r in caplog.records)
+    assert "tool call → search_docs [1/10]" in msgs
+    assert "args={query='claude code'}" in msgs
+    assert "tool call ✓ search_docs [1/10]" in msgs
+
+
+@pytest.mark.asyncio
+async def test_blocked_tool_call_logs_warning(caplog) -> None:
+    import logging
+
+    fake = _FakeMcpSession()
+    g = _guard(fake, allowed=frozenset({"search_docs"}))
+    with caplog.at_level(logging.WARNING, logger="orchestrator.llm"):
+        with pytest.raises(PermissionError):
+            await g.call_tool("fetch_url", {"url": "https://8.8.8.8"})
+    assert any("tool call ✗ fetch_url" in r.getMessage() for r in caplog.records)

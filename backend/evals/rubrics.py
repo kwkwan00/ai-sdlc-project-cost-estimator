@@ -784,6 +784,26 @@ def _score_staffing_adequacy(sample: AgentSample) -> RubricScore:
                  "no role over 60%.")
 
 
+def _score_roster_catalog_selection(sample: AgentSample) -> RubricScore:
+    """When the case supplies an org catalog and a gold ``expected_catalog_role_id``, assert the
+    agent actually SELECTED that predefined role (set some role's ``catalog_role_id`` to it). Skips
+    when there's no gold target or no LLM output (e.g. CI without an API key) — it gates the
+    deliberate-selection behavior only when there's something to check."""
+    rubric: RubricName = "roster_catalog_selection"
+    gold_id = sample.gold.get("expected_catalog_role_id")
+    if not gold_id:
+        return _skip(rubric, "No expected_catalog_role_id in gold.")
+    obj = sample.output_obj
+    if sample.error or obj is None:
+        return _skip(rubric, f"No roster output to check (error={sample.error}).")
+    roles = getattr(obj, "roles", None) or []
+    selected = {getattr(r, "catalog_role_id", None) for r in roles}
+    if gold_id in selected:
+        return _pass(rubric, f"Agent selected catalog role {gold_id!r}.")
+    chosen = sorted(s for s in selected if s)
+    return _fail(rubric, f"Agent did not select catalog role {gold_id!r}; selections={chosen}.")
+
+
 # --------------------------------------------------------------------------- #
 # classification_accuracy + enum_constraint_adherence (deterministic, tooling)
 # --------------------------------------------------------------------------- #
@@ -972,6 +992,54 @@ def _score_partition_correctness(sample: AgentSample) -> RubricScore:
 
 
 # --------------------------------------------------------------------------- #
+# wbs_structural (deterministic) — WBS planner
+# --------------------------------------------------------------------------- #
+
+_WBS_MIN_LEAVES = 3
+_WBS_MIN_PHASES = 2
+
+
+def _score_wbs_structural(sample: AgentSample) -> RubricScore:
+    """Validate the planner's WBS tree is a usable, well-formed decomposition: enough leaf tasks
+    spanning multiple phases, and every leaf carries a phase, a roster ``role_id``, and a positive,
+    PERT-ordered 3-point estimate. Runs offline (the planner always yields a tree — the deterministic
+    fallback when no API key), so it's a real CI gate on both the fallback and the live output."""
+    rubric: RubricName = "wbs_structural"
+    tree = sample.output_obj
+    if sample.error or not tree:
+        return _fail(rubric, f"No WBS tree to validate (error={sample.error}).")
+    from models.wbs_task import iter_leaves
+
+    leaves = list(iter_leaves(tree))
+    if len(leaves) < _WBS_MIN_LEAVES:
+        return _fail(rubric, f"Too few leaf tasks ({len(leaves)}); a usable WBS has ≥{_WBS_MIN_LEAVES}.")
+
+    roster_ids = set(sample.eval_context.get("roster_role_ids") or [])
+    problems: list[str] = []
+    phases: set[str] = set()
+    for leaf in leaves:
+        if leaf.phase is None:
+            problems.append(f"{leaf.id}: no phase")
+        else:
+            phases.add(leaf.phase.value)
+        if roster_ids and leaf.role_id not in roster_ids:
+            problems.append(f"{leaf.id}: role_id {leaf.role_id!r} not in roster")
+        o, m, p = leaf.optimistic, leaf.most_likely, leaf.pessimistic
+        if None in (o, m, p) or not (0 < o <= m <= p):  # type: ignore[operator]
+            problems.append(f"{leaf.id}: non-positive / unordered hours {o}/{m}/{p}")
+    if len(phases) < _WBS_MIN_PHASES:
+        problems.append(f"only {len(phases)} distinct phase(s); expected ≥{_WBS_MIN_PHASES}")
+
+    if problems:
+        return _fail(rubric, "; ".join(problems[:5]))
+    return _pass(
+        rubric,
+        f"{len(leaves)} leaves across {len(phases)} phases; all carry phase + roster role + "
+        "ordered positive PERT.",
+    )
+
+
+# --------------------------------------------------------------------------- #
 # consistency (deterministic, multi-sample) — twins + tooling
 # --------------------------------------------------------------------------- #
 
@@ -1089,9 +1157,11 @@ _DETERMINISTIC = {
     "interval_calibration": _score_interval_calibration,
     "extraction_accuracy": _score_extraction_accuracy,
     "staffing_adequacy": _score_staffing_adequacy,
+    "roster_catalog_selection": _score_roster_catalog_selection,
     "classification_accuracy": _score_classification_accuracy,
     "enum_constraint_adherence": _score_enum_constraint_adherence,
     "partition_correctness": _score_partition_correctness,
+    "wbs_structural": _score_wbs_structural,
 }
 
 

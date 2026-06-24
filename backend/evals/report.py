@@ -18,9 +18,11 @@ _RUBRIC_ORDER: list[RubricName] = [
     "consistency",
     "extraction_accuracy",
     "staffing_adequacy",
+    "roster_catalog_selection",
     "classification_accuracy",
     "enum_constraint_adherence",
     "partition_correctness",
+    "wbs_structural",
     "plan_quality",
     "summarization",
 ]
@@ -36,9 +38,11 @@ _SHORT = {
     "consistency": "consist",
     "extraction_accuracy": "extract",
     "staffing_adequacy": "staff",
+    "roster_catalog_selection": "cat_sel",
     "classification_accuracy": "classif",
     "enum_constraint_adherence": "enum",
     "partition_correctness": "partn",
+    "wbs_structural": "wbs_str",
     "plan_quality": "plan_q",
     "summarization": "summ",
 }

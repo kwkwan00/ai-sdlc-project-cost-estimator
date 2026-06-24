@@ -37,7 +37,12 @@ from db.repositories.history import (
     list_estimate_history,
     save_estimate_history,
 )
-from db.repositories.rates import get_default_rates, upsert_default_rates
+from db.repositories.rates import (
+    CustomRoleRecord,
+    get_custom_roles,
+    get_default_rates,
+    replace_rate_card,
+)
 from db.repositories.staffing import (
     get_staffing_coefficients,
     upsert_staffing_coefficients,
@@ -62,7 +67,10 @@ __all__ = [
     "upsert_staffing_coefficients",
     # default rate card
     "get_default_rates",
-    "upsert_default_rates",
+    # custom rate-card roles
+    "CustomRoleRecord",
+    "get_custom_roles",
+    "replace_rate_card",
     # generic app settings
     "get_app_setting",
     "get_app_settings_map",

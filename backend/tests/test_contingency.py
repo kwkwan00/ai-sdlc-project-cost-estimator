@@ -12,13 +12,24 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import db.postgres_adapter as postgres_adapter
-from contingency_admin import (
+from admin.contingency_admin import (
     CONTINGENCY_BOUNDS,
     DEFAULT_CONTINGENCY_PCT,
     ContingencyUpdate,
     get_contingency,
+    resolve_contingency_pct,
     update_contingency,
 )
+
+
+def test_resolve_contingency_pct_parses_floors_and_ceils() -> None:
+    # The single read path shared by the admin GET, parse_input, and the WBS rollup: parse + clamp.
+    assert resolve_contingency_pct("12.5") == 12.5
+    assert resolve_contingency_pct(30.0) == 30.0
+    assert resolve_contingency_pct("-5") == 0.0       # floor at 0
+    assert resolve_contingency_pct("250") == 100.0    # ceil at 100 (legacy/hand-edited row)
+    assert resolve_contingency_pct("nonsense") == DEFAULT_CONTINGENCY_PCT
+    assert resolve_contingency_pct(None) == DEFAULT_CONTINGENCY_PCT
 
 
 @pytest.mark.asyncio

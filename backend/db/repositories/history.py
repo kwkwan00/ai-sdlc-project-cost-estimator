@@ -198,6 +198,10 @@ async def list_estimate_history(limit: int = 50, offset: int = 0) -> list[dict[s
             "estimate_id": r.id,
             "project_name": r.project_name,
             "status": r.status,
+            # The estimation flow that produced this row, read off the stored envelope JSON
+            # (defaulting to "twins" for pre-WBS rows). Lets the dashboard badge WBS estimates
+            # and offer the WBS-only "Duplicate" action without a schema migration.
+            "method": (r.envelope_json or {}).get("method", "twins"),
             "industry": r.industry,
             "project_type": r.project_type,
             "total_ai_assisted_hours": r.total_ai_assisted_mid_hours,

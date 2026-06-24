@@ -18,6 +18,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import db.postgres_adapter as postgres_adapter
+from admin.qa_sizing_admin import (
+    QaSizingUpdate,
+    get_qa_sizing_method,
+    update_qa_sizing_method,
+)
 from models.project_schema import RoleRoster
 from models.twin_outputs import PhaseEstimate
 from orchestrator.montecarlo import Range3, make_rng
@@ -35,11 +40,6 @@ from orchestrator.nodes.qa_testing_strategist import (
     compute_test_case_points,
     resolve_defect_density,
     resolve_test_cases,
-)
-from qa_sizing_admin import (
-    QaSizingUpdate,
-    get_qa_sizing_method,
-    update_qa_sizing_method,
 )
 
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   getContingency,
@@ -17,14 +17,26 @@ import {
   saveQaSizingMethod,
   saveReductionBands,
   saveStaffingCoefficients,
+  type CustomRoleRow,
   type RateRow,
   type ReductionBandRow,
   type SizingMethodResponse,
   type StaffingCoefficientRow,
 } from "@/lib/api-client";
 import { Tabs, type TabItem } from "@/components/Tabs";
-import { ROLE_CATEGORY_LABELS, ROLE_SENIORITY_LABELS } from "@/lib/schemas";
+import {
+  ROLE_CATEGORY_LABELS,
+  ROLE_CATEGORY_OPTIONS,
+  ROLE_SENIORITY_LABELS,
+  ROLE_SENIORITY_OPTIONS,
+} from "@/lib/schemas";
 import { PHASE_LABELS, type Phase } from "@/lib/types";
+import {
+  COEFF_META,
+  DEV_SIZING_LABELS,
+  DISCOVERY_SIZING_LABELS,
+  QA_SIZING_LABELS,
+} from "@/lib/settings-content";
 
 const PHASE_ORDER = [
   "discovery",
@@ -286,47 +298,6 @@ function ReductionBandsSection() {
   );
 }
 
-const DISCOVERY_SIZING_LABELS: Record<string, { label: string; hint: string }> = {
-  ucp: {
-    label: "Use Case Points (UCP)",
-    hint: "Sizes discovery off classified use cases + actors × technical/environmental factors — the calibrated default.",
-  },
-  function_points: {
-    label: "FP-based analysis effort",
-    hint: "Scales discovery/analysis hours linearly off the project's function-point count — better for FP-anchored scopes.",
-  },
-};
-
-const DEV_SIZING_LABELS: Record<string, { label: string; hint: string }> = {
-  cocomo: {
-    label: "COCOMO II",
-    hint: "Effort scales super-linearly with code size (KSLOC^E) — the calibrated default.",
-  },
-  function_points: {
-    label: "Function Points (IFPUG)",
-    hint: "Effort scales linearly with function points (FP × hours/FP) — better for feature-counted scopes.",
-  },
-  cosmic_function_points: {
-    label: "COSMIC Function Points (ISO 19761)",
-    hint: "Effort scales linearly with COSMIC functional size (data movements) — better for real-time, embedded, and service-oriented systems.",
-  },
-};
-
-const QA_SIZING_LABELS: Record<string, { label: string; hint: string }> = {
-  tpa: {
-    label: "Test Point Analysis (TPA)",
-    hint: "Sizes testing off function points × dynamic/static quality characteristics — the calibrated default.",
-  },
-  test_case_point: {
-    label: "Test Case Point Analysis (TCPA)",
-    hint: "Sizes testing off the planned test-case count weighted by complexity — better when you count test cases.",
-  },
-  defect_removal: {
-    label: "Defect Removal (Capers-Jones)",
-    hint: "Sizes testing off the defects a project of this size will contain (defect potential × removal effort) — quality-driven rather than count-driven.",
-  },
-};
-
 /** Reusable single-choice "sizing method" editor backed by a GET/PUT admin pair. */
 function SizingMethodSection({
   title,
@@ -475,29 +446,6 @@ function QaSizingSection() {
   );
 }
 
-const COEFF_META: Record<string, { label: string; hint: string; step: number }> = {
-  link_cost: {
-    label: "Coordination tax per link",
-    hint: "Capacity fraction lost per communication link (Brooks's Law).",
-    step: 0.01,
-  },
-  free_team_size: {
-    label: "Coordination-free team size",
-    hint: "No coordination overhead at or below this team size.",
-    step: 1,
-  },
-  overhead_cap: {
-    label: "Max coordination overhead",
-    hint: "Cap on the overhead applied to cost + schedule.",
-    step: 0.05,
-  },
-  diminishing_returns_exponent: {
-    label: "Diminishing-returns exponent (β)",
-    hint: "n^β throughput — 1.0 = perfectly parallel; lower = stronger diminishing returns.",
-    step: 0.01,
-  },
-};
-
 function StaffingCoefficientsSection() {
   const [rows, setRows] = useState<StaffingCoefficientRow[]>([]);
   const [editable, setEditable] = useState(true);
@@ -645,21 +593,38 @@ function StaffingCoefficientsSection() {
   );
 }
 
+// Custom-role rows carry a client-only `_key` for stable React keys while a freshly-added row has
+// no server role_id yet (the server assigns one on save).
+type CustomRoleDraft = CustomRoleRow & { _key: string };
+
 function DefaultRatesSection() {
   const [rows, setRows] = useState<RateRow[]>([]);
+  const [customRoles, setCustomRoles] = useState<CustomRoleDraft[]>([]);
   const [editable, setEditable] = useState(true);
   const [bounds, setBounds] = useState({ min: 0, max: 1000 });
   const [loading, setLoading] = useState(true);
+  // Did the initial GET succeed? Saving is blocked until it does, so a failed load (which leaves
+  // rows/customRoles empty) can't be saved — which would otherwise wipe every custom role (an
+  // explicit empty custom_roles list is a delete-all) and clear the grid overrides.
+  const [loadOk, setLoadOk] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // Monotonic counter for client-only keys of not-yet-saved rows. A plain ref (not crypto.randomUUID,
+  // which is undefined in insecure contexts — plain-HTTP LAN deploys — and would throw on add).
+  const newRowSeq = useRef(0);
+
+  const adoptCustomRoles = (cr: CustomRoleRow[]) =>
+    setCustomRoles(cr.map((r) => ({ ...r, _key: `srv_${r.role_id}` })));
 
   useEffect(() => {
     getDefaultRates()
       .then((r) => {
         setRows(r.rates);
+        adoptCustomRoles(r.custom_roles);
         setEditable(r.editable);
         setBounds({ min: r.min_rate, max: r.max_rate });
+        setLoadOk(true);
       })
       .catch((e) => setError((e as Error).message))
       .finally(() => setLoading(false));
@@ -672,8 +637,29 @@ function DefaultRatesSection() {
     setSaved(false);
   };
 
+  const addCustomRole = () => {
+    newRowSeq.current += 1;
+    setCustomRoles((cr) => [
+      ...cr,
+      { _key: `new_${newRowSeq.current}`, role_id: "", label: "", category: "engineering", seniority: "senior", rate: 165 },
+    ]);
+    setSaved(false);
+  };
+  const updateCustomRole = (key: string, patch: Partial<CustomRoleRow>) => {
+    setCustomRoles((cr) => cr.map((r) => (r._key === key ? { ...r, ...patch } : r)));
+    setSaved(false);
+  };
+  const removeCustomRole = (key: string) => {
+    setCustomRoles((cr) => cr.filter((r) => r._key !== key));
+    setSaved(false);
+  };
+
   const differs = rows.some((r) => r.rate !== r.default_rate);
-  const hasInvalid = rows.some((r) => r.rate < bounds.min || r.rate > bounds.max);
+  const gridInvalid = rows.some((r) => r.rate < bounds.min || r.rate > bounds.max);
+  const customInvalid = customRoles.some(
+    (r) => !r.label.trim() || r.rate < bounds.min || r.rate > bounds.max,
+  );
+  const hasInvalid = gridInvalid || customInvalid;
 
   const save = async () => {
     setSaving(true);
@@ -681,8 +667,16 @@ function DefaultRatesSection() {
     try {
       const resp = await saveDefaultRates(
         rows.map((r) => ({ category: r.category, seniority: r.seniority, rate: r.rate })),
+        customRoles.map((r) => ({
+          role_id: r.role_id || undefined,
+          label: r.label.trim(),
+          category: r.category,
+          seniority: r.seniority,
+          rate: r.rate,
+        })),
       );
       setRows(resp.rates);
+      adoptCustomRoles(resp.custom_roles);
       setEditable(resp.editable);
       setSaved(true);
     } catch (e) {
@@ -767,23 +761,124 @@ function DefaultRatesSection() {
         </table>
       </div>
 
+      <div className="space-y-2 border-t border-slate-100 pt-3">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <h3 className="text-sm font-medium">Custom roles</h3>
+            <p className="text-xs muted">
+              Named roles on top of the grid (e.g. &ldquo;Principal Architect&rdquo;, &ldquo;Scrum
+              Master&rdquo;). They appear in the Stage&nbsp;2 roster editor&apos;s &ldquo;Add from
+              catalog&rdquo; picker, prefilling description, category, seniority &amp; rate.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={addCustomRole}
+            disabled={!editable}
+            className="btn-secondary text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            + Add custom role
+          </button>
+        </div>
+
+        {customRoles.length === 0 ? (
+          <p className="text-xs muted">No custom roles yet.</p>
+        ) : (
+          <div className="space-y-2">
+            {customRoles.map((r) => {
+              const labelEmpty = !r.label.trim();
+              const rateBad = r.rate < bounds.min || r.rate > bounds.max;
+              return (
+                <div
+                  key={r._key}
+                  className="grid grid-cols-12 gap-2 items-center rounded-md border border-slate-200 bg-white p-2"
+                >
+                  <input
+                    type="text"
+                    value={r.label}
+                    disabled={!editable}
+                    maxLength={120}
+                    placeholder="Role name (e.g. Principal Architect)"
+                    onChange={(e) => updateCustomRole(r._key, { label: e.target.value })}
+                    className={`input py-1 col-span-5 disabled:opacity-60 ${labelEmpty ? "border-rose-400" : ""}`}
+                    aria-label="Custom role name"
+                  />
+                  <select
+                    value={r.category}
+                    disabled={!editable}
+                    onChange={(e) => updateCustomRole(r._key, { category: e.target.value })}
+                    className="select py-1 col-span-3 disabled:opacity-60"
+                    aria-label="Custom role category"
+                  >
+                    {ROLE_CATEGORY_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={r.seniority}
+                    disabled={!editable}
+                    onChange={(e) => updateCustomRole(r._key, { seniority: e.target.value })}
+                    className="select py-1 col-span-2 disabled:opacity-60"
+                    aria-label="Custom role seniority"
+                  >
+                    {ROLE_SENIORITY_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="number"
+                    min={bounds.min}
+                    max={bounds.max}
+                    step={5}
+                    value={r.rate}
+                    disabled={!editable}
+                    onChange={(e) => updateCustomRole(r._key, { rate: Number(e.target.value) })}
+                    className={`input py-1 col-span-1 text-right disabled:opacity-60 ${rateBad ? "border-rose-400" : ""}`}
+                    aria-label="Custom role hourly rate"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeCustomRole(r._key)}
+                    disabled={!editable}
+                    className="btn-secondary text-xs col-span-1 flex items-center justify-center disabled:opacity-50"
+                    aria-label={`Remove ${r.label || "custom role"}`}
+                    title="Remove this custom role"
+                  >
+                    ✕
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-xs muted" role="status" aria-live="polite">
-          {hasInvalid ? `Rates must be ${bounds.min}–${bounds.max}.` : saved ? "Saved." : ""}
+          {customInvalid
+            ? "Custom roles need a name and an in-range rate."
+            : gridInvalid
+              ? `Rates must be ${bounds.min}–${bounds.max}.`
+              : !loadOk
+                ? "Couldn’t load the rate card."
+                : saved
+                  ? "Saved."
+                  : ""}
         </p>
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={resetToDefaults}
             disabled={!editable || !differs}
+            title="Revert the grid rates to their shipped defaults (custom roles are not affected)"
             className="btn-secondary text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Reset to defaults
+            Reset grid rates
           </button>
           <button
             type="button"
             onClick={save}
-            disabled={!editable || hasInvalid || saving}
+            disabled={!editable || !loadOk || hasInvalid || saving}
             className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving ? "Saving…" : "Save changes"}

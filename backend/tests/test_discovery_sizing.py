@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import db.postgres_adapter as postgres_adapter
-from discovery_sizing_admin import (
+from admin.discovery_sizing_admin import (
     DiscoverySizingUpdate,
     get_discovery_sizing_method,
     update_discovery_sizing_method,

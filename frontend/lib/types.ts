@@ -1,6 +1,7 @@
 /** Response types mirroring backend pydantic models. Wire format only — not validated. */
 
-import type { RoleCategory, RoleSeniority } from "./schemas";
+import type { Phase, RoleCategory, RoleSeniority } from "./schemas";
+import type { WbsTaskInput } from "./wbs";
 
 export type EstimateStatus =
   | "pending"
@@ -11,13 +12,9 @@ export type EstimateStatus =
   | "completed"
   | "failed";
 
-export type Phase =
-  | "discovery"
-  | "ux_design"
-  | "development"
-  | "code_review"
-  | "deployment"
-  | "qa_testing";
+// Phase is defined once in lib/schemas.ts (the zod `phaseEnum`) and re-exported here so the many
+// `@/lib/types` consumers keep working and can't drift from request validation.
+export type { Phase };
 
 export interface HourRange {
   optimistic: number;
@@ -142,6 +139,58 @@ export interface EstimateEnvelope {
   pass2_estimates: PhaseEstimate[];
   final_estimate: DualScenarioEstimate | null;
   error: string | null;
+  /** Which flow produced this: "twins" (default) or "wbs" (bottom-up). Defaulted server-side. */
+  method?: "twins" | "wbs";
+  /** WBS-only: the finalized task tree, for the review-page tree panel + Duplicate. */
+  wbs_tree?: WbsTaskInput[] | null;
+}
+
+// --- Statement of Work (SOW) export -------------------------------------------------
+export type SowScenario = "ai_assisted" | "manual_only";
+export type SowSectionKind =
+  | "paragraph"
+  | "bullets"
+  | "table"
+  | "signature_block"
+  | "cover";
+
+export interface SowTable {
+  columns: string[];
+  rows: string[][];
+}
+
+export interface SowSignatory {
+  party: string;
+  fields: string[];
+}
+
+export interface SowSectionContent {
+  id: string;
+  heading: string;
+  kind: SowSectionKind;
+  text: string;
+  bullets: string[];
+  table: SowTable | null;
+  signatories: SowSignatory[];
+  /** UI hint: prose/bullets are editable; tables/cover/signature blocks are read-only. */
+  editable: boolean;
+}
+
+export interface SowDocument {
+  estimate_id: string;
+  template_id: string;
+  title: string;
+  project_name: string;
+  scenario: SowScenario;
+  sections: SowSectionContent[];
+  /** Bracketed tokens still unresolved (e.g. "[CLIENT NAME]") — the user fills these in Word. */
+  placeholders: string[];
+}
+
+export interface SowGenerateResponse {
+  document: SowDocument;
+  /** Token cost of generating this SOW (separate from the estimate's own llm_usage). */
+  llm_usage: LlmUsage;
 }
 
 export const PHASE_LABELS: Record<Phase, string> = {

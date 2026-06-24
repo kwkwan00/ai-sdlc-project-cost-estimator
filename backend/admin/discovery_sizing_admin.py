@@ -8,19 +8,19 @@ read/validate/persist + ``editable=false`` semantics.
 
 from __future__ import annotations
 
+from admin.sizing_method_admin import (
+    SizingMethodResponse as DiscoverySizingResponse,
+)
+from admin.sizing_method_admin import (
+    SizingMethodUpdate as DiscoverySizingUpdate,
+)
+from admin.sizing_method_admin import (
+    get_sizing_method,
+    update_sizing_method,
+)
 from orchestrator.nodes.discovery_analyst import (
     DEFAULT_DISCOVERY_SIZING_METHOD,
     DISCOVERY_SIZING_METHODS,
-)
-from sizing_method_admin import (
-    SizingMethodResponse as DiscoverySizingResponse,
-)
-from sizing_method_admin import (
-    SizingMethodUpdate as DiscoverySizingUpdate,
-)
-from sizing_method_admin import (
-    get_sizing_method,
-    update_sizing_method,
 )
 
 __all__ = [

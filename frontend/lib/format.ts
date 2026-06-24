@@ -15,6 +15,13 @@ export function formatPct(n: number): string {
   return `${Math.round(n * 100)}%`;
 }
 
+/** Format an ISO timestamp to a locale string; "" for null/invalid input. */
+export function formatDate(iso: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
+}
+
 /** Cents precision for small amounts (e.g. LLM cost), whole dollars for large. */
 export function formatUSDPrecise(n: number): string {
   const digits = Math.abs(n) < 100 ? 2 : 0;

@@ -14,8 +14,6 @@ import asyncio
 import logging
 import random
 from collections.abc import Awaitable, Callable
-from functools import cache
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -30,7 +28,7 @@ from models.twin_outputs import (
     Risk,
 )
 from observability.langfuse_wrapper import traced
-from orchestrator.ai_acceleration import band_for, effective_ai_reduction
+from orchestrator.ai_acceleration import ReductionContext, band_for, effective_ai_reduction
 from orchestrator.llm import call_structured, render_context_block
 from orchestrator.montecarlo import (
     DEFAULT_DRAWS,
@@ -41,21 +39,13 @@ from orchestrator.montecarlo import (
     sample_pert,
 )
 
+# load_prompt now lives in orchestrator.prompts (neutral home so agents don't import twin
+# internals); re-exported here for the twins + existing callers that import it from _twin_base.
+from orchestrator.prompts import load_prompt
+
 logger = logging.getLogger(__name__)
 
-PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
-
 _PHASE_VALUES = {p.value for p in Phase}
-
-
-@cache
-def load_prompt(name: str) -> str:
-    """Load a twin's system prompt from prompts/<name>.md.
-
-    Prompts are static at runtime, so each file is read once per process and the
-    result is cached by ``name`` (avoids a blocking ``read_text`` on every one of
-    the 12+ twin invocations per estimate)."""
-    return (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
 
 
 def _calibration_for_phase(state: EstimationState, phase_value: str) -> list[dict[str, Any]]:
@@ -135,7 +125,15 @@ def build_twin_user_prompt(
         f"## Pass {pass_num}\n\n"
         f"Project description (raw):\n```\n{state.get('raw_input', '')}\n```\n\n"
         f"Structured context:\n{render_context_block(parsed, extras)}\n\n"
-        f"Produce your phase estimate using the algorithm in your system prompt."
+        "Produce your phase estimate using the algorithm in your system prompt.\n\n"
+        "Technology: the user MAY specify their stack — in the raw project description above or "
+        "the `stage3.technology_stack` field in the structured context. Factor any specified "
+        "technologies into your effort estimate (a legacy or unfamiliar stack raises effort; a "
+        "modern, well-supported one can lower it), and you MAY name those user-specified "
+        "technologies in your notes. But do NOT invent specific vendor products or cloud services "
+        "the user did not mention (e.g. AWS ECS Fargate, RabbitMQ, Kafka, Auth0, Kubernetes, "
+        "Snowflake); for anything unspecified, describe it generically (\"a container platform\", "
+        "\"a managed message queue\", \"an identity provider\") rather than naming a brand."
     )
 
 
@@ -284,6 +282,23 @@ def build_phase_from_compute(
         rng=rng,
     )
     ai_mid = point_mid * (1 - effective_reduction)
+    logger.info(
+        "%s determine: algo=%s point=%.0fh ×(1−%.3f)=ai_point=%.0fh | "
+        "MC manual P10/P50/P90=%.0f/%.0f/%.0f ai=%.0f/%.0f/%.0f draws=%d",
+        twin_name,
+        algorithm,
+        point_mid,
+        effective_reduction,
+        ai_mid,
+        manual_mc.p10,
+        manual_mc.p50,
+        manual_mc.p90,
+        ai_mc.p10,
+        ai_mc.p50,
+        ai_mc.p90,
+        manual_mc.n,
+    )
+    logger.debug("%s breakdown: %s", twin_name, breakdown)
     return assemble_phase_estimate(
         phase=phase,
         twin_name=twin_name,
@@ -334,7 +349,7 @@ _REDUCTION_UPSIDE = 0.30      # … but only 0.30·mode above it (bounded upside
 
 def make_reduction_sampler(
     *,
-    reduction_ctx: dict[str, Any],
+    ctx: ReductionContext,
     proposed_point: float | None,
     reduction_range: Range3 | None,
 ) -> ReductionSampler:
@@ -348,9 +363,7 @@ def make_reduction_sampler(
     codebase·seniority moderation / penalty nonlinearity is honored on every draw. The
     Beta-PERT uses a reduced shape (``_REDUCTION_PERT_LAMBDA``) so the band is flatter and
     heavier-tailed. Returns a constant 0 when the phase has no AI-tooling band."""
-    phase = reduction_ctx["phase"]
-    tooling = reduction_ctx["tooling"]
-    lo, hi = band_for(phase, tooling, reduction_ctx.get("bands"))
+    lo, hi = band_for(ctx.phase, ctx.tooling, ctx.bands)
     if hi <= 0.0:
         return lambda rng: 0.0
     if proposed_point is not None:
@@ -369,7 +382,7 @@ def make_reduction_sampler(
 
     def _sampler(rng: random.Random) -> float:
         proposed = sample_pert(p_lo, mode, p_hi, rng, lam=_REDUCTION_PERT_LAMBDA)
-        return effective_ai_reduction(proposed_reduction=proposed, **reduction_ctx)
+        return effective_ai_reduction(proposed_reduction=proposed, **ctx.reduction_kwargs())
 
     return _sampler
 
@@ -422,6 +435,14 @@ async def run_twin[T: BaseModel](
     roster = roster_for(state)
     regulated = bool(stage2 and getattr(stage2, "regulatory_requirements", None))
     twin_name = prompt_name
+    logger.debug(
+        "%s twin start: pass=%s estimate=%s tooling=%s codebase=%s",
+        phase.value,
+        pass_num,
+        state.get("estimate_id", ""),
+        tooling_for(stage3, phase).value,
+        stage3.codebase_context.value,
+    )
 
     try:
         system = load_prompt(prompt_name)
@@ -449,18 +470,20 @@ async def run_twin[T: BaseModel](
         else:
             inputs = await _call()
         proposed_point = proposed_reduction_fn(inputs) if proposed_reduction_fn is not None else None
-        reduction_ctx: dict[str, Any] = {
-            "phase": phase,
-            "codebase": stage3.codebase_context,
-            "tooling": tooling_for(stage3, phase),
-            "roster": roster,
-            "regulated": regulated,
-            "bands": state.get("reduction_bands"),
-        }
-        eff = effective_ai_reduction(proposed_reduction=proposed_point, **reduction_ctx)
+        reduction_ctx = ReductionContext(
+            phase=phase,
+            codebase=stage3.codebase_context,
+            tooling=tooling_for(stage3, phase),
+            roster=roster,
+            regulated=regulated,
+            bands=state.get("reduction_bands"),
+        )
+        eff = effective_ai_reduction(
+            proposed_reduction=proposed_point, **reduction_ctx.reduction_kwargs()
+        )
         rng = make_rng(f"{state.get('estimate_id', '')}:{phase.value}:{pass_num}")
         reduction_sampler = make_reduction_sampler(
-            reduction_ctx=reduction_ctx,
+            ctx=reduction_ctx,
             proposed_point=proposed_point,
             reduction_range=getattr(inputs, "reduction_range", None),
         )
@@ -478,11 +501,19 @@ async def run_twin[T: BaseModel](
             **extra_build_kwargs,
         )
         logger.info(
-            "%s twin done: pass=%s ai_ml=%.0fh manual_ml=%.0fh",
+            "%s twin decided: pass=%s algo=%s proposed_reduction=%s eff_reduction=%.1f%% "
+            "confidence=%.2f ai_ml=%.0fh manual_ml=%.0fh gaps=%d risks=%d estimate=%s",
             phase.value,
             pass_num,
+            est.algorithm,
+            f"{proposed_point * 100:.1f}%" if proposed_point is not None else "band-mid",
+            est.effective_ai_reduction_pct,
+            est.confidence,
             est.ai_assisted_hours.most_likely,
             est.manual_only_hours.most_likely,
+            len(est.gaps),
+            len(est.risks),
+            state.get("estimate_id", ""),
         )
         return est
     except Exception as exc:  # noqa: BLE001
@@ -490,6 +521,15 @@ async def run_twin[T: BaseModel](
         return stub_phase_estimate(
             phase, twin_name, stub_algorithm, stub_ai_mid, stub_manual_mid, roster
         )
+
+
+def _phase_selected(state: EstimationState, phase: Phase) -> bool:
+    """Whether this twin's phase is in the user's selection.
+
+    Absent/empty ``selected_phases`` ⇒ every phase runs (back-compat: existing callers, the
+    smoke test, and the WBS flow never set it). A non-empty list runs exactly those phases."""
+    selected = state.get("selected_phases")
+    return not selected or phase in selected
 
 
 def make_twin_nodes[T: BaseModel](
@@ -541,10 +581,17 @@ def make_twin_nodes[T: BaseModel](
 
     @traced(name=f"{trace_name}.p1")
     async def pass1(state: EstimationState) -> dict:
+        # Skipped phases return {} — a clean no-op on the operator.add reducer (and no LLM call,
+        # since the guard precedes _run). The node still executes, so the static join at
+        # merge_pass1 still fires; the graph topology is untouched.
+        if not _phase_selected(state, phase):
+            return {}
         return {"pass1_estimates": [await _run(state, pass_num=1)]}
 
     @traced(name=f"{trace_name}.p2")
     async def pass2(state: EstimationState) -> dict:
+        if not _phase_selected(state, phase):
+            return {}
         return {"pass2_estimates": [await _run(state, pass_num=2)]}
 
     return pass1, pass2

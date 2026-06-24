@@ -37,6 +37,19 @@ TECH_CATEGORIES = {RoleCategory.ENGINEERING, RoleCategory.DEVOPS, RoleCategory.D
 PRODUCT_DESIGN_CATEGORIES = {RoleCategory.PRODUCT, RoleCategory.UI_UX}
 
 
+def default_role_id(roster: RoleRoster) -> str:
+    """A safe default role: prefer a senior engineer, then any engineer, then the first role.
+    A neutral roster util shared by the WBS planner agent and the rollup (so the compute layer
+    doesn't have to import a private helper from the LLM-agent module)."""
+    for r in roster.roles:
+        if r.category == RoleCategory.ENGINEERING and r.seniority == RoleSeniority.SENIOR:
+            return r.role_id
+    for r in roster.roles:
+        if r.category == RoleCategory.ENGINEERING:
+            return r.role_id
+    return roster.roles[0].role_id if roster.roles else "sr_engineer"
+
+
 def _normalize(pcts: dict[str, float]) -> dict[str, float]:
     total = sum(pcts.values())
     if total <= 0:

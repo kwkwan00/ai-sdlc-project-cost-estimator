@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -30,8 +31,9 @@ from config import get_settings
 from models.project_schema import CustomRole, RoleRoster, Stage2Context
 from models.twin_outputs import RoleCategory, RoleSeniority
 from orchestrator.llm import call_structured, render_context_block
-from orchestrator.nodes._twin_base import load_prompt
+from orchestrator.prompts import load_prompt
 from pricing import resolve_rate
+from slug import unique_slug
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +53,19 @@ class ProjectPlanItem(BaseModel):
 
 class ProposedRole(BaseModel):
     """A role the agent proposes. No role_id / rate — those are assigned by the
-    deterministic backstop, not the LLM."""
+    deterministic backstop, not the LLM.
+
+    ``catalog_role_id`` is the agent's optional, EXPLICIT selection of an admin predefined
+    rate-card role (by its id, listed in the prompt) — when it's a valid catalog id the backstop
+    uses that role's exact rate and carries its id into the roster (so identity + pricing are a
+    deterministic key lookup, not a fuzzy label match). Null / unknown → priced from the grid."""
 
     model_config = ConfigDict(extra="forbid")
     description: str = Field(min_length=1, max_length=120)
     category: RoleCategory = RoleCategory.OTHER
     seniority: RoleSeniority = RoleSeniority.OTHER
     percentage: float = Field(default=0.0, ge=0, le=100)
+    catalog_role_id: str | None = Field(default=None, max_length=64)
 
 
 class RosterProposal(BaseModel):
@@ -76,25 +84,19 @@ class RosterProposal(BaseModel):
 # ---------- deterministic backstop ----------
 
 
-def _make_unique_ids(roles: list[ProposedRole]) -> list[str]:
-    """Generate stable, unique role_ids (<=64 chars) from the tags.
-
-    `{seniority}_{category}`, with a numeric suffix on collision; the base is
-    truncated so the suffix is never lost when it would exceed 64 chars.
-    """
-    ids: list[str] = []
+def _unique_ids(bases: list[str]) -> list[str]:
+    """Assign unique role_ids (<=64 chars) from the given per-role base strings, suffixing on
+    collision (shared `unique_slug` keeps the truncation rule consistent with the rate-card admin's
+    id minting)."""
     seen: set[str] = set()
-    for role in roles:
-        base = f"{role.seniority.value}_{role.category.value}"[:64]
-        candidate = base
-        n = 2
-        while candidate in seen:
-            suffix = f"_{n}"
-            candidate = base[: 64 - len(suffix)] + suffix
-            n += 1
-        seen.add(candidate)
-        ids.append(candidate)
-    return ids
+    return [unique_slug(base, seen) for base in bases]
+
+
+def _make_unique_ids(roles: list[ProposedRole]) -> list[str]:
+    """Unique role_ids from the `{seniority}_{category}` tags (the grid-priced path)."""
+    return _unique_ids(
+        [f"{role.seniority.value}_{role.category.value}" for role in roles]
+    )
 
 
 def _rebalance_to_100(weights: list[float]) -> list[int]:
@@ -139,15 +141,33 @@ def _rebalance_to_100(weights: list[float]) -> list[int]:
     return result
 
 
+class CatalogRole(NamedTuple):
+    """One admin predefined rate-card role, as offered to the roster agent. ``role_id`` is the
+    stable selection key (the agent sets ``ProposedRole.catalog_role_id`` to it)."""
+
+    role_id: str
+    label: str
+    category: str
+    seniority: str
+    rate: float
+
+
 def proposal_to_roster(
     proposal: RosterProposal,
     rate_overrides: dict[tuple[RoleCategory, RoleSeniority], float] | None = None,
+    catalog: list[CatalogRole] | None = None,
 ) -> RoleRoster:
     """Map the agent's proposal into a valid RoleRoster (the wizard's shape).
 
     Caps role count, assigns unique ids + table rates, and rebalances
     percentages to sum to 100 so `RoleRoster`'s validator passes. Falls back to
     `RoleRoster.default()` if there's nothing usable or validation somehow fails.
+
+    ``catalog`` lets the roster draw on the admin's custom rate-card roles by **explicit selection**:
+    when a proposed role's ``catalog_role_id`` is a valid catalog id, that role's EXACT rate is used
+    (instead of the ``(category, seniority)`` grid rate) and the catalog id is carried into the
+    roster as the role_id, so identity + pricing are a deterministic key lookup. An absent/unknown
+    ``catalog_role_id`` → grid pricing + a tag-derived id (no silent fuzzy matching).
     """
     roles = list(proposal.roles)
     if not roles:
@@ -158,7 +178,21 @@ def proposal_to_roster(
         keep = set(sorted(range(len(roles)), key=lambda i: (-roles[i].percentage, i))[:_MAX_ROLES])
         roles = [r for i, r in enumerate(roles) if i in keep]
 
-    ids = _make_unique_ids(roles)
+    catalog_by_id = {c.role_id: c for c in (catalog or [])}
+
+    def _resolve(role: ProposedRole) -> tuple[float, str]:
+        """(rate, id_base) — the selected catalog role's exact rate + its id when the agent picked a
+        valid one; otherwise the grid rate + a tag-derived base."""
+        sel = catalog_by_id.get(role.catalog_role_id) if role.catalog_role_id else None
+        if sel is not None:
+            return sel.rate, sel.role_id
+        return (
+            resolve_rate(role.category, role.seniority, rate_overrides),
+            f"{role.seniority.value}_{role.category.value}",
+        )
+
+    resolved = [_resolve(role) for role in roles]
+    ids = _unique_ids([base for _, base in resolved])
     pcts = _rebalance_to_100([r.percentage for r in roles])
     custom = [
         CustomRole(
@@ -166,10 +200,10 @@ def proposal_to_roster(
             description=role.description,
             category=role.category,
             seniority=role.seniority,
-            rate_per_hour=resolve_rate(role.category, role.seniority, rate_overrides),
+            rate_per_hour=rate,
             percentage=float(pct),
         )
-        for rid, role, pct in zip(ids, roles, pcts, strict=True)
+        for rid, role, (rate, _), pct in zip(ids, roles, resolved, pcts, strict=True)
     ]
     try:
         roster = RoleRoster(roles=custom)
@@ -187,8 +221,35 @@ def proposal_to_roster(
 # ---------- agent entry point ----------
 
 
-async def run_roster_agent(stage2: Stage2Context, raw_input: str) -> RosterProposal:
+def _custom_role_catalog_block(catalog: list[CatalogRole]) -> str:
+    """Render the admin's predefined custom roles as a prompt block instructing the agent to SELECT
+    one by id (``catalog_role_id``) when a role it would propose corresponds to it, so the org's set
+    rate applies. Empty list → "" (no block)."""
+    if not catalog:
+        return ""
+    lines = "\n".join(
+        f"- id={c.role_id} · {c.label} ({c.category}/{c.seniority}) · ${c.rate:.0f}/h"
+        for c in catalog
+    )
+    return (
+        "Your organization has these predefined roles with set hourly rates. When a role you would "
+        "propose corresponds to one of them, set that role's `catalog_role_id` to the matching id "
+        "below (you may still give it a natural `description`/`category`/`seniority`). Select one "
+        "ONLY when it genuinely fits; otherwise leave `catalog_role_id` null and propose normally."
+        f"\n{lines}\n\n"
+    )
+
+
+async def run_roster_agent(
+    stage2: Stage2Context,
+    raw_input: str,
+    custom_roles: list[CatalogRole] | None = None,
+) -> RosterProposal:
     """Run the roster agent: one fast Sonnet forced-tool-use call.
+
+    ``custom_roles`` is the admin's rate-card catalog (``CatalogRole`` per predefined role); when
+    present it's injected into the prompt so the agent can deliberately SELECT a predefined role by
+    its id (``ProposedRole.catalog_role_id``), which the backstop then prices at the org's rate.
 
     Raises on LLM failure (no API key, network); the caller in `prefill` handles
     the fallback to the default roster.
@@ -205,6 +266,7 @@ async def run_roster_agent(stage2: Stage2Context, raw_input: str) -> RosterPropo
     user = (
         f"Project description:\n\n{raw_input}\n\n"
         f"Interpreted project context:\n{render_context_block(context)}\n\n"
+        f"{_custom_role_catalog_block(custom_roles or [])}"
         "Sketch the high-level delivery plan, then propose the team roster."
     )
     logger.debug(

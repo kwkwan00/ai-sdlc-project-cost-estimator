@@ -1,6 +1,8 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
 import { use, useState } from "react";
 
 import { AiSavingsSection } from "@/components/AiSavingsSection";
@@ -15,10 +17,11 @@ import { Modal } from "@/components/Modal";
 import { PertChart } from "@/components/PertChart";
 import { PhaseBar } from "@/components/PhaseBar";
 import { RiskRegister } from "@/components/RiskRegister";
+import { SowExportModal } from "@/components/SowExportModal";
 import { StageProgress } from "@/components/StageProgress";
 import { Tabs } from "@/components/Tabs";
 import { TornadoChart } from "@/components/TornadoChart";
-import { getEstimate } from "@/lib/api-client";
+import { duplicateWbsEstimate, getEstimate } from "@/lib/api-client";
 import { confidenceLabel, pAiSavesTime } from "@/lib/fan-chart";
 import { expectedRiskHours, sortRisks } from "@/lib/risk";
 import { deriveSchedule } from "@/lib/schedule";
@@ -35,15 +38,25 @@ import { algorithmColor } from "@/lib/algorithms";
 import { reconciledTotals, sharePct } from "@/lib/review-ui";
 import { PHASE_LABELS } from "@/lib/types";
 
+// Code-split the WBS tree view (MUI X) so its bundle only loads when a WBS estimate's review is
+// actually viewed — twin estimates never render this tab. Client-only (MUI / emotion).
+const WbsTreePanel = dynamic(
+  () => import("@/components/WbsTreePanel").then((m) => m.WbsTreePanel),
+  { ssr: false, loading: () => <p className="muted text-sm">Loading work breakdown…</p> },
+);
+
 interface PageProps {
   params: Promise<{ id: string }>;
 }
 
 export default function ReviewPage({ params }: PageProps) {
   const { id } = use(params);
+  const router = useRouter();
   const [mode, setMode] = useState<"ai_assisted" | "manual_only">("ai_assisted");
   const [openPhase, setOpenPhase] = useState<number | null>(null);
   const [showLlmUsage, setShowLlmUsage] = useState(false);
+  const [showSow, setShowSow] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
   const { data, isLoading, error } = useQuery({
     queryKey: ["estimate", id],
     queryFn: () => getEstimate(id),
@@ -69,6 +82,18 @@ export default function ReviewPage({ params }: PageProps) {
   }
 
   const fe = data.final_estimate;
+  const isWbs = data.method === "wbs";
+
+  async function handleDuplicateWbs() {
+    setDuplicating(true);
+    try {
+      const res = await duplicateWbsEstimate(id);
+      router.push(`/wbs/edit/${res.draft_id}`);
+    } catch {
+      setDuplicating(false);
+    }
+  }
+
   const totalRange =
     mode === "ai_assisted" ? fe.total_ai_assisted_hours : fe.total_manual_only_hours;
   // Rounded, reconciling totals: AI + saved === manual (hours and cost) exactly,
@@ -130,12 +155,14 @@ export default function ReviewPage({ params }: PageProps) {
             </p>
             <PhaseBar phases={fe.phases} mode={mode} />
           </div>
-          <div>
-            <p className="text-xs uppercase tracking-wide muted mb-1">
-              Effort share by algorithm
-            </p>
-            <AlgorithmBreakdownChart phases={fe.phases} mode={mode} />
-          </div>
+          {!isWbs && (
+            <div>
+              <p className="text-xs uppercase tracking-wide muted mb-1">
+                Effort share by algorithm
+              </p>
+              <AlgorithmBreakdownChart phases={fe.phases} mode={mode} />
+            </div>
+          )}
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {fe.phases.map((p, idx) => {
@@ -153,7 +180,9 @@ export default function ReviewPage({ params }: PageProps) {
                   <span className="text-sm font-medium leading-snug">
                     {PHASE_LABELS[p.phase]}
                   </span>
-                  <AlgorithmBadge algorithm={p.algorithm} />
+                  {/* WBS phases all carry the same synthetic algorithm ("WBS bottom-up (PERT)"),
+                      so the per-algorithm badge is meaningless — hide it for WBS estimates. */}
+                  {!isWbs && <AlgorithmBadge algorithm={p.algorithm} />}
                 </div>
                 <div>
                   <p className="text-xl font-semibold">
@@ -432,6 +461,24 @@ export default function ReviewPage({ params }: PageProps) {
           <p className="muted">Final estimate · confidence {formatPct(fe.confidence)}</p>
         </div>
         <div className="flex items-center gap-2">
+          {isWbs && (
+            <button
+              type="button"
+              onClick={handleDuplicateWbs}
+              disabled={duplicating}
+              className="btn-secondary text-sm disabled:opacity-50"
+            >
+              {duplicating ? "Duplicating…" : "Duplicate as new draft"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setShowSow(true)}
+            className="btn-secondary text-sm"
+            title="Generate a Statement of Work from this estimate"
+          >
+            Export SOW
+          </button>
           {fe.llm_usage && fe.llm_usage.call_count > 0 && (
             <button
               type="button"
@@ -524,6 +571,20 @@ export default function ReviewPage({ params }: PageProps) {
             label: "Cost breakdown",
             content: breakdownPanel,
           },
+          ...(isWbs && data.wbs_tree
+            ? [
+                {
+                  id: "wbs",
+                  label: "Work breakdown",
+                  content: (
+                    <section className="card space-y-3">
+                      <h2 className="section-title">Work breakdown structure</h2>
+                      <WbsTreePanel tree={data.wbs_tree} />
+                    </section>
+                  ),
+                },
+              ]
+            : []),
           { id: "timeline", label: "Timeline", content: timelinePanel },
           { id: "ai", label: "AI assistance", content: aiPanel },
           {
@@ -533,6 +594,14 @@ export default function ReviewPage({ params }: PageProps) {
             content: riskPanel,
           },
         ]}
+      />
+
+      <SowExportModal
+        open={showSow}
+        onClose={() => setShowSow(false)}
+        estimateId={data.estimate_id}
+        projectName={data.project_name}
+        scenario={mode}
       />
 
       {fe.llm_usage && fe.llm_usage.call_count > 0 && (
@@ -607,7 +676,7 @@ export default function ReviewPage({ params }: PageProps) {
           title={PHASE_LABELS[phaseModal.phase]}
         >
           <div className="space-y-4">
-            <AlgorithmBadge algorithm={phaseModal.algorithm} />
+            {!isWbs && <AlgorithmBadge algorithm={phaseModal.algorithm} />}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
               <div>
                 <p className="text-xs uppercase muted mb-1">
@@ -646,11 +715,16 @@ export default function ReviewPage({ params }: PageProps) {
                 )}
               </div>
             </div>
-            <BreakdownView
-              breakdown={phaseModal.breakdown}
-              reductionPct={phaseModal.effective_ai_reduction_pct}
-              notes={phaseModal.notes}
-            />
+            {/* The method/algorithm breakdown widget is twin-only: WBS phases carry just a
+                synthetic {leaf_count: N} breakdown + the same "WBS bottom-up (PERT)" algorithm,
+                so the magnitude bars/chips are meaningless. Hide the whole widget for WBS. */}
+            {!isWbs && (
+              <BreakdownView
+                breakdown={phaseModal.breakdown}
+                reductionPct={phaseModal.effective_ai_reduction_pct}
+                notes={phaseModal.notes}
+              />
+            )}
           </div>
         </Modal>
       )}

@@ -1,0 +1,51 @@
+# Deterministic full-lifecycle WBS used when the LLM planner is unavailable (no API key or
+# error), so the editor always opens with a complete starting point. Each task's `category`
+# is mapped to the best-matching roster role at build time, and ids are assigned then. Edit
+# the hours, phases, names, and wording here — no code change.
+
+package:
+  name: "Project work breakdown"
+  description: "Auto-generated starting point — refine the tasks, hours, and roles."
+
+# Default leaf description when a task below doesn't set its own.
+default_task_description: "Placeholder task — edit or replace."
+
+# One leaf per SDLC phase. `category` is a RoleCategory the roster role is matched on
+# (product | engineering | ui_ux | qa | devops | data | other).
+tasks:
+  - phase: discovery
+    category: product
+    name: "Discovery work"
+    optimistic: 8
+    most_likely: 16
+    pessimistic: 32
+  - phase: ux_design
+    category: ui_ux
+    name: "UX & design work"
+    optimistic: 8
+    most_likely: 16
+    pessimistic: 32
+  - phase: development
+    category: engineering
+    name: "Development work"
+    optimistic: 40
+    most_likely: 80
+    pessimistic: 160
+  - phase: code_review
+    category: engineering
+    name: "Code review work"
+    optimistic: 8
+    most_likely: 16
+    pessimistic: 24
+  - phase: deployment
+    category: devops
+    name: "Deployment & DevOps work"
+    optimistic: 8
+    most_likely: 16
+    pessimistic: 32
+  - phase: qa_testing
+    category: qa
+    name: "QA & testing work"
+    optimistic: 16
+    most_likely: 24
+    pessimistic: 40

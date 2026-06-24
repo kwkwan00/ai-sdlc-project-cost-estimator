@@ -57,13 +57,20 @@ def test_create_estimate_accepts_raw_input_at_max_length(monkeypatch) -> None:
     # background run so we only exercise request validation + envelope creation.
     import runtime
 
+    spawned: list = []
+
     def _swallow(coro, *a, **k) -> None:
+        spawned.append(coro)
         coro.close()  # discard the un-awaited coroutine cleanly
 
     monkeypatch.setattr(runtime, "_spawn_background", _swallow)
     with _client() as c:
         r = c.post("/estimates", json={"raw_input": "x" * 20000})
         assert r.status_code == 200
+    # Assert creation actually routed through runtime._spawn_background — otherwise a refactor
+    # that inlines asyncio.create_task would silently leak a real background run (and a
+    # non-awaited-coroutine warning) instead of failing this test.
+    assert len(spawned) == 1
 
 
 def test_submit_answers_for_unknown_estimate_returns_404() -> None:
@@ -295,7 +302,7 @@ async def test_spawn_background_logs_and_discards_on_failure(caplog) -> None:
     assert any("unit-test" in r.getMessage() for r in caplog.records)
 
 
-# --- _persist calibration refresh iterates the Phase enum ---------------------
+# --- persist_completed_estimate calibration refresh iterates the Phase enum ---
 
 
 def test_persist_refreshes_calibration_for_every_phase(monkeypatch) -> None:
@@ -313,9 +320,12 @@ def test_persist_refreshes_calibration_for_every_phase(monkeypatch) -> None:
     async def _fake_save_history(*args, **kwargs) -> None:
         return None
 
+    async def _fake_save_envelope(*args, **kwargs) -> None:  # awaited in persist_completed_estimate
+        return None
+
     monkeypatch.setattr(runtime, "refresh_calibration_for_phase", _fake_refresh)
     monkeypatch.setattr(runtime, "save_estimate_history", _fake_save_history)
-    monkeypatch.setattr(runtime, "save_estimate_envelope", lambda *a, **k: None)
+    monkeypatch.setattr(runtime, "save_estimate_envelope", _fake_save_envelope)
 
     env = EstimateEnvelope(
         estimate_id="e1",
@@ -323,6 +333,6 @@ def test_persist_refreshes_calibration_for_every_phase(monkeypatch) -> None:
         status=EstimateStatus.COMPLETED,
         created_at=datetime.now(UTC),
     )
-    asyncio.run(runtime._persist(env, "", stage2=None, stage3=None))
+    asyncio.run(runtime.persist_completed_estimate(env, raw_input="", stage2=None, stage3=None))
 
     assert sorted(refreshed) == sorted(p.value for p in Phase)

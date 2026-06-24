@@ -15,7 +15,9 @@ from __future__ import annotations
 import logging
 import sys
 
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# `[%(estimate_id)s]` is stamped by EstimateIdFilter (installed below) — every line during
+# an estimate run carries its id, "-" otherwise — so concurrent runs stay disentangleable.
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s [%(estimate_id)s]: %(message)s"
 
 # Marker on the handler we install so re-configuration is idempotent (we replace
 # our own handler) without disturbing foreign handlers (uvicorn, pytest caplog).
@@ -71,6 +73,11 @@ def configure_logging(level: str | None = None, *, force: bool = False) -> None:
             root.removeHandler(existing)  # replace on re-config; avoid duplicates
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+    # Stamp the context-local estimate id onto every record so the format's
+    # `%(estimate_id)s` always resolves (defaults to "-" outside an estimate run).
+    from observability.correlation import EstimateIdFilter
+
+    handler.addFilter(EstimateIdFilter())
     setattr(handler, _OWN_HANDLER, True)
     root.addHandler(handler)
 

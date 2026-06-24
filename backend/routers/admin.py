@@ -19,37 +19,37 @@ from typing import Any, NamedTuple
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from contingency_admin import (
+from admin.contingency_admin import (
     ContingencyResponse,
     get_contingency,
     update_contingency,
 )
-from dev_sizing_admin import (
+from admin.dev_sizing_admin import (
     DevSizingResponse,
     get_dev_sizing_method,
     update_dev_sizing_method,
 )
-from discovery_sizing_admin import (
+from admin.discovery_sizing_admin import (
     DiscoverySizingResponse,
     get_discovery_sizing_method,
     update_discovery_sizing_method,
 )
-from qa_sizing_admin import (
+from admin.qa_sizing_admin import (
     QaSizingResponse,
     get_qa_sizing_method,
     update_qa_sizing_method,
 )
-from rate_card_admin import (
+from admin.rate_card_admin import (
     RateCardResponse,
     get_effective_rates,
     update_rates,
 )
-from reduction_bands_admin import (
+from admin.reduction_bands_admin import (
     ReductionBandsResponse,
     get_effective_bands,
     update_bands,
 )
-from staffing_admin import (
+from admin.staffing_admin import (
     StaffingCoefficientsResponse,
     get_effective_staffing,
     update_staffing,

@@ -23,29 +23,15 @@ from typing import cast
 from config import get_settings
 
 from . import report as report_mod
-from .models import EvalCase, RubricName
+from .models import RUBRIC_THRESHOLDS, EvalCase, RubricName
 from .runner import run_evals
 from .synthetic import generate_cases_by_agent
 
 logger = logging.getLogger(__name__)
 
-_VALID_RUBRICS: tuple[str, ...] = (
-    "faithfulness",
-    "plan_quality",
-    "summarization",
-    "json_correctness",
-    "band_adherence",
-    "algorithm_conformance",
-    "role_attribution_validity",
-    "estimate_accuracy",
-    "interval_calibration",
-    "extraction_accuracy",
-    "staffing_adequacy",
-    "classification_accuracy",
-    "enum_constraint_adherence",
-    "partition_correctness",
-    "consistency",
-)
+# Derived from the canonical rubric registry so the CLI choices never drift from the rubrics that
+# actually exist (adding a rubric to RUBRIC_THRESHOLDS automatically makes it selectable here).
+_VALID_RUBRICS: tuple[str, ...] = tuple(RUBRIC_THRESHOLDS.keys())
 
 
 async def main(
