@@ -206,7 +206,7 @@ The **WBS (Work Breakdown Structure)** flow is the bottom-up complement to the p
 
 **WBS-specific contingency.** Because bottom-up estimates run optimistic even after the realism factor, the WBS flow carries its **own** explicit contingency reserve — an editable input on the editor defaulting to **30%** (`WBS_DEFAULT_CONTINGENCY_PCT`) — that uplifts final cost + timeline. It is **independent** of the global `app_settings` contingency the Quick Estimate uses (that one is unchanged).
 
-**Resumable, graph-native drafts.** The WBS hierarchy lives in **Neo4j** as real nodes + relationships: `(:WbsDraft)-[:HAS_CHILD]->(:WbsTask)-[:HAS_CHILD]->…`. Drafts are saved atomically (one managed transaction), so a user can leave and **resume** later (the editor falls back to a localStorage cache when Neo4j is off). A committed estimate hangs the same task subgraph under its `(:Estimate)` node. **Duplicate** clones either an in-progress draft or a completed WBS estimate into a fresh editable draft (new task ids, " (Copy)" name) — duplicating from a completed estimate works even with Neo4j off, sourcing the tree + context from the persisted `envelope_json`.
+**Resumable, graph-native drafts.** The WBS hierarchy lives in **Neo4j** as real nodes + relationships: `(:WbsDraft)-[:HAS_CHILD]->(:WbsTask)-[:HAS_CHILD]->…`. Drafts are saved atomically (one managed transaction), so a user can leave and **resume** later (the editor falls back to a localStorage cache when Neo4j is off). A committed estimate hangs the same task subgraph under its `(:Estimate)` node. **Duplicate** clones either an in-progress draft or a completed WBS estimate into a fresh editable draft (new task ids, " (Copy)" name) — duplicating from a completed estimate works even with Neo4j off, sourcing the tree + context (including the original project description, carried on the envelope as `wbs_raw_input` so a re-draft has prose to plan from) from the persisted `envelope_json`.
 
 The WBS compute reuses, unchanged: `commercial_processing` / `synthesize_estimate`'s typed seams, the Monte Carlo `result_to_hour_range` / `make_rng`, the AI-reduction guardrail bands, role attribution, the review page, and the dashboard history. New code is confined to `agents/wbs_agent.py`, `routers/wbs.py`, `orchestrator/wbs/rollup.py`, `models/wbs_schema.py` + `models/wbs_task.py`, the Neo4j WBS-draft functions, and the `frontend/app/wbs/*` pages.
 
@@ -281,7 +281,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 │   │   ├── admin.py           #   /admin/* (reduction-bands, staffing-coefficients, default-rates,
 │   │   │                      #     {discovery,development,qa}-sizing-method, contingency)
 │   │   ├── catalog.py         #   static option lists for the wizard
-│   │   ├── wbs.py             #   /wbs/draft(+drafts CRUD, duplicate), /estimates/wbs(+/preview, +duplicate)
+│   │   ├── wbs.py             #   /wbs/draft(+/agui stream, drafts CRUD, duplicate), /estimates/wbs(+/preview, +duplicate)
 │   │   └── sow.py             #   POST /estimates/{id}/sow(+/docx) — Statement-of-Work export
 │   ├── agents/                # non-twin LLM helpers (each pins its own model tier):
 │   │   ├── prefill.py         #   Stage 1 → Stage 2 prefill (Haiku, roster-free)
@@ -301,7 +301,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 │   │
 │   ├── orchestrator/
 │   │   ├── graph.py           # StateGraph topology
-│   │   ├── llm.py             # call_structured(...) — forced tool-use → Pydantic; per-agent model resolution
+│   │   ├── llm.py             # call_structured(...) / stream_structured(...) — forced tool-use → Pydantic; per-agent model resolution
 │   │   ├── ai_acceleration.py # AI-reduction guardrail bands + effective_ai_reduction()
 │   │   ├── montecarlo.py      # Monte Carlo uncertainty propagation (pure stdlib Beta-PERT)
 │   │   ├── staffing.py        # team-scaling model: Brooks coordination + diminishing returns (pure stdlib)
@@ -331,7 +331,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 │   ├── models/
 │   │   ├── estimation_state.py  # LangGraph EstimationState TypedDict (incl. reduction_bands, calibration_examples)
 │   │   ├── twin_outputs.py      # Phase, PhaseEstimate, HourRange (+std/mean/percentiles), RiskInput(List), DualScenarioEstimate (+ brooks_overhead_pct/staffing_efficiency_pct/team_size/optimal_team_size), LlmUsage, ...
-│   │   ├── project_schema.py    # CreateEstimateRequest, EstimateEnvelope (+ method/wbs_tree/wbs_stage2/3), Stage2Context (roster), Stage3Context (codebase + AI-tooling), CodebaseContext, AiToolingLevel
+│   │   ├── project_schema.py    # CreateEstimateRequest, EstimateEnvelope (+ method/wbs_tree/wbs_stage2/3/wbs_raw_input), Stage2Context (roster), Stage3Context (codebase + AI-tooling), CodebaseContext, AiToolingLevel
 │   │   ├── wbs_schema.py        # WBS request/response models (draft/save/calculate) + WBS_DEFAULT_CONTINGENCY_PCT
 │   │   └── wbs_task.py          # WbsTaskInput tree node + flatten/rebuild/iter helpers (leaf module)
 │   │
@@ -358,7 +358,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 │   │   ├── logging_config.py  # configure_logging() — root log level + format
 │   │   └── request_logging.py # ASGI middleware: method / path / status / latency per request
 │   │
-│   └── tests/                 # pytest, asyncio auto-mode (~700 tests)
+│   └── tests/                 # pytest, asyncio auto-mode (~750 tests)
 │
 └── frontend/
     ├── app/
@@ -539,6 +539,7 @@ Graceful degradation is intentional — every external dependency (Anthropic, Ne
 | `GET` | `/admin/contingency` | Read the global contingency reserve % (uplifts final cost + timeline; **Quick Estimate only**) + bounds — backs the Settings screen. The WBS flow carries its own per-estimate contingency (default 30%) instead. |
 | `PUT` | `/admin/contingency` | Persist the contingency reserve % (`[0, 100]`). No-ops (response `editable: false`) when Postgres is disabled. |
 | `POST` | `/wbs/draft` | WBS: LLM-draft a Work Breakdown Structure tree from a project description and persist it as a resumable draft. Always returns an editable tree (degrades to a deterministic skeleton). |
+| `POST` | `/wbs/draft/agui` | WBS: **AG-UI streaming** variant of `/wbs/draft` — emits friendly `wbs_progress` custom events as the planner drafts each work package + task, then a `STATE_SNAPSHOT` carrying the persisted draft (`draft_id` + tree + notes + `llm_usage`). Same persisted result as the POST, with live progress. |
 | `GET` | `/wbs/drafts` | WBS: the "resume a draft" list (newest first). `resumable: false` signals Neo4j is off (client falls back to its localStorage cache). |
 | `GET` / `PUT` / `DELETE` | `/wbs/drafts/{id}` | WBS: load a draft to resume / autosave the editor state / discard a draft. `GET` 404s when absent / Neo4j off. |
 | `POST` | `/wbs/drafts/{id}/duplicate` | WBS: clone an in-progress draft into a new editable draft (fresh task ids, " (Copy)" name). |
@@ -582,8 +583,8 @@ A second, separate wizard under `frontend/app/wbs/` (reachable via "WBS Estimate
 |---|---|---|
 | `/wbs` | Landing + resume | "New WBS estimate" plus a **"Resume a draft"** list (`GET /wbs/drafts`); each row links to the editor and offers Duplicate / Delete. Notes when resume needs Neo4j. |
 | `/wbs/new` | 1. Describe | Project description + codebase-context picker + freeform AI-tooling field (with a prefill helper). |
-| `/wbs/team` | 2. Team | Transition page that prefills the **roster** (roster agent) and classifies the **AI tooling** from the description before drafting; classification is awaited at submit so the per-phase tooling — hence the AI-savings — is never baked in as all-`none`. |
-| `/wbs/edit/[draftId]` | 3. Edit & review | The interactive tree editor (`<WbsTreeViewEditor>`), a **Contingency reserve %** input (default 30%), debounced autosave (`PUT /wbs/drafts/{id}`), a **Re-evaluate** button (`POST /estimates/wbs/preview`, live total + duration), and **Submit** (`POST /estimates/wbs` → redirect to the shared `/estimate/{id}/review`). |
+| `/wbs/team` | 2. Team | Transition page that prefills the **roster** (roster agent) and classifies the **AI tooling** from the description before drafting; classification is awaited at submit so the per-phase tooling — hence the AI-savings — is never baked in as all-`none`. Drafting **streams live progress** over AG-UI (`lib/wbs-agui.ts` → `POST /wbs/draft/agui`): a `<ProgressBar>` shows a single rolling status line narrating each work package + task as the planner produces it (no fake percentage), falling back to the plain `POST /wbs/draft` if streaming fails. |
+| `/wbs/edit/[draftId]` | 3. Edit & review | The interactive tree editor (`<WbsTreeViewEditor>`), a **Contingency reserve %** input (default 30%), debounced autosave (`PUT /wbs/drafts/{id}`), a **Re-evaluate** button (`POST /estimates/wbs/preview`, live total + duration), an **LLM-cost** modal (`<LlmUsageModal>` — what the planner draft cost), and **Submit** (`POST /estimates/wbs` → redirect to the shared `/estimate/{id}/review`). |
 
 The shared review page (`/estimate/[id]/review`) renders a WBS estimate from the same `DualScenarioEstimate`, hiding the twin-only algorithm badges/breakdown charts and adding a read-only WBS-tree panel; it offers "Duplicate as new draft".
 
@@ -654,7 +655,7 @@ The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remov
 
 ## Testing
 
-Backend (~700 tests, pytest with asyncio auto-mode):
+Backend (~750 tests, pytest with asyncio auto-mode):
 
 ```bash
 cd backend && uv run pytest                              # full suite
