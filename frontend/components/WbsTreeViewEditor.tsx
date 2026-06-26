@@ -7,13 +7,15 @@ import { TreeItem } from "@mui/x-tree-view/TreeItem";
 import { useMemo, useState } from "react";
 
 import { Modal } from "@/components/Modal";
-import { ROLE_CATEGORY_LABELS, type CustomRoleInput } from "@/lib/schemas";
+import { type CustomRoleInput } from "@/lib/schemas";
+import { designateTeamMembers, type TeamMember } from "@/lib/team-roster";
 import { PHASE_LABELS, type Phase } from "@/lib/types";
 import {
   addChild,
   branchIds,
   clampHours,
   countLeaves,
+  dependencyTargets,
   findNode,
   isLeaf,
   moveNode,
@@ -22,6 +24,7 @@ import {
   newPackage,
   PHASE_ORDER,
   pertMean,
+  pruneDanglingDependencies,
   removeNode,
   rolledHoursMap,
   updateNode,
@@ -37,21 +40,79 @@ interface Props {
 
 interface LeafFieldsProps {
   leaf: WbsTaskInput;
-  roster: CustomRoleInput[];
+  members: TeamMember[];
   defaultRole: string;
+  dependsOnOptions: { id: string; name: string }[];
   patch: (id: string, p: Partial<WbsTaskInput>) => void;
 }
 
 type HourField = "optimistic" | "most_likely" | "pessimistic";
 
-/** Concise role label for the leaf dropdowns: the role's category (e.g. "Engineering"); falls back
- *  to the free-form description when the category is "other". */
-function roleLabel(r: CustomRoleInput): string {
-  return r.category !== "other" ? ROLE_CATEGORY_LABELS[r.category] : r.description;
+/** Small round badge for a task's assignee — the member's A/B/C designation (when the role is
+ *  shared by more than one seat) or the role's initial otherwise. Visually ties a task row to the
+ *  individual in the Team roster. */
+function AssigneeBadge({ member }: { member?: TeamMember }) {
+  if (!member) return null;
+  return (
+    <span
+      title={member.label}
+      className="inline-flex h-4 shrink-0 items-center justify-center rounded-full bg-brand-50 px-1.5 text-[0.65rem] font-semibold text-brand-700"
+    >
+      {member.designation ?? member.description.charAt(0).toUpperCase()}
+    </span>
+  );
 }
 
-/** Edit-modal body for a leaf task: phase, role, 3-point hours, PERT readout, description. */
-function LeafFields({ leaf, roster, defaultRole, patch }: LeafFieldsProps) {
+/** A "Depends on" multi-select: a scrollable checkbox list of eligible predecessors (same-kind
+ *  nodes from `dependencyTargets`). Selection order follows the option (document) order so it stays
+ *  stable across toggles. Renders a muted note when there's nothing eligible to depend on. */
+function DependsOnField({
+  value,
+  options,
+  emptyNote,
+  onChange,
+}: {
+  value: string[];
+  options: { id: string; name: string }[];
+  emptyNote: string;
+  onChange: (next: string[]) => void;
+}) {
+  const selected = new Set(value);
+  const toggle = (id: string) => {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    onChange(options.filter((o) => next.has(o.id)).map((o) => o.id));
+  };
+  return (
+    <div className="block">
+      <span className="label">Depends on</span>
+      {options.length === 0 ? (
+        <p className="text-xs muted">{emptyNote}</p>
+      ) : (
+        <>
+          <div className="mt-1 max-h-32 space-y-1 overflow-y-auto rounded-md border border-slate-200 p-2">
+            {options.map((o) => (
+              <label key={o.id} className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5 shrink-0"
+                  checked={selected.has(o.id)}
+                  onChange={() => toggle(o.id)}
+                />
+                <span className="truncate text-slate-700">{o.name}</span>
+              </label>
+            ))}
+          </div>
+          <p className="help">Predecessors that must finish before this can start.</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Edit-modal body for a leaf task: phase, assignee, 3-point hours, PERT readout, description. */
+function LeafFields({ leaf, members, defaultRole, dependsOnOptions, patch }: LeafFieldsProps) {
   // Keep a transient string draft for the ONE hour field currently being edited so the user can
   // clear it / type a partial value ("", "12.") without the controlled value snapping back to a
   // number mid-typing. The committed tree value is always the clamped non-negative number.
@@ -74,15 +135,15 @@ function LeafFields({ leaf, roster, defaultRole, patch }: LeafFieldsProps) {
           </select>
         </label>
         <label className="block">
-          <span className="label">Role</span>
+          <span className="label">Assignee</span>
           <select
             className="input"
             value={leaf.role_id ?? defaultRole}
             onChange={(e) => patch(leaf.id, { role_id: e.target.value })}
           >
-            {roster.map((r) => (
-              <option key={r.role_id} value={r.role_id}>
-                {roleLabel(r)}
+            {members.map((m) => (
+              <option key={m.role_id} value={m.role_id}>
+                {m.label}
               </option>
             ))}
           </select>
@@ -152,6 +213,13 @@ function LeafFields({ leaf, roster, defaultRole, patch }: LeafFieldsProps) {
           onChange={(e) => patch(leaf.id, { description: e.target.value })}
         />
       </label>
+
+      <DependsOnField
+        value={leaf.depends_on ?? []}
+        options={dependsOnOptions}
+        emptyNote="No other tasks to depend on yet."
+        onChange={(next) => patch(leaf.id, { depends_on: next })}
+      />
     </>
   );
 }
@@ -159,12 +227,24 @@ function LeafFields({ leaf, roster, defaultRole, patch }: LeafFieldsProps) {
 interface BranchFieldsProps {
   branch: WbsTaskInput;
   hours: Map<string, number>;
+  memberById: Map<string, TeamMember>;
+  dependsOnOptions: { id: string; name: string }[];
   onSelect: (id: string) => void;
   onAddTask: (parentId: string) => void;
+  patch: (id: string, p: Partial<WbsTaskInput>) => void;
 }
 
-/** Edit-modal body for a branch (work package): child summary + drill-in list + add-task. */
-function BranchFields({ branch, hours, onSelect, onAddTask }: BranchFieldsProps) {
+/** Edit-modal body for a branch (work package): child summary + drill-in list + add-task +
+ *  a "depends on" selector limited to other work packages. */
+function BranchFields({
+  branch,
+  hours,
+  memberById,
+  dependsOnOptions,
+  onSelect,
+  onAddTask,
+  patch,
+}: BranchFieldsProps) {
   return (
     <div className="space-y-2">
       <p className="text-sm text-slate-700">
@@ -188,6 +268,7 @@ function BranchFields({ branch, hours, onSelect, onAddTask }: BranchFieldsProps)
                   />
                 )}
                 <span className="truncate text-sm">{c.name}</span>
+                {isLeaf(c) && c.role_id && <AssigneeBadge member={memberById.get(c.role_id)} />}
               </span>
               <span className="shrink-0 text-xs muted">
                 {Math.round(hours.get(c.id) ?? 0)} h ›
@@ -203,6 +284,15 @@ function BranchFields({ branch, hours, onSelect, onAddTask }: BranchFieldsProps)
       >
         + Add task
       </button>
+
+      <div className="border-t border-slate-100 pt-2">
+        <DependsOnField
+          value={branch.depends_on ?? []}
+          options={dependsOnOptions}
+          emptyNote="No other work packages to depend on yet."
+          onChange={(next) => patch(branch.id, { depends_on: next })}
+        />
+      </div>
     </div>
   );
 }
@@ -216,6 +306,14 @@ export function WbsTreeViewEditor({ tree, roster, onChange }: Props) {
   // One bottom-up pass for every node's rolled-up most-likely hours (O(n)); replaces the per-node
   // subtreeMostLikely re-walks that were O(n²) on every keystroke.
   const hours = useMemo(() => rolledHoursMap(tree), [tree]);
+
+  // Resolve the roster into individual team members (duplicate roles get A/B/C designations) so
+  // tasks can be assigned to — and labeled by — a specific person, not just a role.
+  const members = useMemo(() => designateTeamMembers(roster), [roster]);
+  const memberById = useMemo(
+    () => new Map(members.map((m) => [m.role_id, m])),
+    [members],
+  );
 
   const defaultRole = roster[0]?.role_id ?? "sr_engineer";
   const defaultPhase: Phase = "development";
@@ -231,14 +329,21 @@ export function WbsTreeViewEditor({ tree, roster, onChange }: Props) {
   };
   const addTopTask = () => onChange([...tree, newLeaf(defaultPhase, defaultRole)]);
   const addTaskTo = (parentId: string) => {
-    onChange(addChild(tree, parentId, newLeaf(defaultPhase, defaultRole)));
+    // Adding a child flips a leaf parent into a branch; prune so a sibling's now-cross-kind
+    // depends_on edge (leaf→package) and the parent's own now-invalid leaf deps are scrubbed.
+    onChange(pruneDanglingDependencies(addChild(tree, parentId, newLeaf(defaultPhase, defaultRole))));
     setExpanded((e) => (e.includes(parentId) ? e : [...e, parentId]));
   };
   const remove = (id: string) => {
-    onChange(removeNode(tree, id));
+    // Prune the node, then scrub any now-dangling depends_on edges that pointed at it (or at a
+    // package the removal emptied + pruned) so the tree stays referentially valid.
+    onChange(pruneDanglingDependencies(removeNode(tree, id)));
     setSelectedId(null);
   };
-  const move = (id: string, target: string | null) => onChange(moveNode(tree, id, target));
+  // moveNode can empty+prune the source package and flip the target leaf into a branch; prune after
+  // so no depends_on edge is left dangling or cross-kind (mirrors `remove`).
+  const move = (id: string, target: string | null) =>
+    onChange(pruneDanglingDependencies(moveNode(tree, id, target)));
 
   // --- recursive tree rows -----------------------------------------------------------------
   const renderItem = (node: WbsTaskInput) => (
@@ -255,6 +360,9 @@ export function WbsTreeViewEditor({ tree, roster, onChange }: Props) {
               />
             )}
             <span className="truncate text-sm">{node.name}</span>
+            {isLeaf(node) && node.role_id && (
+              <AssigneeBadge member={memberById.get(node.role_id)} />
+            )}
             <span className="shrink-0 text-xs text-slate-400">
               {Math.round(hours.get(node.id) ?? 0)} h
             </span>
@@ -277,6 +385,13 @@ export function WbsTreeViewEditor({ tree, roster, onChange }: Props) {
   );
 
   const targets = selected ? moveTargets(tree, selected.id) : [];
+  // Eligible predecessors for the selected node — same kind, no self, no cycle (see dependencyTargets).
+  // Memoized: dependencyTargets walks the whole tree + runs a BFS, so recomputing it on every render
+  // (each keystroke in an open task modal produces a new `tree`) caused visible typing lag at scale.
+  const dependsOnOptions = useMemo(
+    () => (selectedId ? dependencyTargets(tree, selectedId) : []),
+    [tree, selectedId],
+  );
 
   return (
     <div className="space-y-3">
@@ -320,16 +435,20 @@ export function WbsTreeViewEditor({ tree, roster, onChange }: Props) {
             {isLeaf(selected) ? (
               <LeafFields
                 leaf={selected}
-                roster={roster}
+                members={members}
                 defaultRole={defaultRole}
+                dependsOnOptions={dependsOnOptions}
                 patch={patch}
               />
             ) : (
               <BranchFields
                 branch={selected}
                 hours={hours}
+                memberById={memberById}
+                dependsOnOptions={dependsOnOptions}
                 onSelect={setSelectedId}
                 onAddTask={addTaskTo}
+                patch={patch}
               />
             )}
 

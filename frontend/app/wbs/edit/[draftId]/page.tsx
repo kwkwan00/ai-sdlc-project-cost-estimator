@@ -10,9 +10,19 @@ import {
   previewWbs,
   saveWbsDraft,
 } from "@/lib/api-client";
-import { DEFAULT_ROSTER, type Stage2Input, type Stage3Input } from "@/lib/schemas";
-import { formatHours, formatUSD } from "@/lib/format";
-import type { DualScenarioEstimate } from "@/lib/types";
+import { LlmUsageModal } from "@/components/LlmUsageModal";
+import { Modal } from "@/components/Modal";
+import {
+  CODEBASE_CONTEXT_LABELS,
+  DEFAULT_ROSTER,
+  ROLE_CATEGORY_LABELS,
+  ROLE_SENIORITY_LABELS,
+  type Stage2Input,
+  type Stage3Input,
+} from "@/lib/schemas";
+import { formatHours, formatUSD, formatUSDPrecise } from "@/lib/format";
+import type { DualScenarioEstimate, LlmUsage } from "@/lib/types";
+import { designateTeamMembers } from "@/lib/team-roster";
 import { clearWbsCache, loadWbsCache, saveWbsCache } from "@/lib/wbs-store";
 import { countLeaves, rollupRange, type WbsTaskInput } from "@/lib/wbs";
 
@@ -46,6 +56,10 @@ export default function WbsEditorPage() {
   const [previewing, setPreviewing] = useState(false);
   const [committing, setCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [inputsOpen, setInputsOpen] = useState(false);
+  const [teamOpen, setTeamOpen] = useState(false);
+  const [llmOpen, setLlmOpen] = useState(false);
+  const [llmUsage, setLlmUsage] = useState<LlmUsage | null>(null);
 
   const roster = stage2?.roster?.roles ?? DEFAULT_ROSTER;
 
@@ -77,6 +91,7 @@ export default function WbsEditorPage() {
       setStage3(draft.stage3 ?? undefined);
       // Resume the saved reserve; a pre-existing draft without one falls back to the WBS default.
       setContingency(draft.contingency_pct ?? WBS_DEFAULT_CONTINGENCY_PCT);
+      setLlmUsage(draft.llm_usage ?? null);
       setLoaded(true);
     }
     load();
@@ -176,6 +191,8 @@ export default function WbsEditorPage() {
   // transitions). Hooks stay above the early returns to keep the hook order stable.
   const localRange = useMemo(() => rollupRange(tree), [tree]);
   const leafCount = useMemo(() => countLeaves(tree), [tree]);
+  // Individual team members (duplicate roles get A/B/C… designations) for the Team modal.
+  const teamMembers = useMemo(() => designateTeamMembers(roster), [roster]);
 
   if (!loaded) return <p className="muted text-sm">Loading draft…</p>;
   if (loadError)
@@ -202,6 +219,46 @@ export default function WbsEditorPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setInputsOpen(true)}
+            title="View the original project description and AI tooling this WBS was drafted from"
+            className="btn-secondary"
+          >
+            Project brief
+          </button>
+          <button
+            type="button"
+            onClick={() => setTeamOpen(true)}
+            title="View the generated team roster used to attribute and cost this WBS"
+            className="btn-secondary"
+          >
+            Team
+          </button>
+          {llmUsage && llmUsage.call_count > 0 && (
+            <button
+              type="button"
+              onClick={() => setLlmOpen(true)}
+              title="LLM token cost to draft this WBS"
+              className="btn-secondary inline-flex items-center gap-1.5"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                className="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v10" />
+                <path d="M14.5 9.3A2.4 2 0 0 0 12 8c-1.4 0-2.5.8-2.5 1.9 0 1 .9 1.6 2.5 2s2.5 1 2.5 2.1-1.1 1.9-2.5 1.9a2.4 2 0 0 1-2.5-1.3" />
+              </svg>
+              {formatUSDPrecise(llmUsage.cost_usd)}
+            </button>
+          )}
           <button
             type="button"
             onClick={handleReevaluate}
@@ -284,6 +341,115 @@ export default function WbsEditorPage() {
       <section className="card">
         <WbsTreeViewEditor tree={tree} roster={roster} onChange={setTree} />
       </section>
+
+      <Modal
+        open={inputsOpen}
+        onClose={() => setInputsOpen(false)}
+        title="Project brief"
+        widthClass="max-w-2xl"
+      >
+        <div className="space-y-4 text-sm">
+          <div>
+            <h3 className="font-semibold text-slate-900">Project description</h3>
+            {rawInput.trim() ? (
+              <p className="mt-1 whitespace-pre-wrap text-slate-700">{rawInput}</p>
+            ) : (
+              <p className="mt-1 muted">No description was provided.</p>
+            )}
+          </div>
+
+          <div>
+            <h3 className="font-semibold text-slate-900">AI tooling</h3>
+            {stage3?.ai_tooling_description?.trim() ? (
+              <p className="mt-1 whitespace-pre-wrap text-slate-700">
+                {stage3.ai_tooling_description}
+              </p>
+            ) : (
+              <p className="mt-1 muted">No AI tooling was described.</p>
+            )}
+          </div>
+
+          <div>
+            <h3 className="font-semibold text-slate-900">Codebase context</h3>
+            <p className="mt-1 text-slate-700">
+              {stage3?.codebase_context
+                ? CODEBASE_CONTEXT_LABELS[stage3.codebase_context]
+                : "—"}
+            </p>
+          </div>
+
+          {stage3?.technology_stack?.trim() && (
+            <div>
+              <h3 className="font-semibold text-slate-900">Technology stack</h3>
+              <p className="mt-1 whitespace-pre-wrap text-slate-700">
+                {stage3.technology_stack}
+              </p>
+            </div>
+          )}
+        </div>
+      </Modal>
+
+      <Modal
+        open={teamOpen}
+        onClose={() => setTeamOpen(false)}
+        title="Team roster"
+        widthClass="max-w-2xl"
+      >
+        {teamMembers.length === 0 ? (
+          <p className="text-sm muted">No team roster was generated for this draft.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 text-left text-xs uppercase tracking-wide text-slate-500">
+                  <th className="py-2 pr-3 font-medium">Team member</th>
+                  <th className="py-2 pr-3 font-medium">Category</th>
+                  <th className="py-2 pr-3 font-medium">Seniority</th>
+                  <th className="py-2 pr-3 text-right font-medium">Rate / h</th>
+                  <th className="py-2 text-right font-medium">Allocation</th>
+                </tr>
+              </thead>
+              <tbody>
+                {teamMembers.map((member) => (
+                  <tr key={member.role_id} className="border-b border-slate-100">
+                    <td className="py-2 pr-3">
+                      <div className="flex items-center gap-2">
+                        <span
+                          aria-hidden="true"
+                          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-brand-50 text-xs font-semibold text-brand-700"
+                        >
+                          {member.designation ?? member.description.charAt(0).toUpperCase()}
+                        </span>
+                        <span className="text-slate-800">{member.label}</span>
+                      </div>
+                    </td>
+                    <td className="py-2 pr-3 text-slate-700">
+                      {ROLE_CATEGORY_LABELS[member.category]}
+                    </td>
+                    <td className="py-2 pr-3 text-slate-700">
+                      {ROLE_SENIORITY_LABELS[member.seniority]}
+                    </td>
+                    <td className="py-2 pr-3 text-right text-slate-700">
+                      {formatUSD(member.rate_per_hour)}
+                    </td>
+                    <td className="py-2 text-right text-slate-700">{member.percentage}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Modal>
+
+      {llmUsage && (
+        <LlmUsageModal
+          open={llmOpen}
+          onClose={() => setLlmOpen(false)}
+          usage={llmUsage}
+          title="WBS draft — LLM cost & usage"
+          subtitle="What it cost to draft this Work Breakdown Structure via the Anthropic API — the planner's token cost, separate from the project labor cost."
+        />
+      )}
     </div>
   );
 }

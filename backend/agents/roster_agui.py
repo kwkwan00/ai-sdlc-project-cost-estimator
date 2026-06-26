@@ -32,29 +32,41 @@ from fastapi.responses import StreamingResponse
 from agents.roster_agent import CatalogRole, proposal_to_roster, run_roster_agent
 from db.repositories import get_custom_roles, get_default_rates
 from models.project_schema import Stage2Context
+from models.twin_outputs import Phase
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_inputs(input_data: RunAgentInput) -> tuple[Stage2Context, str]:
-    """Pull the interpreted Stage 2 context + raw description from the run input.
+def _extract_inputs(input_data: RunAgentInput) -> tuple[Stage2Context, str, list[Phase]]:
+    """Pull the interpreted Stage 2 context + raw description + selected SDLC phases from the run
+    input.
 
     The frontend passes them via AG-UI ``forwardedProps``:
-        {"stage2": <Stage2Context dict>, "raw_input": "<description>"}
-    Falls back to an empty Stage2Context so the agent can still run if either is
-    missing or malformed.
+        {"stage2": <Stage2Context dict>, "raw_input": "<description>",
+         "selected_phases": ["development", "qa_testing"]}
+    Falls back to an empty Stage2Context / empty phase scope so the agent can still run if anything
+    is missing or malformed (an unparseable phase is dropped, never raised).
     """
     props = input_data.forwarded_props or {}
     raw_input = ""
     stage2_data = None
+    phases_raw: object = []
     if isinstance(props, dict):
         raw_input = str(props.get("raw_input") or "")
         stage2_data = props.get("stage2")
+        phases_raw = props.get("selected_phases") or []
     try:
         stage2 = Stage2Context.model_validate(stage2_data) if stage2_data else Stage2Context()
     except Exception:  # noqa: BLE001 - bad client payload shouldn't 500 the run
         stage2 = Stage2Context()
-    return stage2, raw_input
+    selected_phases: list[Phase] = []
+    if isinstance(phases_raw, list):
+        for p in phases_raw:
+            try:
+                selected_phases.append(Phase(str(p)))
+            except ValueError:
+                continue  # ignore an unknown phase value rather than failing the run
+    return stage2, raw_input, selected_phases
 
 
 async def roster_agui_endpoint(
@@ -77,14 +89,16 @@ async def roster_agui_endpoint(
             input_data.run_id,
         )
         try:
-            stage2, raw_input = _extract_inputs(input_data)
+            stage2, raw_input, selected_phases = _extract_inputs(input_data)
             # Fetch the rate card up front so the agent can be TOLD about the org's custom roles
             # (and SELECT one by id), then price the selection deterministically afterward.
             overrides, custom = await asyncio.gather(get_default_rates(), get_custom_roles())
             catalog = [
                 CatalogRole(c.role_id, c.label, c.category, c.seniority, c.rate) for c in custom
             ]
-            proposal = await run_roster_agent(stage2, raw_input, custom_roles=catalog)
+            proposal = await run_roster_agent(
+                stage2, raw_input, custom_roles=catalog, selected_phases=selected_phases
+            )
             # A proposed role whose catalog_role_id is a valid catalog id is priced at that role's
             # exact rate and carries its id; otherwise it's grid-priced (no fuzzy label matching).
             roster = proposal_to_roster(proposal, overrides, catalog)

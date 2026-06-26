@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import Annotated, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
 from config import get_settings
 from models.project_schema import CustomRole, RoleRoster, Stage2Context
-from models.twin_outputs import RoleCategory, RoleSeniority
+from models.twin_outputs import Phase, RoleCategory, RoleSeniority
 from orchestrator.llm import call_structured, render_context_block
 from orchestrator.prompts import load_prompt
 from pricing import resolve_rate
@@ -40,6 +41,21 @@ logger = logging.getLogger(__name__)
 _MAX_ROLES = 8
 
 
+def _clip(limit: int) -> Callable[[object], object]:
+    """Truncate an over-long LLM string to ``limit`` chars instead of failing validation.
+
+    The model sometimes ignores the schema's ``maxLength`` — e.g. a rationale a few words over the
+    cap — and a slightly-too-long free-text field shouldn't sink the whole structured-output call,
+    which forces a retry and, if that also overshoots, a fallback to the deterministic roster. We
+    keep ``max_length`` in the schema as a hint to the model and clip as the safety net (a 'before'
+    validator, so it runs ahead of the length constraint)."""
+
+    def _truncate(value: object) -> object:
+        return value[:limit] if isinstance(value, str) else value
+
+    return _truncate
+
+
 # ---------- agent response model (enum-constrained; LLM emits structure only) ----------
 
 
@@ -47,8 +63,8 @@ class ProjectPlanItem(BaseModel):
     """One high-level workstream in the proposed delivery plan."""
 
     model_config = ConfigDict(extra="forbid")
-    workstream: str = Field(min_length=1, max_length=80)
-    summary: str = Field(min_length=1, max_length=160)
+    workstream: Annotated[str, BeforeValidator(_clip(80))] = Field(min_length=1, max_length=80)
+    summary: Annotated[str, BeforeValidator(_clip(160))] = Field(min_length=1, max_length=160)
 
 
 class ProposedRole(BaseModel):
@@ -61,7 +77,7 @@ class ProposedRole(BaseModel):
     deterministic key lookup, not a fuzzy label match). Null / unknown → priced from the grid."""
 
     model_config = ConfigDict(extra="forbid")
-    description: str = Field(min_length=1, max_length=120)
+    description: Annotated[str, BeforeValidator(_clip(120))] = Field(min_length=1, max_length=120)
     category: RoleCategory = RoleCategory.OTHER
     seniority: RoleSeniority = RoleSeniority.OTHER
     percentage: float = Field(default=0.0, ge=0, le=100)
@@ -77,7 +93,9 @@ class RosterProposal(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     project_plan: list[ProjectPlanItem] = Field(default_factory=list, max_length=6)
-    staffing_rationale: str = Field(default="", max_length=300)
+    # 400, not 300: the prompt asks for ≤45 words naming specific integrations/regimes, which runs
+    # past 300 chars in practice — the old cap mismatched its own instruction and tripped the retry.
+    staffing_rationale: Annotated[str, BeforeValidator(_clip(400))] = Field(default="", max_length=400)
     roles: list[ProposedRole] = Field(min_length=1, max_length=_MAX_ROLES)
 
 
@@ -221,6 +239,26 @@ def proposal_to_roster(
 # ---------- agent entry point ----------
 
 
+def _phases_in_scope_block(selected_phases: list[Phase] | None) -> str:
+    """Tell the agent which SDLC phases the engagement covers so it staffs for ONLY those phases.
+
+    Empty/None or the full set → "" (no constraint — full-lifecycle staffing). A strict subset →
+    a block naming the in-scope phases and instructing the agent not to staff roles whose work is
+    entirely out of scope (e.g. no dedicated UX designer when ux_design is excluded)."""
+    if not selected_phases:
+        return ""
+    scope = [p for p in Phase if p in set(selected_phases)]
+    if len(scope) >= len(list(Phase)):
+        return ""
+    labels = ", ".join(p.value for p in scope)
+    return (
+        f"Scope — this engagement covers ONLY these SDLC phases: {labels}. Staff the team for "
+        "these phases only: do not propose a role whose work lives entirely in an out-of-scope "
+        "phase (e.g. no dedicated UX designer if ux_design is out of scope; no QA lead if "
+        "qa_testing is out of scope), and weight the effort split toward the in-scope phases.\n\n"
+    )
+
+
 def _custom_role_catalog_block(catalog: list[CatalogRole]) -> str:
     """Render the admin's predefined custom roles as a prompt block instructing the agent to SELECT
     one by id (``catalog_role_id``) when a role it would propose corresponds to it, so the org's set
@@ -244,12 +282,16 @@ async def run_roster_agent(
     stage2: Stage2Context,
     raw_input: str,
     custom_roles: list[CatalogRole] | None = None,
+    selected_phases: list[Phase] | None = None,
 ) -> RosterProposal:
     """Run the roster agent: one fast Sonnet forced-tool-use call.
 
     ``custom_roles`` is the admin's rate-card catalog (``CatalogRole`` per predefined role); when
     present it's injected into the prompt so the agent can deliberately SELECT a predefined role by
     its id (``ProposedRole.catalog_role_id``), which the backstop then prices at the org's rate.
+
+    ``selected_phases`` is the engagement's SDLC scope; a strict subset constrains the agent to
+    staff for those phases only (a full set / None imposes no constraint).
 
     Raises on LLM failure (no API key, network); the caller in `prefill` handles
     the fallback to the default roster.
@@ -266,6 +308,7 @@ async def run_roster_agent(
     user = (
         f"Project description:\n\n{raw_input}\n\n"
         f"Interpreted project context:\n{render_context_block(context)}\n\n"
+        f"{_phases_in_scope_block(selected_phases)}"
         f"{_custom_role_catalog_block(custom_roles or [])}"
         "Sketch the high-level delivery plan, then propose the team roster."
     )

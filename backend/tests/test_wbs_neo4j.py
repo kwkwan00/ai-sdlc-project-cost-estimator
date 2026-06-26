@@ -207,3 +207,20 @@ async def test_load_wbs_draft_surfaces_contingency_pct(monkeypatch) -> None:
     loaded = await adapter.load_wbs_draft("d1")
     assert loaded is not None
     assert loaded["contingency_pct"] == 25.0
+
+
+async def test_load_wbs_draft_surfaces_llm_usage_json(monkeypatch) -> None:
+    # The planner's LLM meta-cost is captured at draft time and persisted on the draft node so the
+    # editor can show an LLM-cost icon after a resume (the deterministic rollup spends no tokens).
+    blob = '{"call_count": 1, "cost_usd": 0.42, "by_model": []}'
+
+    class _Driver:
+        def session(self, **_: object) -> _SingleRecordSession:
+            return _SingleRecordSession(
+                {"draft_id": "d1", "project_name": "x", "llm_usage_json": blob}, []
+            )
+
+    monkeypatch.setattr(adapter, "get_driver", _async_returning(_Driver()))
+    loaded = await adapter.load_wbs_draft("d1")
+    assert loaded is not None
+    assert loaded["llm_usage_json"] == blob

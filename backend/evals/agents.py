@@ -57,6 +57,21 @@ def _stage3_from_input(data: dict[str, Any]) -> Stage3Context:
     return Stage3Context.model_validate(raw)
 
 
+def _selected_phases_from_input(data: dict[str, Any]) -> list[Phase] | None:
+    """Coerce a case's ``selected_phases`` (list of phase-value strings) to ``list[Phase]``; None
+    when absent/empty. Unknown values are dropped. Feeds the WBS planner's + roster agent's scope."""
+    raw = data.get("selected_phases")
+    if not raw:
+        return None
+    phases: list[Phase] = []
+    for p in raw:
+        try:
+            phases.append(Phase(str(p)))
+        except ValueError:
+            continue
+    return phases or None
+
+
 def _twin_retrieval_context(state: EstimationState, phase_value: str) -> list[str]:
     """Discrete context items the twin saw, one per top-level context key.
 
@@ -231,6 +246,7 @@ class _RosterAdapter:
             for c in case.input.get("custom_roles", [])
         ]
         stage2 = _stage2_from_input(case.input) or Stage2Context()
+        selected_phases = _selected_phases_from_input(case.input)
         retrieval = [f"raw_input: {raw_input}"]
         retrieval.extend(
             f"stage2.{key}: {json.dumps(value, default=str)}"
@@ -244,15 +260,23 @@ class _RosterAdapter:
             }.items()
         )
         task_input = "Propose a delivery plan + team roster for the project."
-        # staffing_adequacy derives required categories from these Stage 2 signals.
+        # staffing_adequacy derives required categories from these Stage 2 signals, relaxing the
+        # specialist requirements whose phase is out of scope.
         eval_context: dict[str, Any] = {
             "stage2_signals": {
                 "screen_count": stage2.screen_count_estimate,
                 "regulatory": list(stage2.regulatory_requirements),
             }
         }
+        if selected_phases:
+            scope_values = [p.value for p in selected_phases]
+            eval_context["selected_phases"] = scope_values
+            # Surface the scope so the faithfulness / plan_quality judges assess scope-fit.
+            retrieval.append(f"selected_phases (scope): {scope_values}")
         try:
-            proposal = await run_roster_agent(stage2, raw_input, custom_roles=catalog or None)
+            proposal = await run_roster_agent(
+                stage2, raw_input, custom_roles=catalog or None, selected_phases=selected_phases
+            )
         except Exception as exc:  # noqa: BLE001
             return AgentSample(
                 case_id=case.id,
@@ -265,8 +289,12 @@ class _RosterAdapter:
                 error=str(exc),
             )
         plan = "; ".join(f"{p.workstream}: {p.summary}" for p in proposal.project_plan)
+        # Render each role's catalog selection when present, so the plan_quality judge can SEE that
+        # the agent deliberately reused a predefined org role (the expected_output asks for it) —
+        # otherwise the selection is invisible and the judge wrongly reads it as "didn't select".
         roles = "; ".join(
             f"{r.description} [{r.category.value}/{r.seniority.value}] {r.percentage}%"
+            + (f" (selected catalog role: {r.catalog_role_id})" if r.catalog_role_id else "")
             for r in proposal.roles
         )
         output_text = (
@@ -376,12 +404,18 @@ class _WbsAdapter:
 
         raw_input = case.input.get("raw_input", "")
         stage2 = _stage2_from_input(case.input)
-        req = WbsDraftRequest(raw_input=raw_input, stage2=stage2)
+        selected_phases = _selected_phases_from_input(case.input)
+        req = WbsDraftRequest(raw_input=raw_input, stage2=stage2, selected_phases=selected_phases)
         roster = stage2.roster if stage2 and stage2.roster.roles else RoleRoster.default()
         retrieval = [f"raw_input: {raw_input}"]
         task_input = "Decompose the project into a Work Breakdown Structure (work packages → tasks)."
-        # wbs_structural checks every leaf's role_id against the roster.
+        # wbs_structural checks every leaf's role_id against the roster, the depends_on edges, and
+        # (when a scope is pinned) that no leaf falls outside selected_phases.
         eval_context: dict[str, Any] = {"roster_role_ids": [r.role_id for r in roster.roles]}
+        if selected_phases:
+            scope_values = [p.value for p in selected_phases]
+            eval_context["selected_phases"] = scope_values
+            retrieval.append(f"selected_phases (scope): {scope_values}")
         try:
             # generate_wbs_tree ALWAYS returns a valid tree (deterministic fallback with no API key),
             # so wbs_structural is a real offline gate; the planner output is scored when a key is set.
@@ -392,17 +426,38 @@ class _WbsAdapter:
                 retrieval_context=retrieval, expected_output=case.expected_output,
                 gold=case.gold, eval_context=eval_context, error=str(exc),
             )
-        from models.wbs_task import count_tasks, iter_leaves
+        from models.wbs_task import WbsTaskInput, count_tasks, iter_leaves
 
         leaves = list(iter_leaves(tree))
-        output_text = (
-            f"{count_tasks(tree)} tasks ({len(leaves)} leaves); notes: {notes}\n"
-            + "\n".join(
-                f"- [{leaf.phase.value if leaf.phase else '?'}] {leaf.name} "
-                f"({leaf.role_id}) {leaf.optimistic}/{leaf.most_likely}/{leaf.pessimistic}h"
-                for leaf in leaves
-            )
+
+        # Render the work-package → task HIERARCHY (not a flat leaf list) so the plan_quality judge
+        # can actually see the WBS structure the planner produced — a flat dump was being read as
+        # "not really a WBS / no work packages shown". Show the real Σ most-likely so the total is
+        # self-consistent (the judge cross-checks any claimed total against the leaf hours).
+        def _render(nodes: list[WbsTaskInput], depth: int = 0) -> list[str]:
+            out: list[str] = []
+            for n in nodes:
+                pad = "  " * depth
+                if n.is_leaf:
+                    ph = n.phase.value if n.phase else "?"
+                    out.append(
+                        f"{pad}- [{ph}] {n.name} ({n.role_id}) "
+                        f"{n.optimistic}/{n.most_likely}/{n.pessimistic}h"
+                    )
+                else:
+                    out.append(f"{pad}■ {n.name}  (work package)")
+                    out.extend(_render(n.children, depth + 1))
+            return out
+
+        pkg_count = sum(1 for n in tree if not n.is_leaf)
+        total_ml = round(sum((leaf.most_likely or 0) for leaf in leaves))
+        header = (
+            f"{pkg_count} work package(s) → {len(leaves)} leaf tasks "
+            f"({count_tasks(tree)} nodes); Σ most-likely ≈ {total_ml}h."
         )
+        if notes:
+            header += f" Notes: {notes}"
+        output_text = header + "\n" + "\n".join(_render(tree))
         return AgentSample(
             case_id=case.id, agent=case.agent, task_input=task_input,
             output_text=output_text, output_obj=tree, retrieval_context=retrieval,

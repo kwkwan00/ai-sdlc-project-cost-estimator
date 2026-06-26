@@ -46,6 +46,11 @@ class WbsTaskInput(BaseModel):
     most_likely: float | None = Field(default=None, ge=0)
     pessimistic: float | None = Field(default=None, ge=0)
     children: list[WbsTaskInput] = Field(default_factory=list)
+    # "Depends on" predecessor ids. Applies to BOTH kinds (unlike phase/role) — a work package may
+    # depend on other work packages, a task on other tasks. The SAME-KIND + existence constraints
+    # need sibling context, so they're enforced leniently at the tree level
+    # (`wbs_schema._sanitize_dependencies`); here we only normalize locally (strip/self/dedup).
+    depends_on: list[str] = Field(default_factory=list, max_length=MAX_WBS_NODES)
 
     @property
     def is_leaf(self) -> bool:
@@ -53,6 +58,19 @@ class WbsTaskInput(BaseModel):
 
     @model_validator(mode="after")
     def _validate_node(self) -> WbsTaskInput:
+        # Normalize depends_on on BOTH kinds: strip ids, drop self-references and blanks, and dedupe
+        # while preserving order. Cross-kind / dangling refs need sibling context and are pruned at
+        # the tree level (`wbs_schema._sanitize_dependencies`).
+        if self.depends_on:
+            seen: set[str] = set()
+            cleaned: list[str] = []
+            for raw in self.depends_on:
+                dep = raw.strip()
+                if not dep or dep == self.id or dep in seen:
+                    continue
+                seen.add(dep)
+                cleaned.append(dep)
+            self.depends_on = cleaned
         if self.children:
             # Branch: reject leaf estimate fields rather than silently dropping them, so a
             # mislabeled node surfaces as a 422 instead of a wrong rollup.
@@ -106,13 +124,35 @@ def regenerate_ids(
 
     ``make_id`` is injected (rather than calling ``uuid`` here) so the helper stays pure
     and unit-testable; the router passes ``lambda: str(uuid.uuid4())``.
+
+    ``depends_on`` ids are remapped through the SAME old→new id map so a duplicated tree's
+    dependency edges point at the copies, not the originals. A predecessor that somehow isn't in
+    the map (a dangling ref) is dropped — the copy can't depend on a node it doesn't contain.
     """
-    return [
-        node.model_copy(
-            update={"id": make_id(), "children": regenerate_ids(node.children, make_id)}
-        )
-        for node in tree
-    ]
+    id_map: dict[str, str] = {}
+
+    def relabel(nodes: list[WbsTaskInput]) -> list[WbsTaskInput]:
+        out: list[WbsTaskInput] = []
+        for node in nodes:
+            new_id = make_id()
+            id_map[node.id] = new_id
+            out.append(node.model_copy(update={"id": new_id, "children": relabel(node.children)}))
+        return out
+
+    relabeled = relabel(tree)
+
+    def remap(nodes: list[WbsTaskInput]) -> list[WbsTaskInput]:
+        return [
+            node.model_copy(
+                update={
+                    "depends_on": [id_map[d] for d in node.depends_on if d in id_map],
+                    "children": remap(node.children),
+                }
+            )
+            for node in nodes
+        ]
+
+    return remap(relabeled)
 
 
 def flatten_tree(tree: list[WbsTaskInput], owner_id: str) -> list[dict]:
@@ -137,6 +177,7 @@ def flatten_tree(tree: list[WbsTaskInput], owner_id: str) -> list[dict]:
                     "optimistic": n.optimistic,
                     "most_likely": n.most_likely,
                     "pessimistic": n.pessimistic,
+                    "depends_on": list(n.depends_on),
                 }
             )
             if n.children:
@@ -177,6 +218,8 @@ def rebuild_tree(rows: list[dict], owner_id: str) -> list[WbsTaskInput]:
                     optimistic=(r.get("optimistic") if leaf else None),
                     most_likely=(r.get("most_likely") if leaf else None),
                     pessimistic=(r.get("pessimistic") if leaf else None),
+                    # depends_on applies to both kinds, so it's read regardless of leaf/branch.
+                    depends_on=(r.get("depends_on") or []),
                     children=children,
                 )
             )

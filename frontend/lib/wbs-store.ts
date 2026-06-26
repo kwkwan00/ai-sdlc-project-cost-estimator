@@ -7,7 +7,7 @@
  * (resume then falls back to the cache). Cleared when the draft is committed or discarded.
  */
 
-import type { CodebaseContext } from "./schemas";
+import type { CodebaseContext, Phase } from "./schemas";
 import type { WbsDraft } from "./wbs";
 
 const KEY = (id: string) => `sdlc-wbs:${id}`;
@@ -23,6 +23,8 @@ export interface WbsNewDraft {
   codebase: CodebaseContext;
   /** Existing/proposed technologies (estimation signal → stage3.technology_stack). */
   technology?: string;
+  /** SDLC phases to estimate. A strict subset scopes the LLM-drafted tree to those phases. */
+  selected_phases?: Phase[];
 }
 
 export function loadWbsNewDraft(): WbsNewDraft | null {

@@ -395,6 +395,8 @@ export interface WbsDraftInput {
   raw_input: string;
   stage2?: Stage2Input;
   stage3?: Stage3Input;
+  /** SDLC phases in scope; a strict subset scopes the drafted tree (omitted ⇒ full lifecycle). */
+  selected_phases?: Phase[];
 }
 
 export interface WbsCalculateInput {

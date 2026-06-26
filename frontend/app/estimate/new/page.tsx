@@ -12,7 +12,9 @@ import {
   SIZE_ORDER,
   type ExampleProject,
 } from "@/lib/example-projects";
+import { ALL_PHASES, PhaseScopePicker } from "@/components/PhaseScopePicker";
 import { stage1Schema, type Stage1Input } from "@/lib/schemas";
+import { type Phase } from "@/lib/types";
 import { loadDraft, saveDraft } from "@/lib/wizard-store";
 
 function Stage1Inner() {
@@ -26,12 +28,18 @@ function Stage1Inner() {
   const [analyzing, setAnalyzing] = useState(false);
   const [prefillNote, setPrefillNote] = useState<string | null>(null);
   const [pick, setPick] = useState("");
+  // Which SDLC phases to estimate. All selected by default; the request omits the field entirely
+  // when all six remain checked, so a full-scope estimate is byte-identical to the pre-feature one.
+  const [selectedPhases, setSelectedPhases] = useState<Phase[]>(ALL_PHASES);
 
   useEffect(() => {
     const draft = loadDraft();
     if (draft) {
       setValue("raw_input", draft.raw_input || "");
       setValue("project_name", draft.project_name || "");
+      // Restore a previously-chosen phase subset so returning here doesn't silently reset the
+      // scope to all six. Absent/empty ⇒ keep the all-selected default.
+      if (draft.selected_phases?.length) setSelectedPhases(draft.selected_phases);
     }
   }, [setValue]);
 
@@ -51,6 +59,7 @@ function Stage1Inner() {
         prefill_summary: prefill.summary,
         // Carry any AI tools named in the description forward to seed Stage 3.
         prefill_ai_tooling: prefill.ai_tooling_description,
+        selected_phases: selectedPhases,
       });
       router.push(`/estimate/draft/context`);
     } catch (e) {
@@ -59,6 +68,7 @@ function Stage1Inner() {
       saveDraft({
         raw_input: values.raw_input,
         project_name: values.project_name,
+        selected_phases: selectedPhases,
       });
       setPrefillNote(
         `Couldn't auto-fill from description (${(e as Error).message}). Continuing with a blank form.`
@@ -159,6 +169,10 @@ function Stage1Inner() {
           </p>
         </div>
 
+        <div className="border-t border-slate-100 pt-4">
+          <PhaseScopePicker selected={selectedPhases} onChange={setSelectedPhases} />
+        </div>
+
         {prefillNote && (
           <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-800">
             {prefillNote}
@@ -174,7 +188,7 @@ function Stage1Inner() {
           <button
             className="btn-primary disabled:opacity-60 disabled:cursor-progress"
             type="submit"
-            disabled={analyzing}
+            disabled={analyzing || selectedPhases.length === 0}
           >
             {analyzing ? "Analyzing…" : "Continue"}
           </button>

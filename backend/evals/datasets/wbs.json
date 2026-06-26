@@ -34,5 +34,23 @@
     },
     "expected_output": "A bottom-up WBS for the KYC onboarding app: packages for discovery, UX & design, the onboarding flow (IDV, document upload, sanctions/PEP screening, risk scoring), the four integrations, SOC 2 / PCI-DSS compliance hardening, QA, and deployment — decomposed into estimable leaf tasks each with a phase, a roster role, and a 3-point estimate. The breakdown should reflect the screening + risk-scoring complexity and the compliance load.",
     "notes": "WBS planner — fintech."
+  },
+  {
+    "id": "wbs-scoped-dev-qa",
+    "agent": "wbs",
+    "input": {
+      "raw_input": "Add a bulk CSV import + validation feature to an existing inventory-management web app, plus an automated test suite for it. The team already has the designs and infra; this engagement is build + test only. ~6 screens touched, brownfield. No new integrations.",
+      "stage2": {
+        "industry": "retail",
+        "project_type": "enhancement",
+        "screen_count_estimate": 6,
+        "integration_count": 0,
+        "integration_list": [],
+        "regulatory_requirements": []
+      },
+      "selected_phases": ["development", "qa_testing"]
+    },
+    "expected_output": "A bottom-up WBS scoped to DEVELOPMENT and QA/TESTING only (the engagement excludes discovery, UX/design, code review as a separate phase, and deployment): work packages for the CSV import + validation build and the automated test suite, decomposed into estimable leaf tasks. Every leaf must carry a phase that is one of development or qa_testing — no discovery/ux_design/deployment tasks — a roster role, and an ordered 3-point estimate; depends_on edges (tests after the build) must be same-kind and resolvable.",
+    "notes": "WBS planner — phase scoping. wbs_structural asserts every leaf phase is within selected_phases (development, qa_testing) and that the new depends_on edges are same-kind + resolvable; plan_quality (judge) scores the scoped decomposition."
   }
 ]

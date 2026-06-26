@@ -38,7 +38,9 @@ def test_streaming_endpoint_still_streams_through_middleware(
     from agents.roster_agent import ProposedRole, RosterProposal
     from models.twin_outputs import RoleCategory, RoleSeniority
 
-    async def fake_agent(stage2, raw_input: str, custom_roles=None) -> RosterProposal:
+    async def fake_agent(
+        stage2, raw_input: str, custom_roles=None, selected_phases=None
+    ) -> RosterProposal:
         return RosterProposal(
             project_plan=[],
             staffing_rationale="r",

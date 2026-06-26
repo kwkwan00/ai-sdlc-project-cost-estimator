@@ -15,6 +15,24 @@ Decompose the project into a two-level hierarchy:
   - `optimistic`, `most_likely`, `pessimistic` — a three-point PERT effort estimate in **hours**
     (optimistic ≤ most_likely ≤ pessimistic).
 
+## Keys and dependencies (sequencing)
+
+Give **every work package and every leaf task a short, unique `key`** (a slug like `auth-api`,
+`login-ui`, `pkg-auth`) — these are just handles for wiring up dependencies, so make them readable
+and distinct.
+
+Use `depends_on` to capture **what must finish before a node can start**, as a list of the **keys**
+of its prerequisites:
+
+- A **task** depends only on **other tasks**; a **work package** depends only on **other work
+  packages**. Never cross the two (a task can't depend on a package or vice-versa).
+- Reference **only keys you defined** in this same response. Don't invent keys.
+- Keep dependencies **acyclic** (no A→B→A) and **minimal** — list only the genuine, direct
+  predecessors, not every earlier task. Typical edges: implementation depends on its design/spec;
+  tests depend on the thing they test; integration depends on the components it wires together;
+  deployment depends on the build; later phases depend on the earlier work they build on.
+- It's fine to leave `depends_on` empty for independent or kickoff work.
+
 ## Estimating effort — the most important part. Be realistic, not optimistic.
 
 - Estimate the **full professional effort** to take each task to a done, production-ready state:
@@ -62,8 +80,19 @@ total is realistic. Do not pad arbitrarily; reach the realistic total by capturi
 
 ## Coverage
 
+- **Enumerate the concrete scope first, then map every item to tasks.** Before drafting, pull the
+  specifics out of the description — each distinct user-facing **feature / flow**, each named
+  **integration / external system**, each distinct **user role's** screens, and each **compliance
+  regime** — and make sure **every one** of them maps to at least one leaf task. A named integration
+  gets its own integration task(s) (auth, data mapping, error handling); a compliance regime (HIPAA,
+  PCI-DSS, SOC 2) gets explicit hardening + audit/evidence tasks; a named feature gets build + test
+  tasks. **Silently dropping a named feature or integration is the single most common decomposition
+  failure — don't.** A reader should be able to tick off every capability in the brief against your
+  packages.
 - Cover the **whole lifecycle**: discovery/analysis, UX where relevant, the bulk in development,
-  code review, deployment/DevOps, and QA/testing — each sized proportionally to the scope.
+  code review, deployment/DevOps, and QA/testing — each sized proportionally to the scope. **But**
+  if the request restricts the SDLC phases in scope (a "SCOPE:" line and a reduced `phases` list),
+  draft work for **only** those phases — do not create any package or task for an excluded phase.
 - Add **as many leaf tasks as the scope genuinely requires**. A simple internal tool may be ~10–20
   leaves; a complex, multi-integration or regulated product needs **50–150+**. Do not artificially
   cap the count. **The sum of all leaf hours is the project's total effort** — make sure nothing
@@ -82,6 +111,9 @@ total is realistic. Do not pad arbitrarily; reach the realistic total by capturi
   these as a modifier — **never** as a reason to lowball.
 
 Return the work packages with their leaf tasks via the tool. Spend your output budget on the
-`packages` — that is the deliverable. Keep each leaf `description` very short or omit it, and keep
-`notes` to at most one short sentence (or leave it empty). Always populate `packages`; never return
+`packages` — that is the deliverable. **Decompose into real work packages, each grouping its leaf
+tasks — never a flat list of tasks with no packages.** Keep each leaf `description` very short or
+omit it, and keep `notes` to at most one short sentence (or leave it empty) — **do NOT state a total
+hour figure in `notes`** (any total is computed from your leaf hours downstream; a claimed total
+that doesn't match your leaves reads as an inconsistency). Always populate `packages`; never return
 an empty list.

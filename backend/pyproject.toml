@@ -49,7 +49,11 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W"]
-ignore = ["E501"]
+# UP042 (str+Enum → StrEnum) and UP047 (classic TypeVar → PEP-695 type params): the codebase
+# deliberately uses `class X(str, Enum)` and module-level TypeVars with `from __future__ import
+# annotations` throughout. These newer-ruff modernizations conflict with that established style, so
+# they stay opted out (keeps `ruff check .` green without churning every enum / generic).
+ignore = ["E501", "UP042", "UP047"]
 
 [tool.uv]
 package = false

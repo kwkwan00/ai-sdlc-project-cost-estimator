@@ -103,6 +103,12 @@ def build_twin_user_prompt(
         "stage3": stage3.model_dump(),
         "pass": pass_num,
     }
+    # The engagement's SDLC scope. Present only when the user estimated a strict subset of phases
+    # (a full-scope request omits it). Lets each twin produce scope-aware planning + estimates and
+    # state assumptions about out-of-scope phases instead of silently absorbing their effort.
+    selected_phases = state.get("selected_phases")
+    if selected_phases:
+        extras["phases_in_scope"] = [p.value for p in selected_phases]
     if pass_num == 2:
         questions = state.get("clarifying_questions", [])
         extras["user_answers"] = [
@@ -121,10 +127,19 @@ def build_twin_user_prompt(
         if guardrail:
             extras["ai_reduction_guardrail"] = guardrail
 
+    scope_note = (
+        "Scope: `phases_in_scope` in the structured context lists the only SDLC phases this "
+        "engagement covers. Estimate your phase on that basis, and state any assumption about "
+        "out-of-scope phases (e.g. discovery/design performed elsewhere) rather than silently "
+        "absorbing their effort.\n\n"
+        if selected_phases
+        else ""
+    )
     return (
         f"## Pass {pass_num}\n\n"
         f"Project description (raw):\n```\n{state.get('raw_input', '')}\n```\n\n"
         f"Structured context:\n{render_context_block(parsed, extras)}\n\n"
+        f"{scope_note}"
         "Produce your phase estimate using the algorithm in your system prompt.\n\n"
         "Technology: the user MAY specify their stack — in the raw project description above or "
         "the `stage3.technology_stack` field in the structured context. Factor any specified "

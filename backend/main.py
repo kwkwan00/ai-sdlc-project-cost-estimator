@@ -24,6 +24,7 @@ Endpoints (9), grouped by router:
                        GET  /estimates/{id}/stream              -- SSE run events (best-effort)
                        GET  /health                             -- liveness probe
   routers/wbs.py       POST /wbs/draft                          -- LLM-draft a WBS tree (resumable)
+                       POST /wbs/draft/agui                     -- AG-UI streaming WBS draft
                        GET  /wbs/drafts                         -- resume list
                        GET/PUT/DELETE /wbs/drafts/{id}          -- load / autosave / discard a draft
                        POST /wbs/drafts/{id}/duplicate          -- clone a draft

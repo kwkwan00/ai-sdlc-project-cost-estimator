@@ -634,6 +634,29 @@ async def test_staffing_adequacy_fails_role_over_60pct() -> None:
     assert "60%" in result.reasoning
 
 
+async def test_staffing_adequacy_relaxes_specialists_for_out_of_scope_phases() -> None:
+    # Screens > 0 would normally require UI/UX, but ux_design is out of scope → not required, so an
+    # eng + product + QA team (build + test only) passes.
+    proposal = _FakeProposal(
+        [
+            _FakeProposedRole(RoleCategory.ENGINEERING, 50),
+            _FakeProposedRole(RoleCategory.PRODUCT, 25),
+            _FakeProposedRole(RoleCategory.QA, 25),
+        ]
+    )
+    sample = AgentSample(
+        case_id="c",
+        agent="roster",
+        output_obj=proposal,
+        eval_context={
+            "stage2_signals": {"screen_count": 25, "regulatory": []},
+            "selected_phases": ["development", "qa_testing"],
+        },
+    )
+    result = await rubrics.score("staffing_adequacy", sample, judge_model="x")
+    assert result.passed is True
+
+
 # --------------------------------------------------------------------------- #
 # roster_catalog_selection (roster)
 # --------------------------------------------------------------------------- #
@@ -725,6 +748,23 @@ async def test_wbs_structural_passes_for_well_formed_tree() -> None:
     assert result.passed is True
 
 
+async def test_wbs_structural_allows_zero_optimistic() -> None:
+    # optimistic == 0 is valid (WbsTaskInput allows ge=0; WbsPlannerLeaf defaults it to 0.0). A
+    # well-ordered 0/m/p leaf must NOT trip the hours check — regression guard for `0 < o` which
+    # falsely failed the live eval gate on a structurally valid tree.
+    tree = _wbs_tree(
+        _wbs_leaf("l1", "development", "sr_engineer", 0, 8, 16),
+        _wbs_leaf("l2", "qa_testing", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "ux_design", "sr_product", 3, 6, 12),
+    )
+    sample = AgentSample(
+        case_id="c", agent="wbs", output_obj=tree,
+        eval_context={"roster_role_ids": ["sr_engineer", "sr_product"]},
+    )
+    result = await rubrics.score("wbs_structural", sample, judge_model="x")
+    assert result.passed is True
+
+
 async def test_wbs_structural_fails_role_not_in_roster() -> None:
     tree = _wbs_tree(
         _wbs_leaf("l1", "development", "ghost_role", 4, 8, 16),
@@ -762,6 +802,88 @@ async def test_wbs_structural_fails_single_phase_or_too_few_leaves() -> None:
         judge_model="x",
     )
     assert r2.passed is False
+
+
+def _wbs_leaf_dep(tid: str, phase: str, role_id: str, depends_on: list[str]):
+    from models.wbs_task import WbsTaskInput
+
+    return WbsTaskInput(
+        id=tid, name=tid, phase=phase, role_id=role_id,
+        optimistic=4, most_likely=8, pessimistic=16, depends_on=depends_on,
+    )
+
+
+async def test_wbs_structural_passes_same_kind_dependency_edges() -> None:
+    # A leaf→leaf depends_on (same kind, resolvable) is valid.
+    tree = _wbs_tree(
+        _wbs_leaf("l1", "development", "sr_engineer", 4, 8, 16),
+        _wbs_leaf_dep("l2", "qa_testing", "sr_engineer", ["l1"]),
+        _wbs_leaf("l3", "ux_design", "sr_engineer", 3, 6, 12),
+    )
+    r = await rubrics.score(
+        "wbs_structural",
+        AgentSample(case_id="c", agent="wbs", output_obj=tree,
+                    eval_context={"roster_role_ids": ["sr_engineer"]}),
+        judge_model="x",
+    )
+    assert r.passed is True and "depends_on edge" in r.reasoning
+
+
+async def test_wbs_structural_fails_cross_kind_or_missing_dependency() -> None:
+    # A leaf depending on the package id is cross-kind → fail.
+    cross = _wbs_tree(
+        _wbs_leaf_dep("l1", "development", "sr_engineer", ["pkg"]),
+        _wbs_leaf("l2", "qa_testing", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "ux_design", "sr_engineer", 3, 6, 12),
+    )
+    r1 = await rubrics.score(
+        "wbs_structural",
+        AgentSample(case_id="c", agent="wbs", output_obj=cross,
+                    eval_context={"roster_role_ids": ["sr_engineer"]}),
+        judge_model="x",
+    )
+    assert r1.passed is False and "cross-kind" in r1.reasoning
+    # A dep on a non-existent node → fail.
+    missing = _wbs_tree(
+        _wbs_leaf_dep("l1", "development", "sr_engineer", ["ghost"]),
+        _wbs_leaf("l2", "qa_testing", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "ux_design", "sr_engineer", 3, 6, 12),
+    )
+    r2 = await rubrics.score(
+        "wbs_structural",
+        AgentSample(case_id="c", agent="wbs", output_obj=missing,
+                    eval_context={"roster_role_ids": ["sr_engineer"]}),
+        judge_model="x",
+    )
+    assert r2.passed is False and "missing node" in r2.reasoning
+
+
+async def test_wbs_structural_enforces_phase_scope() -> None:
+    scope = {"roster_role_ids": ["sr_engineer"], "selected_phases": ["development", "qa_testing"]}
+    # A ux_design leaf is outside the dev+qa scope → fail.
+    out = _wbs_tree(
+        _wbs_leaf("l1", "development", "sr_engineer", 4, 8, 16),
+        _wbs_leaf("l2", "qa_testing", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "ux_design", "sr_engineer", 3, 6, 12),
+    )
+    r1 = await rubrics.score(
+        "wbs_structural", AgentSample(case_id="c", agent="wbs", output_obj=out, eval_context=scope),
+        judge_model="x",
+    )
+    assert r1.passed is False and "outside selected scope" in r1.reasoning
+    # A single-phase scope relaxes the ≥2-phase requirement: an all-development tree passes.
+    dev_only = _wbs_tree(
+        _wbs_leaf("l1", "development", "sr_engineer", 4, 8, 16),
+        _wbs_leaf("l2", "development", "sr_engineer", 2, 4, 8),
+        _wbs_leaf("l3", "development", "sr_engineer", 3, 6, 12),
+    )
+    r2 = await rubrics.score(
+        "wbs_structural",
+        AgentSample(case_id="c", agent="wbs", output_obj=dev_only,
+                    eval_context={"roster_role_ids": ["sr_engineer"], "selected_phases": ["development"]}),
+        judge_model="x",
+    )
+    assert r2.passed is True
 
 
 # --------------------------------------------------------------------------- #

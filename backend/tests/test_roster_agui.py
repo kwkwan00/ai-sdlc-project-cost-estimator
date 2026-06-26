@@ -15,7 +15,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agents.roster_agent import ProjectPlanItem, ProposedRole, RosterProposal
-from models.twin_outputs import RoleCategory, RoleSeniority
+from agents.roster_agui import _extract_inputs
+from models.twin_outputs import Phase, RoleCategory, RoleSeniority
 
 
 @pytest.fixture()
@@ -41,6 +42,25 @@ def _run_input() -> dict:
     }
 
 
+def test_extract_inputs_parses_selected_phases_and_drops_unknowns() -> None:
+    from ag_ui.core import RunAgentInput
+
+    payload = _run_input()
+    payload["forwardedProps"]["selected_phases"] = ["development", "qa_testing", "bogus"]
+    stage2, raw_input, selected_phases = _extract_inputs(RunAgentInput.model_validate(payload))
+    assert raw_input.startswith("A HIPAA")
+    assert stage2.industry == "healthcare"
+    # Valid phases parsed in order; the unknown "bogus" is dropped (never raises).
+    assert selected_phases == [Phase.DEVELOPMENT, Phase.QA_TESTING]
+
+
+def test_extract_inputs_defaults_phase_scope_to_empty_when_absent() -> None:
+    from ag_ui.core import RunAgentInput
+
+    _, _, selected_phases = _extract_inputs(RunAgentInput.model_validate(_run_input()))
+    assert selected_phases == []
+
+
 def _parse_sse_events(body: str) -> list[dict]:
     events: list[dict] = []
     for line in body.splitlines():
@@ -53,7 +73,9 @@ def _parse_sse_events(body: str) -> list[dict]:
 def test_roster_agui_streams_snapshot_then_finished(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    async def fake_agent(stage2, raw_input: str, custom_roles=None) -> RosterProposal:
+    async def fake_agent(
+        stage2, raw_input: str, custom_roles=None, selected_phases=None
+    ) -> RosterProposal:
         return RosterProposal(
             project_plan=[ProjectPlanItem(workstream="Core build", summary="Build it")],
             staffing_rationale="Lean regulated team",
@@ -102,7 +124,9 @@ def test_roster_agui_streams_snapshot_then_finished(
 def test_roster_agui_emits_run_error_on_agent_failure(
     monkeypatch: pytest.MonkeyPatch, client: TestClient
 ) -> None:
-    async def failing_agent(stage2, raw_input: str, custom_roles=None) -> RosterProposal:
+    async def failing_agent(
+        stage2, raw_input: str, custom_roles=None, selected_phases=None
+    ) -> RosterProposal:
         raise RuntimeError("sonnet unavailable")
 
     monkeypatch.setattr("agents.roster_agui.run_roster_agent", failing_agent)

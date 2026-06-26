@@ -5,7 +5,7 @@
  */
 
 import type { Stage2Input, Stage3Input } from "./schemas";
-import type { Phase } from "./types";
+import type { LlmUsage, Phase } from "./types";
 
 export interface WbsTaskInput {
   id: string;
@@ -17,6 +17,10 @@ export interface WbsTaskInput {
   optimistic?: number | null;
   most_likely?: number | null;
   pessimistic?: number | null;
+  /** "Depends on" predecessor ids. Applies to BOTH kinds: a work package may depend on other work
+   *  packages, a task on other tasks. Same-kind/existence is enforced by the editor's option list
+   *  and re-sanitized server-side. */
+  depends_on?: string[];
   children: WbsTaskInput[];
 }
 
@@ -24,6 +28,8 @@ export interface WbsDraftResponse {
   draft_id: string;
   tree: WbsTaskInput[];
   notes: string;
+  /** Token cost of the planner call that drafted this tree (absent when no API key / not captured). */
+  llm_usage?: LlmUsage | null;
 }
 
 export interface WbsDraft {
@@ -34,6 +40,8 @@ export interface WbsDraft {
   stage2?: Stage2Input | null;
   stage3?: Stage3Input | null;
   contingency_pct?: number | null;
+  /** Token cost of the planner call that drafted this tree, persisted with the draft. */
+  llm_usage?: LlmUsage | null;
   created_at?: string | null;
   updated_at?: string | null;
 }
@@ -146,6 +154,69 @@ export function countLeaves(nodes: WbsTaskInput[]): number {
   return nodes.reduce((a, n) => a + (isLeaf(n) ? 1 : countLeaves(n.children)), 0);
 }
 
+/** Per-node **labor** cost rolled up bottom-up: a leaf's cost is its most-likely hours × the
+ *  assigned member's hourly rate, optionally discounted by the phase's AI reduction for the
+ *  AI-assisted scenario (`hours × rate × (1 − reduction)`); a branch is the sum of its descendants.
+ *  Mirrors the rollup's BASE-labor basis (most-likely mode + per-phase reduction + explicit role
+ *  rates) — i.e. the figure BEFORE the project-level Brooks coordination overhead and contingency
+ *  reserve the headline Total adds; the panel surfaces those as separate reconciliation lines.
+ *
+ *  A role missing from the rate card falls back to `opts.fallbackRate` (default 0), mirroring the
+ *  server which remaps an unknown role to a costed default rather than charging it $0. */
+export function rolledCostMap(
+  tree: WbsTaskInput[],
+  rateByRoleId: Map<string, number>,
+  opts: {
+    reductionByPhase?: Partial<Record<Phase, number>>;
+    aiAssisted?: boolean;
+    fallbackRate?: number;
+  } = {},
+): Map<string, number> {
+  const map = new Map<string, number>();
+  const visit = (node: WbsTaskInput): number => {
+    let cost: number;
+    if (isLeaf(node)) {
+      const rate = (node.role_id ? rateByRoleId.get(node.role_id) : undefined) ?? opts.fallbackRate ?? 0;
+      const reductionPct =
+        opts.aiAssisted && node.phase ? opts.reductionByPhase?.[node.phase] ?? 0 : 0;
+      const factor = opts.aiAssisted ? 1 - reductionPct / 100 : 1;
+      cost = (node.most_likely ?? 0) * rate * factor;
+    } else {
+      cost = node.children.reduce((a, c) => a + visit(c), 0);
+    }
+    map.set(node.id, cost);
+    return cost;
+  };
+  for (const n of tree) visit(n);
+  return map;
+}
+
+/** Team-member (people) count per node: a leaf contributes its role's headcount (capacity), a
+ *  branch the sum over the DISTINCT roles in its subtree. Matches the Timeline Gantt, which expands
+ *  each role into `headcount` parallel lanes — so "N members" on a package agrees with its lanes.
+ *  Pass the per-role headcount; an unknown role (or absent map) counts as 1. */
+export function memberCountMap(
+  tree: WbsTaskInput[],
+  headcountByRole: Map<string, number> = new Map(),
+): Map<string, number> {
+  const map = new Map<string, number>();
+  const visit = (node: WbsTaskInput): Set<string> => {
+    let roles: Set<string>;
+    if (isLeaf(node)) {
+      roles = new Set(node.role_id ? [node.role_id] : []);
+    } else {
+      roles = new Set();
+      for (const c of node.children) for (const r of visit(c)) roles.add(r);
+    }
+    let people = 0;
+    for (const r of roles) people += Math.max(1, Math.round(headcountByRole.get(r) ?? 1));
+    map.set(node.id, people);
+    return roles;
+  };
+  for (const n of tree) visit(n);
+  return map;
+}
+
 /** A fresh task id. Uses crypto.randomUUID where available (browser + Node ≥19), else a fallback. */
 export function newTaskId(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
@@ -221,6 +292,9 @@ export function addChild(
         optimistic: null,
         most_likely: null,
         pessimistic: null,
+        // The node flips leaf→branch, so its task-kind dependencies no longer apply (a work package
+        // depends only on work packages). Inbound task→this edges are pruned server-side.
+        depends_on: [],
       };
     }
     return { ...n, children: addChild(n.children, parentId, child) };
@@ -268,4 +342,132 @@ export function moveTargets(
   };
   walk(tree);
   return out;
+}
+
+/** The effective leaf-level dependency graph: each leaf's predecessor leaf ids = its own
+ *  `depends_on` (to existing leaves) PLUS, for every ancestor work package that depends on another
+ *  package, all of that package's leaves. This is the graph the schedule actually enforces, so it's
+ *  the one the editor must use for cycle detection too — leaf-only edges miss package-implied
+ *  orderings. Self / unknown ids are dropped. Returns `leafId → predecessor leaf ids`. */
+export function effectiveLeafDeps(tree: WbsTaskInput[]): Map<string, string[]> {
+  const leafIds = new Set<string>();
+  const branchLeaves = new Map<string, string[]>(); // branch id → its descendant leaf ids
+  const branchDeps = new Map<string, string[]>();
+  const leaves: { id: string; ownDeps: string[]; ancestors: string[] }[] = [];
+
+  const walk = (nodes: WbsTaskInput[], ancestors: string[]): string[] => {
+    const collected: string[] = [];
+    for (const n of nodes) {
+      if (isLeaf(n)) {
+        leafIds.add(n.id);
+        leaves.push({ id: n.id, ownDeps: [...(n.depends_on ?? [])], ancestors });
+        collected.push(n.id);
+      } else {
+        branchDeps.set(n.id, [...(n.depends_on ?? [])]);
+        const child = walk(n.children, [...ancestors, n.id]);
+        branchLeaves.set(n.id, child);
+        collected.push(...child);
+      }
+    }
+    return collected;
+  };
+  walk(tree, []);
+
+  const deps = new Map<string, string[]>();
+  for (const leaf of leaves) {
+    const set = new Set<string>();
+    for (const d of leaf.ownDeps) if (leafIds.has(d) && d !== leaf.id) set.add(d);
+    for (const pkg of leaf.ancestors) {
+      for (const pkgDep of branchDeps.get(pkg) ?? []) {
+        for (const pl of branchLeaves.get(pkgDep) ?? []) if (pl !== leaf.id) set.add(pl);
+      }
+    }
+    deps.set(leaf.id, [...set]);
+  }
+  return deps;
+}
+
+/** Nodes that node `id` may declare a "depends on" relationship to: the SAME kind (a work package
+ *  depends only on work packages, a task only on tasks), excluding itself and any node that already
+ *  (transitively) depends on `id` — adding that edge would close a cycle. Returned as `{id, name}`
+ *  in document order. Returns `[]` when `id` isn't found. */
+export function dependencyTargets(
+  tree: WbsTaskInput[],
+  id: string,
+): { id: string; name: string }[] {
+  const self = findNode(tree, id);
+  if (!self) return [];
+  const wantLeaf = isLeaf(self);
+
+  // Reverse adjacency (dep → dependent) over the EFFECTIVE graph for the selected kind: leaves use
+  // the package-expanded leaf graph (so package-implied orderings count — a leaf-only check would
+  // offer a predecessor the package edges already order after `id`, a hidden cycle); branches use
+  // the package→package graph. BFS from `id` finds every node that already (transitively) depends on
+  // it; offering any of those as a predecessor would close a cycle.
+  const reverse = new Map<string, string[]>();
+  const addEdge = (dep: string, dependent: string) => {
+    const arr = reverse.get(dep) ?? [];
+    arr.push(dependent);
+    reverse.set(dep, arr);
+  };
+  if (wantLeaf) {
+    for (const [leaf, deps] of effectiveLeafDeps(tree)) for (const d of deps) addEdge(d, leaf);
+  } else {
+    const walk = (nodes: WbsTaskInput[]) => {
+      for (const n of nodes) {
+        if (!isLeaf(n)) for (const d of n.depends_on ?? []) addEdge(d, n.id);
+        walk(n.children);
+      }
+    };
+    walk(tree);
+  }
+
+  const cyclic = new Set<string>();
+  const queue = [id];
+  while (queue.length) {
+    const cur = queue.shift()!;
+    for (const dependent of reverse.get(cur) ?? []) {
+      if (!cyclic.has(dependent)) {
+        cyclic.add(dependent);
+        queue.push(dependent);
+      }
+    }
+  }
+
+  const out: { id: string; name: string }[] = [];
+  const walk = (nodes: WbsTaskInput[]) => {
+    for (const n of nodes) {
+      if (n.id !== id && isLeaf(n) === wantLeaf && !cyclic.has(n.id)) {
+        out.push({ id: n.id, name: n.name });
+      }
+      walk(n.children);
+    }
+  };
+  walk(tree);
+  return out;
+}
+
+/** Drop every `depends_on` reference that is no longer valid: an id absent from the tree (e.g. a
+ *  deleted predecessor, possibly cascading to a pruned empty package) OR a cross-kind reference
+ *  (a work package may depend only on packages, a task only on tasks — a leaf→branch flip can leave
+ *  one behind). Keeps the graph referentially valid AND same-kind so autosave never sends an edge
+ *  the backend would silently drop (which would lose it on resume). */
+export function pruneDanglingDependencies(nodes: WbsTaskInput[]): WbsTaskInput[] {
+  const kindById = new Map<string, boolean>(); // id → isLeaf
+  const collect = (ns: WbsTaskInput[]) => {
+    for (const n of ns) {
+      kindById.set(n.id, isLeaf(n));
+      collect(n.children);
+    }
+  };
+  collect(nodes);
+
+  const scrub = (ns: WbsTaskInput[]): WbsTaskInput[] =>
+    ns.map((n) => ({
+      ...n,
+      // `=== isLeaf(n)` drops both a dangling id (get → undefined) and a cross-kind one.
+      depends_on: n.depends_on?.filter((d) => kindById.get(d) === isLeaf(n)),
+      children: scrub(n.children),
+    }));
+  return scrub(nodes);
 }

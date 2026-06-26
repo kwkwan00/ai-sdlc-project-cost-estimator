@@ -310,6 +310,9 @@ class EstimateEnvelope(BaseModel):
     wbs_tree: list[WbsTaskInput] | None = None
     wbs_stage2: Stage2Context | None = None
     wbs_stage3: Stage3Context | None = None
+    # The Stage-1 project description the WBS was drafted from. Stored so Duplicate can seed the new
+    # draft's description (and a later re-draft has prose to plan from). None on twin/pre-field estimates.
+    wbs_raw_input: str | None = None
 
     @model_validator(mode="after")
     def _coherent_method_and_tree(self) -> EstimateEnvelope:

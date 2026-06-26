@@ -3,11 +3,12 @@
 import { useQuery } from "@tanstack/react-query";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
-import { use, useState } from "react";
+import { use, useMemo, useState } from "react";
 
 import { AiSavingsSection } from "@/components/AiSavingsSection";
 import { AlgorithmBadge } from "@/components/AlgorithmBadge";
-import { AlgorithmBreakdownChart } from "@/components/AlgorithmBreakdownChart";
+import { EffortShareDonut, EFFORT_PALETTE } from "@/components/EffortShareDonut";
+import { LlmUsageModal } from "@/components/LlmUsageModal";
 import { BreakdownView } from "@/components/BreakdownView";
 import { ConfidenceMeter } from "@/components/ConfidenceMeter";
 import { DualScenarioToggle } from "@/components/DualScenarioToggle";
@@ -21,22 +22,22 @@ import { SowExportModal } from "@/components/SowExportModal";
 import { StageProgress } from "@/components/StageProgress";
 import { Tabs } from "@/components/Tabs";
 import { TornadoChart } from "@/components/TornadoChart";
+import { WbsGanttChart } from "@/components/WbsGanttChart";
+import { WbsUncertaintyNote } from "@/components/WbsUncertaintyNote";
+import { WbsPertChart } from "@/components/WbsPertChart";
 import { duplicateWbsEstimate, getEstimate } from "@/lib/api-client";
 import { confidenceLabel, pAiSavesTime } from "@/lib/fan-chart";
 import { expectedRiskHours, sortRisks } from "@/lib/risk";
 import { deriveSchedule } from "@/lib/schedule";
+import { deriveWbsSchedule } from "@/lib/wbs-schedule";
 import { staffingSummary } from "@/lib/staffing";
-import {
-  formatHours,
-  formatPct,
-  formatTokens,
-  formatUSD,
-  formatUSDPrecise,
-} from "@/lib/format";
+import { formatHours, formatPct, formatUSD } from "@/lib/format";
 import { ROLE_CATEGORY_LABELS, ROLE_SENIORITY_LABELS } from "@/lib/schemas";
 import { algorithmColor } from "@/lib/algorithms";
 import { reconciledTotals, sharePct } from "@/lib/review-ui";
-import { PHASE_LABELS } from "@/lib/types";
+import { PHASE_LABELS, type Phase } from "@/lib/types";
+import { PHASE_COLORS, PHASE_FALLBACK_COLOR } from "@/lib/wbs-colors";
+import type { WbsTaskInput } from "@/lib/wbs";
 
 // Code-split the WBS tree view (MUI X) so its bundle only loads when a WBS estimate's review is
 // actually viewed — twin estimates never render this tab. Client-only (MUI / emotion).
@@ -63,6 +64,37 @@ export default function ReviewPage({ params }: PageProps) {
     refetchInterval: (q) =>
       q.state.data?.status === "completed" || q.state.data?.status === "failed" ? false : 1500,
   });
+
+  // Memoized ABOVE the early returns (rules-of-hooks) so the O(N²) resource-leveled scheduler +
+  // exact per-phase reduction recompute only when the estimate data changes — not on every UI toggle
+  // (mode, modals, duplicate), which made each interaction janky. Guard on the completed estimate.
+  const completed = data?.final_estimate ?? null;
+  const wbsTreeForSchedule = data?.method === "wbs" ? data.wbs_tree ?? null : null;
+  const wbsSchedule = useMemo(
+    () =>
+      completed && wbsTreeForSchedule && wbsTreeForSchedule.length > 0
+        ? deriveWbsSchedule(wbsTreeForSchedule, completed.headcount_by_role, {
+            nominalWeeks: (completed.duration_weeks_low + completed.duration_weeks_high) / 2,
+          })
+        : null,
+    [completed, wbsTreeForSchedule],
+  );
+  // Per-phase AI reduction from the EXACT ai/manual most-likely ratio (not the rounded
+  // effective_ai_reduction_pct), so the WBS panel's AI-scenario task costs match the server's base
+  // AI labor to the penny instead of carrying a sub-percent rounding skew.
+  const reductionByPhase: Partial<Record<Phase, number>> = useMemo(
+    () =>
+      completed
+        ? Object.fromEntries(
+            completed.phases.map((p) => {
+              const manual = p.manual_only_hours.most_likely;
+              const ai = p.ai_assisted_hours.most_likely;
+              return [p.phase, manual > 0 ? (1 - ai / manual) * 100 : 0];
+            }),
+          )
+        : {},
+    [completed],
+  );
 
   if (isLoading || !data) return <div className="card">Loading...</div>;
   if (error)
@@ -121,6 +153,39 @@ export default function ReviewPage({ params }: PageProps) {
   // Derived presentational schedule (Gantt + PERT + Monte-Carlo finish-risk) for the active
   // scenario. Pure + cheap; recomputes with the mode toggle like the other derived locals.
   const schedule = deriveSchedule(fe, mode);
+  // For a WBS estimate, arrange the Timeline by the tree's own depends_on edges + per-task team
+  // member (role), resource-leveled so independent tasks parallelize. Scaled to the same reported
+  // duration so it stays consistent with the headline. (Twin estimates have no task tree → null.)
+  // Rate for a leaf whose role_id isn't in the rate card — the server remaps unknown roles to a
+  // costed default; approximate it with the first roster role's rate (vs. charging $0).
+  const fallbackRate = fe.headcount_by_role[0]?.rate_per_hour ?? 0;
+
+  // Effort-share donut data: grouped by WORK PACKAGE for a WBS estimate, else by PHASE. Hours are
+  // the active scenario's most-likely (AI-assisted discounts each task/phase by its reduction).
+  const aiAssisted = mode === "ai_assisted";
+  const scenarioHours = (n: WbsTaskInput): number => {
+    if (n.children.length === 0) {
+      const red = aiAssisted && n.phase ? reductionByPhase[n.phase] ?? 0 : 0;
+      return (n.most_likely ?? 0) * (1 - red / 100);
+    }
+    return n.children.reduce((s, c) => s + scenarioHours(c), 0);
+  };
+  const effortShareLabel = isWbs ? "work package" : "phase";
+  const effortShareData =
+    isWbs && data.wbs_tree
+      ? data.wbs_tree.map((n, i) => ({
+          label: n.name,
+          hours: Math.round(scenarioHours(n)),
+          color: EFFORT_PALETTE[i % EFFORT_PALETTE.length],
+        }))
+      : fe.phases.map((p) => ({
+          label: PHASE_LABELS[p.phase],
+          hours: Math.round(
+            (mode === "ai_assisted" ? p.ai_assisted_hours : p.manual_only_hours).most_likely,
+          ),
+          color: PHASE_COLORS[p.phase] ?? PHASE_FALLBACK_COLOR,
+        }));
+
   // Sum of per-phase most-likely hours (for each phase's "share of effort" bar).
   const phaseHoursTotal = fe.phases.reduce(
     (sum, p) =>
@@ -155,14 +220,12 @@ export default function ReviewPage({ params }: PageProps) {
             </p>
             <PhaseBar phases={fe.phases} mode={mode} />
           </div>
-          {!isWbs && (
-            <div>
-              <p className="text-xs uppercase tracking-wide muted mb-1">
-                Effort share by algorithm
-              </p>
-              <AlgorithmBreakdownChart phases={fe.phases} mode={mode} />
-            </div>
-          )}
+          <div>
+            <p className="text-xs uppercase tracking-wide muted mb-1">
+              Effort share by {effortShareLabel}
+            </p>
+            <EffortShareDonut data={effortShareData} />
+          </div>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           {fe.phases.map((p, idx) => {
@@ -210,17 +273,21 @@ export default function ReviewPage({ params }: PageProps) {
                   </div>
                 </div>
                 <ConfidenceMeter value={p.confidence} />
-                <button
-                  type="button"
-                  onClick={() => setOpenPhase(idx)}
-                  className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700"
-                >
-                  Assumptions &amp; risks
-                  <span className="text-slate-400">
-                    ({p.assumptions.length} · {p.risks.length})
-                  </span>
-                  <span aria-hidden="true">→</span>
-                </button>
+                {/* WBS phases carry no per-phase assumptions/risks (the rollup leaves them empty),
+                    so the link would only open an empty modal — hide it for WBS estimates. */}
+                {!isWbs && (
+                  <button
+                    type="button"
+                    onClick={() => setOpenPhase(idx)}
+                    className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-brand-600 hover:text-brand-700"
+                  >
+                    Assumptions &amp; risks
+                    <span className="text-slate-400">
+                      ({p.assumptions.length} · {p.risks.length})
+                    </span>
+                    <span aria-hidden="true">→</span>
+                  </button>
+                )}
               </div>
             );
           })}
@@ -388,6 +455,12 @@ export default function ReviewPage({ params }: PageProps) {
           <RiskRegister phases={fe.phases} />
         </section>
       )}
+
+      {/* Bottom-up estimates emit no discrete risk register; this explains where the uncertainty
+          actually lives (the band + buffers) and the method caveats. */}
+      {isWbs && (
+        <WbsUncertaintyNote contingencyPct={fe.contingency_pct ?? 0} confidence={fe.confidence} />
+      )}
     </>
   );
 
@@ -399,8 +472,9 @@ export default function ReviewPage({ params }: PageProps) {
         <div className="flex items-baseline justify-between gap-2">
           <h2 className="section-title">Schedule — Gantt</h2>
           <p className="text-xs muted">
+            {wbsSchedule ? "By team member · " : ""}
             {mode === "ai_assisted" ? "AI-assisted" : "Manual-only"} · ~
-            {schedule.totalWeeks.toFixed(0)} wk
+            {(wbsSchedule ? wbsSchedule.totalWeeks : schedule.totalWeeks).toFixed(0)} wk
           </p>
         </div>
         {schedule.risk && (
@@ -434,19 +508,29 @@ export default function ReviewPage({ params }: PageProps) {
             )}
           </div>
         )}
-        <GanttChart schedule={schedule} />
+        {wbsSchedule ? <WbsGanttChart schedule={wbsSchedule} /> : <GanttChart schedule={schedule} />}
+        {wbsSchedule && (
+          <p className="text-xs muted">
+            Tasks are arranged by their <span className="font-medium">depends on</span> links and
+            assigned <span className="font-medium">team member</span>: a member runs one task at a
+            time (extra people on a role add parallel lanes), and independent tasks on different
+            members run concurrently. The makespan is scaled to the reported duration.
+          </p>
+        )}
       </section>
 
       <section className="card space-y-3">
-        <h2 className="section-title">Dependencies &amp; critical path (PERT)</h2>
+        <h2 className="section-title">
+          Dependencies &amp; critical {wbsSchedule ? "chain" : "path"} (PERT)
+        </h2>
         <p className="text-xs muted">
-          The critical path sets the duration; phases with slack can slip without delaying
-          launch
-          {schedule.risk?.simulated
-            ? ". The criticality bar is how often each phase lands on the critical path across the Monte-Carlo draws."
-            : "."}
+          {wbsSchedule
+            ? "Tasks are laid out in columns by dependency depth — a column is work that can run in parallel — with the critical chain (the longest dependency + resource path that sets the duration) highlighted."
+            : schedule.risk?.simulated
+              ? "The critical path sets the duration; phases with slack can slip without delaying launch. The criticality bar is how often each phase lands on the critical path across the Monte-Carlo draws."
+              : "The critical path sets the duration; phases with slack can slip without delaying launch."}
         </p>
-        <PertChart schedule={schedule} />
+        {wbsSchedule ? <WbsPertChart schedule={wbsSchedule} /> : <PertChart schedule={schedule} />}
       </section>
     </>
   );
@@ -579,7 +663,15 @@ export default function ReviewPage({ params }: PageProps) {
                   content: (
                     <section className="card space-y-3">
                       <h2 className="section-title">Work breakdown structure</h2>
-                      <WbsTreePanel tree={data.wbs_tree} />
+                      <WbsTreePanel
+                        tree={data.wbs_tree}
+                        headcount={fe.headcount_by_role}
+                        reductionByPhase={reductionByPhase}
+                        mode={mode}
+                        brooksOverheadPct={fe.brooks_overhead_pct ?? 0}
+                        contingencyPct={fe.contingency_pct ?? 0}
+                        fallbackRate={fallbackRate}
+                      />
                     </section>
                   ),
                 },
@@ -605,68 +697,13 @@ export default function ReviewPage({ params }: PageProps) {
       />
 
       {fe.llm_usage && fe.llm_usage.call_count > 0 && (
-        <Modal
+        <LlmUsageModal
           open={showLlmUsage}
           onClose={() => setShowLlmUsage(false)}
+          usage={fe.llm_usage}
           title="Estimation LLM cost & usage"
-        >
-          <p className="text-xs muted mb-3">
-            What it cost to <em>produce</em> this estimate via the Anthropic API —
-            separate from the project labor cost.
-          </p>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <div>
-              <p className="text-xs muted">API cost</p>
-              <p className="text-2xl font-semibold mt-1">
-                {formatUSDPrecise(fe.llm_usage.cost_usd)}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs muted">LLM calls</p>
-              <p className="text-2xl font-semibold mt-1">
-                {fe.llm_usage.call_count}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs muted">Input tokens</p>
-              <p className="text-2xl font-semibold mt-1">
-                {formatTokens(fe.llm_usage.input_tokens)}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs muted">Output tokens</p>
-              <p className="text-2xl font-semibold mt-1">
-                {formatTokens(fe.llm_usage.output_tokens)}
-              </p>
-            </div>
-          </div>
-          {fe.llm_usage.by_model.length > 0 && (
-            <table className="mt-4 min-w-full text-sm">
-              <thead>
-                <tr className="text-left text-xs uppercase muted">
-                  <th className="py-2">Model</th>
-                  <th className="py-2">Calls</th>
-                  <th className="py-2">Input</th>
-                  <th className="py-2">Output</th>
-                  <th className="py-2">Cost</th>
-                </tr>
-              </thead>
-              <tbody>
-                {fe.llm_usage.by_model.map((m) => (
-                  <tr key={m.model} className="border-t border-slate-100">
-                    <td className="py-2 font-medium">{m.model}</td>
-                    <td className="py-2">{m.calls}</td>
-                    <td className="py-2">{formatTokens(m.input_tokens)}</td>
-                    <td className="py-2">{formatTokens(m.output_tokens)}</td>
-                    <td className="py-2 font-semibold">
-                      {formatUSDPrecise(m.cost_usd)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Modal>
+          subtitle="What it cost to produce this estimate via the Anthropic API — separate from the project labor cost."
+        />
       )}
 
       {phaseModal && (

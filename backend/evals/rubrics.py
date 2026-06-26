@@ -752,10 +752,18 @@ def _score_staffing_adequacy(sample: AgentSample) -> RubricScore:
         return _fail(rubric, "Roster proposal has no roles.")
 
     signals = sample.eval_context.get("stage2_signals") or {}
+    # A strict phase subset relaxes the specialist requirements whose phase is out of scope: an
+    # engagement that excludes ux_design needs no UI/UX role, one that excludes qa_testing no QA.
+    scope = {str(p) for p in (sample.eval_context.get("selected_phases") or [])}
+    scoped = bool(scope) and len(scope) < len(Phase)
+
+    def _in_scope(phase: str) -> bool:
+        return not scoped or phase in scope
+
     required = {RoleCategory.ENGINEERING, RoleCategory.PRODUCT}
-    if (signals.get("screen_count") or 0) > 0:
+    if (signals.get("screen_count") or 0) > 0 and _in_scope("ux_design"):
         required.add(RoleCategory.UI_UX)
-    if signals.get("regulatory"):
+    if signals.get("regulatory") and _in_scope("qa_testing"):
         required.add(RoleCategory.QA)
 
     present = {getattr(r.category, "value", r.category) for r in roles}
@@ -999,22 +1007,41 @@ _WBS_MIN_LEAVES = 3
 _WBS_MIN_PHASES = 2
 
 
+def _wbs_walk(nodes: list) -> list:  # noqa: ANN001 — WbsTaskInput, kept import-free here
+    """Flatten every node (branches + leaves) in document order."""
+    out = []
+    for n in nodes:
+        out.append(n)
+        out.extend(_wbs_walk(n.children))
+    return out
+
+
 def _score_wbs_structural(sample: AgentSample) -> RubricScore:
     """Validate the planner's WBS tree is a usable, well-formed decomposition: enough leaf tasks
-    spanning multiple phases, and every leaf carries a phase, a roster ``role_id``, and a positive,
-    PERT-ordered 3-point estimate. Runs offline (the planner always yields a tree — the deterministic
-    fallback when no API key), so it's a real CI gate on both the fallback and the live output."""
+    spanning multiple phases; every leaf carries a phase, a roster ``role_id``, and a positive,
+    PERT-ordered 3-point estimate; every ``depends_on`` edge is **same-kind** (a task depends only on
+    tasks, a package only on packages) and references a node that **exists**; and — when the case
+    pins a phase scope — no leaf falls outside it. Runs offline (the planner always yields a tree —
+    the deterministic fallback when no API key), so it's a real CI gate on both the fallback and the
+    live output, and a regression gate on the new depends_on + phase-scoping plumbing."""
     rubric: RubricName = "wbs_structural"
     tree = sample.output_obj
     if sample.error or not tree:
         return _fail(rubric, f"No WBS tree to validate (error={sample.error}).")
     from models.wbs_task import iter_leaves
 
-    leaves = list(iter_leaves(tree))
-    if len(leaves) < _WBS_MIN_LEAVES:
-        return _fail(rubric, f"Too few leaf tasks ({len(leaves)}); a usable WBS has ≥{_WBS_MIN_LEAVES}.")
-
     roster_ids = set(sample.eval_context.get("roster_role_ids") or [])
+    # A strict phase subset the planner was asked to stay within (skip when absent / full set).
+    scope = {str(p) for p in (sample.eval_context.get("selected_phases") or [])}
+    scoped = bool(scope) and len(scope) < len(Phase)
+
+    # The "usable WBS" leaf floor scales down for a narrow scope so the deterministic fallback (one
+    # leaf per in-scope phase, no API key) still clears the gate; a full-scope WBS keeps the ≥3 floor.
+    leaves = list(iter_leaves(tree))
+    min_leaves = min(_WBS_MIN_LEAVES, len(scope)) if scoped else _WBS_MIN_LEAVES
+    if len(leaves) < min_leaves:
+        return _fail(rubric, f"Too few leaf tasks ({len(leaves)}); a usable WBS has ≥{min_leaves}.")
+
     problems: list[str] = []
     phases: set[str] = set()
     for leaf in leaves:
@@ -1022,20 +1049,38 @@ def _score_wbs_structural(sample: AgentSample) -> RubricScore:
             problems.append(f"{leaf.id}: no phase")
         else:
             phases.add(leaf.phase.value)
+            if scoped and leaf.phase.value not in scope:
+                problems.append(f"{leaf.id}: phase {leaf.phase.value} outside selected scope {sorted(scope)}")
         if roster_ids and leaf.role_id not in roster_ids:
             problems.append(f"{leaf.id}: role_id {leaf.role_id!r} not in roster")
         o, m, p = leaf.optimistic, leaf.most_likely, leaf.pessimistic
-        if None in (o, m, p) or not (0 < o <= m <= p):  # type: ignore[operator]
-            problems.append(f"{leaf.id}: non-positive / unordered hours {o}/{m}/{p}")
-    if len(phases) < _WBS_MIN_PHASES:
+        # optimistic == 0 is valid (WbsTaskInput allows ge=0; WbsPlannerLeaf defaults it to 0.0), so
+        # use `0 <= o` not `0 < o` — only NEGATIVE or out-of-order hours are a real regression.
+        if None in (o, m, p) or not (0 <= o <= m <= p):  # type: ignore[operator]
+            problems.append(f"{leaf.id}: negative / unordered hours {o}/{m}/{p}")
+    if len(phases) < _WBS_MIN_PHASES and not scoped:
         problems.append(f"only {len(phases)} distinct phase(s); expected ≥{_WBS_MIN_PHASES}")
+
+    # depends_on integrity: every edge must point at an existing node of the SAME kind. The backstop
+    # (`_planner_to_tree`) guarantees this, so a violation is a real regression in the new plumbing.
+    nodes = _wbs_walk(tree)
+    is_leaf_by_id = {n.id: n.is_leaf for n in nodes}
+    dep_edges = 0
+    for n in nodes:
+        for dep in getattr(n, "depends_on", None) or []:
+            dep_edges += 1
+            if dep not in is_leaf_by_id:
+                problems.append(f"{n.id}: depends_on {dep!r} references a missing node")
+            elif is_leaf_by_id[dep] != n.is_leaf:
+                problems.append(f"{n.id}: depends_on {dep!r} is cross-kind")
 
     if problems:
         return _fail(rubric, "; ".join(problems[:5]))
+    scope_note = f"; within phase scope {sorted(scope)}" if scoped else ""
     return _pass(
         rubric,
         f"{len(leaves)} leaves across {len(phases)} phases; all carry phase + roster role + "
-        "ordered positive PERT.",
+        f"ordered positive PERT; {dep_edges} depends_on edge(s) same-kind + resolvable{scope_note}.",
     )
 
 

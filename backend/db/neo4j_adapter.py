@@ -173,7 +173,8 @@ async def _replace_task_subgraph(tx: Any, owner_id: str, tasks: list[dict[str, A
           SET n.name = t.name, n.description = t.description, n.phase = t.phase,
               n.role_id = t.role_id, n.is_leaf = t.is_leaf, n.order = t.order,
               n.parent_id = t.parent_id, n.optimistic = t.optimistic,
-              n.most_likely = t.most_likely, n.pessimistic = t.pessimistic
+              n.most_likely = t.most_likely, n.pessimistic = t.pessimistic,
+              n.depends_on = t.depends_on
         """,
         owner_id=owner_id,
         tasks=tasks,
@@ -200,6 +201,7 @@ async def _write_draft_tx(
     stage2_json: str | None,
     stage3_json: str | None,
     contingency_pct: float | None,
+    llm_usage_json: str | None,
     tasks: list[dict[str, Any]],
     now: str,
 ) -> None:
@@ -214,6 +216,7 @@ async def _write_draft_tx(
         SET d.project_name = $project_name, d.raw_input = $raw_input,
             d.stage2_json = $stage2_json, d.stage3_json = $stage3_json,
             d.contingency_pct = $contingency_pct,
+            d.llm_usage_json = coalesce($llm_usage_json, d.llm_usage_json),
             d.task_count = $task_count, d.updated_at = datetime($now),
             d.created_at = coalesce(d.created_at, datetime($now))
         """,
@@ -223,6 +226,7 @@ async def _write_draft_tx(
         stage2_json=stage2_json,
         stage3_json=stage3_json,
         contingency_pct=contingency_pct,
+        llm_usage_json=llm_usage_json,
         task_count=len(tasks),
         now=now,
     )
@@ -283,6 +287,7 @@ async def save_wbs_draft(draft: dict[str, Any]) -> None:
                 stage2_json=draft.get("stage2_json"),
                 stage3_json=draft.get("stage3_json"),
                 contingency_pct=draft.get("contingency_pct"),
+                llm_usage_json=draft.get("llm_usage_json"),
                 tasks=tasks,
                 now=now,
             )
@@ -327,6 +332,7 @@ async def load_wbs_draft(draft_id: str) -> dict[str, Any] | None:
         "stage2_json": d.get("stage2_json"),
         "stage3_json": d.get("stage3_json"),
         "contingency_pct": d.get("contingency_pct"),
+        "llm_usage_json": d.get("llm_usage_json"),
         "created_at": _iso(d.get("created_at")),
         "updated_at": _iso(d.get("updated_at")),
         "tasks": tasks,

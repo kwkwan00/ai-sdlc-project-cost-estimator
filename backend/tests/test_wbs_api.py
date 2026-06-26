@@ -136,6 +136,31 @@ def test_duplicate_from_completed_estimate(client: TestClient) -> None:
     assert src_ids.isdisjoint(dup_ids)
 
 
+def test_duplicate_carries_description(client: TestClient, monkeypatch) -> None:
+    # Regression: duplicating a completed WBS estimate used to clone with raw_input="" — losing the
+    # project prose (and breaking a later re-draft). The commit now stores it on the envelope and the
+    # clone carries it. Neo4j is off in tests, so capture the persisted draft to inspect raw_input.
+    import routers.wbs as wbs_router
+
+    saved: list[dict] = []
+
+    async def _capture(draft: dict) -> None:
+        saved.append(draft)
+
+    monkeypatch.setattr(wbs_router, "save_wbs_draft", _capture)
+    with client as c:
+        created = c.post(
+            "/estimates/wbs",
+            json={"project_name": "Orig", "raw_input": "A HIPAA patient portal.", "tree": _tree()},
+        ).json()
+        # The commit persists the description on the envelope (so Duplicate can recover it).
+        assert created["wbs_raw_input"] == "A HIPAA patient portal."
+        r = c.post(f"/estimates/{created['estimate_id']}/wbs/duplicate")
+        assert r.status_code == 200
+    # The duplicated draft carries the original description, not "".
+    assert saved and saved[-1]["raw_input"] == "A HIPAA patient portal."
+
+
 def test_copy_name_does_not_stack_marker() -> None:
     from routers.wbs import _copy_name
 
@@ -188,3 +213,26 @@ def test_draft_list_and_load_degrade_when_neo4j_off(client: TestClient) -> None:
         assert body["resumable"] is False  # no Neo4j driver in tests
         # load of any id → 404 (client then falls back to its localStorage cache)
         assert c.get("/wbs/drafts/whatever").status_code == 404
+
+
+def test_storage_round_trips_llm_usage() -> None:
+    # The planner's LLM meta-cost rides on the draft row as a JSON blob (Neo4j has no nested types),
+    # so the editor can show an LLM-cost icon on resume. The mapping must round-trip exactly, and an
+    # absent usage (every autosave) must stay None rather than raise.
+    from models.twin_outputs import LlmModelUsage, LlmUsage
+    from routers.wbs import _from_storage, _to_storage
+
+    usage = LlmUsage(
+        call_count=2, input_tokens=1000, output_tokens=300, cost_usd=0.12,
+        by_model=[LlmModelUsage(model="claude-sonnet-4-6", calls=2, cost_usd=0.12)],
+    )
+    row = _to_storage(
+        "d1", project_name="P", raw_input="brief", tree=[],
+        stage2=None, stage3=None, llm_usage=usage,
+    )
+    assert row["llm_usage_json"]  # serialized blob present on the row
+    assert _from_storage(row).llm_usage == usage  # exact round-trip
+
+    bare = _to_storage("d2", project_name="P", raw_input="b", tree=[], stage2=None, stage3=None)
+    assert bare["llm_usage_json"] is None
+    assert _from_storage(bare).llm_usage is None

@@ -7,6 +7,7 @@ from agents.wbs_agent import (
     WbsPlannerLeaf,
     WbsPlannerPackage,
     WbsPlannerResponse,
+    _build_user_prompt,
     _complexity_effort_factor,
     _effective_stage2_for_factor,
     _fallback_tree,
@@ -68,6 +69,72 @@ def test_planner_backstop_fills_role_and_phase_and_order() -> None:
 def test_planner_drops_empty_packages() -> None:
     resp = WbsPlannerResponse(packages=[WbsPlannerPackage(name="Empty", tasks=[])])
     assert _planner_to_tree(resp, RoleRoster.default()) == []
+
+
+def _planner_leaf(name: str, key: str, depends_on: list[str] | None = None) -> WbsPlannerLeaf:
+    return WbsPlannerLeaf(
+        name=name, key=key, phase="development", role_id="sr_engineer",
+        optimistic=1, most_likely=2, pessimistic=3, depends_on=depends_on or [],
+    )
+
+
+def test_planner_translates_dependency_keys_to_real_ids() -> None:
+    resp = WbsPlannerResponse(
+        packages=[
+            WbsPlannerPackage(name="A", key="pkg-a", tasks=[_planner_leaf("design", "t-design")]),
+            WbsPlannerPackage(
+                name="B", key="pkg-b", depends_on=["pkg-a"],
+                tasks=[_planner_leaf("impl", "t-impl", depends_on=["t-design"])],
+            ),
+        ]
+    )
+    tree = _planner_to_tree(resp, RoleRoster.default())
+    by_name = {n.name: n for n in tree}
+    a, b = by_name["A"], by_name["B"]
+    # Package B's dependency now points at A's REAL id (not the model's "pkg-a" key).
+    assert b.depends_on == [a.id]
+    assert "pkg-a" not in b.depends_on
+    # Same for the leaf edge.
+    design, impl = a.children[0], b.children[0]
+    assert impl.depends_on == [design.id]
+    assert "t-design" not in impl.depends_on
+
+
+def test_planner_drops_cross_kind_and_unknown_dependencies() -> None:
+    resp = WbsPlannerResponse(
+        packages=[
+            WbsPlannerPackage(
+                name="A", key="pkg-a",
+                # package → leaf key (cross-kind) + unknown key: both dropped.
+                depends_on=["t-x", "ghost"],
+                tasks=[
+                    _planner_leaf("x", "t-x"),
+                    # leaf → package key (cross-kind) + unknown key: both dropped.
+                    _planner_leaf("y", "t-y", depends_on=["pkg-a", "nope"]),
+                ],
+            )
+        ]
+    )
+    pkg = _planner_to_tree(resp, RoleRoster.default())[0]
+    assert pkg.depends_on == []
+    y = next(c for c in pkg.children if c.name == "y")
+    assert y.depends_on == []
+
+
+def test_planner_drops_self_dependency() -> None:
+    resp = WbsPlannerResponse(
+        packages=[WbsPlannerPackage(name="A", key="pkg-a", tasks=[_planner_leaf("x", "t-x", depends_on=["t-x"])])]
+    )
+    leaf = list(iter_leaves(_planner_to_tree(resp, RoleRoster.default())))[0]
+    assert leaf.depends_on == []
+
+
+def test_fallback_tree_chains_dependencies_through_the_lifecycle() -> None:
+    leaves = list(iter_leaves(_fallback_tree(RoleRoster.default())))
+    assert len(leaves) >= 2
+    assert leaves[0].depends_on == []  # the first task has no predecessor
+    for prev, leaf in zip(leaves, leaves[1:], strict=False):
+        assert leaf.depends_on == [prev.id]  # linear lifecycle chain
 
 
 def test_complexity_effort_factor_grows_with_project_complexity() -> None:
@@ -185,3 +252,99 @@ async def test_generate_wbs_tree_degrades_without_api_key() -> None:
         WbsDraftRequest(raw_input="Build a small internal tool for tracking expenses.")
     )
     assert list(iter_leaves(tree)), "must fall back to a non-empty skeleton"
+
+
+# ---------- phase scoping (don't draft work for disabled phases) ----------
+
+
+def _planner_leaf_for(name: str, key: str, phase: str, depends_on: list[str] | None = None) -> WbsPlannerLeaf:
+    return WbsPlannerLeaf(
+        name=name, key=key, phase=phase, role_id="sr_engineer",
+        optimistic=1, most_likely=2, pessimistic=3, depends_on=depends_on or [],
+    )
+
+
+def test_planner_drops_packages_for_out_of_scope_phases() -> None:
+    resp = WbsPlannerResponse(
+        packages=[
+            WbsPlannerPackage(name="Dev", key="p-dev", tasks=[_planner_leaf_for("build", "t-b", "development")]),
+            WbsPlannerPackage(name="Design", key="p-ux", tasks=[_planner_leaf_for("wireframes", "t-w", "ux_design")]),
+        ]
+    )
+    tree = _planner_to_tree(resp, RoleRoster.default(), selected_phases=[Phase.DEVELOPMENT])
+    # The ux_design package is dropped entirely — its only leaf was out of scope.
+    assert {n.name for n in tree} == {"Dev"}
+    assert {leaf.phase for leaf in iter_leaves(tree)} == {Phase.DEVELOPMENT}
+
+
+def test_planner_scope_prunes_dependencies_onto_dropped_tasks() -> None:
+    # A kept dev task depends on a dropped ux task → that edge is pruned (its key never resolves).
+    resp = WbsPlannerResponse(
+        packages=[
+            WbsPlannerPackage(name="A", key="p-a", tasks=[
+                _planner_leaf_for("wf", "t-wf", "ux_design"),
+                _planner_leaf_for("build", "t-build", "development", depends_on=["t-wf"]),
+            ]),
+        ]
+    )
+    leaves = list(iter_leaves(_planner_to_tree(resp, RoleRoster.default(), selected_phases=[Phase.DEVELOPMENT])))
+    assert [leaf.name for leaf in leaves] == ["build"]
+    assert leaves[0].depends_on == []
+
+
+def test_fallback_tree_scoped_to_selected_phases() -> None:
+    phases = {leaf.phase for leaf in iter_leaves(_fallback_tree(RoleRoster.default(), [Phase.DEVELOPMENT, Phase.QA_TESTING]))}
+    assert phases == {Phase.DEVELOPMENT, Phase.QA_TESTING}  # only in-scope phases appear
+
+
+def test_build_user_prompt_emits_scope_block_for_a_subset() -> None:
+    from models.project_schema import Stage3Context
+
+    req = WbsDraftRequest(
+        raw_input="Build something substantial here.",
+        selected_phases=[Phase.DEVELOPMENT, Phase.QA_TESTING],
+    )
+    prompt = _build_user_prompt(req, RoleRoster.default(), Stage3Context())
+    assert "ONLY these SDLC phases — development, qa_testing" in prompt
+    assert "Do NOT create any work package or leaf task for a phase outside this set" in prompt
+
+
+def test_build_user_prompt_has_no_scope_block_for_full_lifecycle() -> None:
+    from models.project_schema import Stage3Context
+
+    req = WbsDraftRequest(raw_input="Build something substantial here.")  # selected_phases=None
+    prompt = _build_user_prompt(req, RoleRoster.default(), Stage3Context())
+    assert "SCOPE:" not in prompt
+
+
+async def test_generate_wbs_tree_scopes_fallback_without_api_key() -> None:
+    # No API key → degrades to the deterministic skeleton, which must still honor the phase scope.
+    tree, _ = await generate_wbs_tree(
+        WbsDraftRequest(
+            raw_input="Build a small internal tool for tracking expenses.",
+            selected_phases=[Phase.DEVELOPMENT],
+        )
+    )
+    assert {leaf.phase for leaf in iter_leaves(tree)} == {Phase.DEVELOPMENT}
+
+
+def test_planner_resolves_colliding_leaf_keys_within_the_same_package() -> None:
+    # LLM reuses the slug "tests" in two packages; Billing's integration depends_on=["tests"] must
+    # resolve to BILLING's tests (same package), not Auth's (global first-wins would misroute it).
+    resp = WbsPlannerResponse(
+        packages=[
+            WbsPlannerPackage(name="Auth", key="p-auth", tasks=[_planner_leaf("auth tests", "tests")]),
+            WbsPlannerPackage(
+                name="Billing", key="p-bill",
+                tasks=[
+                    _planner_leaf("billing tests", "tests"),
+                    _planner_leaf("billing integration", "integ", depends_on=["tests"]),
+                ],
+            ),
+        ]
+    )
+    tree = _planner_to_tree(resp, RoleRoster.default())
+    billing = next(n for n in tree if n.name == "Billing")
+    billing_tests = next(c for c in billing.children if c.name == "billing tests")
+    integ = next(c for c in billing.children if c.name == "billing integration")
+    assert integ.depends_on == [billing_tests.id]  # same-package, not Auth's "tests"

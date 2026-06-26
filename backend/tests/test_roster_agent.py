@@ -15,19 +15,42 @@ import pytest
 
 from agents import roster_agent
 from agents.roster_agent import (
+    ProjectPlanItem,
     ProposedRole,
     RosterProposal,
     _make_unique_ids,
+    _phases_in_scope_block,
     _rebalance_to_100,
     proposal_to_roster,
     run_roster_agent,
 )
 from models.project_schema import RoleRoster
-from models.twin_outputs import RoleCategory, RoleSeniority
+from models.twin_outputs import Phase, RoleCategory, RoleSeniority
 
 
 def _role(category: RoleCategory, seniority: RoleSeniority, pct: float, desc: str = "X") -> ProposedRole:
     return ProposedRole(description=desc, category=category, seniority=seniority, percentage=pct)
+
+
+def test_proposal_clips_overlong_llm_strings_instead_of_failing() -> None:
+    # The model sometimes writes past the schema's maxLength (the observed staffing_rationale > 300).
+    # Clip rather than raise — a too-long free-text field must not sink the structured-output call
+    # (which forces a retry + possible fallback to the deterministic roster).
+    proposal = RosterProposal(
+        project_plan=[ProjectPlanItem(workstream="W" * 200, summary="S" * 500)],
+        staffing_rationale="R" * 1000,
+        roles=[_role(RoleCategory.ENGINEERING, RoleSeniority.SENIOR, 100, desc="D" * 500)],
+    )
+    assert len(proposal.staffing_rationale) == 400
+    assert len(proposal.project_plan[0].workstream) == 80
+    assert len(proposal.project_plan[0].summary) == 160
+    assert len(proposal.roles[0].description) == 120
+    # A normal-length rationale (the common case) is passed through untouched.
+    ok = RosterProposal(
+        staffing_rationale="Small regulated portal: product+UX, two engineers, QA for HIPAA.",
+        roles=[_role(RoleCategory.QA, RoleSeniority.MID, 100)],
+    )
+    assert ok.staffing_rationale == "Small regulated portal: product+UX, two engineers, QA for HIPAA."
 
 
 # ---------- _make_unique_ids ----------
@@ -206,3 +229,45 @@ async def test_run_roster_agent_uses_sonnet_and_low_effort(
     assert "sonnet" in captured["model"]
     assert captured["effort"] == "low"
     assert captured["tool_name"] == "propose_team_roster"
+
+
+# ---------- SDLC phase scoping ----------
+
+
+def test_phases_in_scope_block_describes_a_strict_subset() -> None:
+    block = _phases_in_scope_block([Phase.DEVELOPMENT, Phase.QA_TESTING])
+    # The scope line names the in-scope phases and instructs the agent to staff only for them.
+    assert "ONLY these SDLC phases: development, qa_testing" in block
+    assert "Staff the team for these phases only" in block
+
+
+def test_phases_in_scope_block_is_empty_for_full_or_no_scope() -> None:
+    # Full set → no constraint (a full-scope estimate is unchanged).
+    assert _phases_in_scope_block(list(Phase)) == ""
+    # None / empty → no constraint.
+    assert _phases_in_scope_block(None) == ""
+    assert _phases_in_scope_block([]) == ""
+
+
+async def test_run_roster_agent_threads_phase_scope_into_the_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from models.project_schema import Stage2Context
+
+    captured: dict = {}
+
+    async def fake_call_structured(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+        return RosterProposal(
+            project_plan=[], staffing_rationale="r",
+            roles=[_role(RoleCategory.ENGINEERING, RoleSeniority.SENIOR, 100, "Eng")],
+        )
+
+    monkeypatch.setattr(roster_agent, "call_structured", fake_call_structured)
+    await run_roster_agent(
+        Stage2Context(), "Build a portal.",
+        selected_phases=[Phase.DEVELOPMENT, Phase.QA_TESTING],
+    )
+    # The scope block reaches the user prompt the LLM sees.
+    assert "ONLY these SDLC phases" in captured["user"]
+    assert "development" in captured["user"] and "qa_testing" in captured["user"]

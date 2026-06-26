@@ -40,18 +40,8 @@ const DEFAULT: Stage3Input = {
 export default function Stage3DraftPage() {
   const router = useRouter();
   const [stage3, setStage3] = useState<Stage3Input>(DEFAULT);
-  // Which SDLC phases to estimate. All selected by default; the request omits the field entirely
-  // when all six remain checked, so a full-scope estimate is byte-identical to the pre-feature one.
-  const [selectedPhases, setSelectedPhases] = useState<Phase[]>(ALL_PHASES);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const togglePhase = (phase: Phase) =>
-    setSelectedPhases((prev) =>
-      prev.includes(phase)
-        ? prev.filter((p) => p !== phase)
-        : ALL_PHASES.filter((p) => p === phase || prev.includes(p)) // keep canonical order
-    );
 
   useEffect(() => {
     const draft = loadDraft();
@@ -65,9 +55,6 @@ export default function Stage3DraftPage() {
       base.ai_tooling_description = draft.prefill_ai_tooling;
     }
     setStage3(base);
-    // Restore a previously-chosen phase subset (e.g. after navigating Back and returning) so the
-    // scope isn't silently reset to all six. Absent/empty ⇒ keep the all-selected default.
-    if (draft.selected_phases?.length) setSelectedPhases(draft.selected_phases);
   }, []);
 
   const persistAndCreate = async () => {
@@ -93,7 +80,10 @@ export default function Stage3DraftPage() {
       }
       const classifiedStage3: Stage3Input = { ...stage3, ai_tooling };
 
-      // Omit selected_phases when every phase is chosen so the full-scope request is unchanged.
+      // Phase scope is chosen on Stage 1 and rides in the draft. Treat an absent OR empty list as
+      // full scope (a stored `[]` must not pass through as an empty request, which the backend 422s)
+      // and omit the field when every phase is chosen so the full-scope request stays byte-identical.
+      const selectedPhases = draft.selected_phases?.length ? draft.selected_phases : ALL_PHASES;
       const phasesArg =
         selectedPhases.length === ALL_PHASES.length ? undefined : selectedPhases;
       const payload = buildCreatePayload(
@@ -220,40 +210,6 @@ export default function Stage3DraftPage() {
             </p>
           </div>
         </div>
-
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <h2 className="text-lg font-semibold text-slate-900">
-              Phases to estimate
-            </h2>
-            <p className="muted">
-              By default we estimate the full SDLC. Uncheck any phases to leave them
-              out — cost, timeline, and team are rolled up from only the phases you
-              keep.
-            </p>
-          </div>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {ALL_PHASES.map((phase) => (
-              <label
-                key={phase}
-                className="flex cursor-pointer items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm hover:bg-slate-50"
-              >
-                <input
-                  type="checkbox"
-                  className="h-4 w-4"
-                  checked={selectedPhases.includes(phase)}
-                  onChange={() => togglePhase(phase)}
-                />
-                <span className="text-slate-800">{PHASE_LABELS[phase]}</span>
-              </label>
-            ))}
-          </div>
-          {selectedPhases.length === 0 && (
-            <p className="text-sm text-rose-600">
-              Select at least one phase to estimate.
-            </p>
-          )}
-        </div>
       </div>
 
       {error && (
@@ -266,11 +222,11 @@ export default function Stage3DraftPage() {
         <button
           type="button"
           onClick={() => {
-            // Persist the Stage-3 edits + phase selection so returning to this page restores
-            // them instead of silently resetting (notably the scope back to all six phases).
+            // Persist the Stage-3 edits so returning to this page restores them instead of
+            // silently resetting. Phase scope is owned by Stage 1 and left untouched here.
             const draft = loadDraft();
             if (draft) {
-              saveDraft({ ...draft, stage3, selected_phases: selectedPhases });
+              saveDraft({ ...draft, stage3 });
             }
             router.push("/estimate/draft/context");
           }}
@@ -281,7 +237,7 @@ export default function Stage3DraftPage() {
         <button
           type="button"
           onClick={persistAndCreate}
-          disabled={submitting || selectedPhases.length === 0}
+          disabled={submitting}
           className="btn-primary"
         >
           {submitting ? "Starting Pass 1..." : "Generate estimate"}

@@ -106,10 +106,12 @@ export default function Stage2DraftPage() {
     if (!draft?.stage2 || !draft.raw_input) return;
     const stage2 = draft.stage2;
     const rawInput = draft.raw_input;
+    // Scope the proposal to the phases chosen on Stage 1 (the backend ignores a full/empty set).
+    const selectedPhases = draft.selected_phases;
     setRosterError(null);
     setRosterLoading(true);
     try {
-      const result = await proposeRoster({ stage2, rawInput });
+      const result = await proposeRoster({ stage2, rawInput, selectedPhases });
       if (!mountedRef.current) return;
       setValue("roster", { roles: result.roster });
       const latest = loadDraft();

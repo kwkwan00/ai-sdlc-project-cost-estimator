@@ -19,10 +19,21 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, HTTPException, Response
+from ag_ui.core import (
+    CustomEvent,
+    EventType,
+    RunAgentInput,
+    RunErrorEvent,
+    RunFinishedEvent,
+    RunStartedEvent,
+    StateSnapshotEvent,
+)
+from ag_ui.encoder import EventEncoder
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 
 import runtime
-from agents.wbs_agent import generate_wbs_tree
+from agents.wbs_agent import generate_wbs_tree, generate_wbs_tree_streamed
 from db.neo4j_adapter import (
     delete_wbs_draft,
     get_driver,
@@ -37,7 +48,7 @@ from models.project_schema import (
     Stage2Context,
     Stage3Context,
 )
-from models.twin_outputs import DualScenarioEstimate
+from models.twin_outputs import DualScenarioEstimate, LlmUsage
 from models.wbs_schema import (
     WbsCalculateRequest,
     WbsDraft,
@@ -46,8 +57,10 @@ from models.wbs_schema import (
     WbsDraftResponse,
     WbsDraftSaveRequest,
     WbsDraftSummary,
+    _sanitize_dependencies,
 )
 from models.wbs_task import WbsTaskInput, flatten_tree, rebuild_tree, regenerate_ids
+from orchestrator.usage import bind_usage_accumulator, summarize_usage
 from orchestrator.wbs.rollup import build_wbs_estimate
 
 logger = logging.getLogger(__name__)
@@ -67,6 +80,7 @@ def _to_storage(
     stage2: Stage2Context | None,
     stage3: Stage3Context | None,
     contingency_pct: float | None = None,
+    llm_usage: LlmUsage | None = None,
 ) -> dict:
     """Flatten a draft into the Neo4j adapter's row shape (tree → flat task rows, context → JSON)."""
     return {
@@ -76,6 +90,7 @@ def _to_storage(
         "stage2_json": stage2.model_dump_json() if stage2 else None,
         "stage3_json": stage3.model_dump_json() if stage3 else None,
         "contingency_pct": contingency_pct,
+        "llm_usage_json": llm_usage.model_dump_json() if llm_usage else None,
         "tasks": flatten_tree(tree, draft_id),
     }
 
@@ -86,6 +101,7 @@ def _from_storage(data: dict) -> WbsDraft:
     tree = rebuild_tree(data.get("tasks", []), draft_id)
     s2_json = data.get("stage2_json")
     s3_json = data.get("stage3_json")
+    lu_json = data.get("llm_usage_json")
     return WbsDraft(
         draft_id=draft_id,
         project_name=data.get("project_name", "") or "",
@@ -94,6 +110,7 @@ def _from_storage(data: dict) -> WbsDraft:
         stage2=Stage2Context.model_validate_json(s2_json) if s2_json else None,
         stage3=Stage3Context.model_validate_json(s3_json) if s3_json else None,
         contingency_pct=data.get("contingency_pct"),
+        llm_usage=LlmUsage.model_validate_json(lu_json) if lu_json else None,
         created_at=data.get("created_at"),
         updated_at=data.get("updated_at"),
     )
@@ -119,6 +136,9 @@ async def _duplicate_into_draft(
     """Clone a tree + context into a brand-new persisted draft (fresh ids, ' (Copy)' name)."""
     new_id = str(uuid.uuid4())
     new_tree = regenerate_ids(tree, lambda: uuid.uuid4().hex)
+    # Re-sanitize: the duplicate path doesn't go through a request validator, so a source tree that
+    # somehow carries a cross-kind/dangling depends_on edge would otherwise be cloned verbatim.
+    _sanitize_dependencies(new_tree)
     await save_wbs_draft(
         _to_storage(
             new_id, project_name=_copy_name(name), raw_input=raw_input, tree=new_tree,
@@ -138,15 +158,167 @@ async def draft_wbs(req: WbsDraftRequest) -> WbsDraftResponse:
 
     Always returns an editable tree — the planner degrades to a deterministic skeleton when the
     LLM is unavailable. The draft persists to Neo4j (best-effort; resume needs Neo4j up)."""
+    # Capture the planner's Anthropic token cost (the LLM work that produced this draft) so the
+    # editor can show it. Empty accumulator (no API key → deterministic fallback) ⇒ no usage.
+    acc: list[dict] = []
+    bind_usage_accumulator(acc)
     tree, notes = await generate_wbs_tree(req)
+    usage = summarize_usage(acc) if acc else None
     draft_id = str(uuid.uuid4())
     await save_wbs_draft(
         _to_storage(
             draft_id, project_name=req.project_name or "", raw_input=req.raw_input,
-            tree=tree, stage2=req.stage2, stage3=req.stage3,
+            tree=tree, stage2=req.stage2, stage3=req.stage3, llm_usage=usage,
         ),
     )
-    return WbsDraftResponse(draft_id=draft_id, tree=tree, notes=notes)
+    return WbsDraftResponse(draft_id=draft_id, tree=tree, notes=notes, llm_usage=usage)
+
+
+def _extract_wbs_request(input_data: RunAgentInput) -> WbsDraftRequest:
+    """Build a `WbsDraftRequest` from the AG-UI run's ``forwardedProps`` (same shape as the POST body).
+
+    The frontend forwards ``{raw_input, project_name, stage2, stage3, selected_phases}``; model
+    validation coerces stage2/stage3/phases and enforces the same constraints as the JSON endpoint.
+    """
+    props = input_data.forwarded_props if isinstance(input_data.forwarded_props, dict) else {}
+    return WbsDraftRequest.model_validate(
+        {
+            "raw_input": str(props.get("raw_input") or ""),
+            "project_name": props.get("project_name") or None,
+            "stage2": props.get("stage2"),
+            "stage3": props.get("stage3"),
+            "selected_phases": props.get("selected_phases") or None,
+        }
+    )
+
+
+def _wbs_progress_event(message: str) -> CustomEvent:
+    """A friendly, human-readable WBS-draft progress event. The UI surfaces only the most recent one,
+    so the user watches the planner work (reviewing → drafting each package + its tasks → finalizing)
+    rather than staring at a frozen spinner."""
+    return CustomEvent(type=EventType.CUSTOM, name="wbs_progress", value={"message": message})
+
+
+async def wbs_agui_endpoint(input_data: RunAgentInput, request: Request) -> StreamingResponse:
+    """AG-UI agent-run endpoint that streams the WBS planner as it drafts.
+
+    Lifecycle: RUN_STARTED → CUSTOM('wbs_progress', {message}) narrating the planner's work
+    (reviewing → drafting each work package + its tasks → finalizing) → STATE_SNAPSHOT (the persisted
+    draft: id + tree + notes + llm_usage) → RUN_FINISHED (or RUN_ERROR on a catastrophic failure). The
+    snapshot mirrors the POST /wbs/draft result so the frontend ends up with the same resumable draft,
+    just with live, friendly progress messages.
+    """
+    encoder = EventEncoder(accept=request.headers.get("accept") or "text/event-stream")
+
+    async def event_generator():
+        yield encoder.encode(
+            RunStartedEvent(
+                type=EventType.RUN_STARTED,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+            )
+        )
+        try:
+            req = _extract_wbs_request(input_data)
+            # Bind the usage accumulator BEFORE spawning the producer task so the task's copied
+            # context shares the same list (record_usage appends to it; we summarize after).
+            acc: list[dict] = []
+            bind_usage_accumulator(acc)
+
+            # A friendly opening status while the planner reads the brief + team (the model can take a
+            # few seconds before the first package streams).
+            yield encoder.encode(
+                _wbs_progress_event("Reviewing your project description and proposed team…")
+            )
+
+            # Bridge the planner's sync per-node callback to this async generator with an unbounded
+            # queue. The producer drafts the tree (never raises — it degrades to a real draft via the
+            # non-streaming path), pushing ("event", message) as packages/tasks stream and a final
+            # ("done", (tree, notes)). Counters/current-package live in dicts so the closure can mutate.
+            queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+            counts = {"package": 0, "task": 0}
+            current_pkg = {"name": ""}
+
+            def _on_node(kind: str, name: str) -> None:
+                clean = " ".join(name.split())[:120] or "…"
+                if kind == "package":
+                    counts["package"] += 1
+                    current_pkg["name"] = clean
+                    message = f"Planning work package {counts['package']}: {clean}"
+                else:  # task
+                    counts["task"] += 1
+                    where = f" to {current_pkg['name']}" if current_pkg["name"] else ""
+                    message = f"Adding task{where}: {clean}"
+                queue.put_nowait(("event", message))
+
+            async def _produce() -> None:
+                try:
+                    tree, notes = await generate_wbs_tree_streamed(req, on_node=_on_node)
+                    queue.put_nowait(("done", (tree, notes)))
+                except Exception as exc:  # noqa: BLE001 - surfaced as RUN_ERROR by the consumer
+                    queue.put_nowait(("error", exc))
+
+            task = asyncio.create_task(_produce())
+            tree: list[WbsTaskInput] = []
+            notes = ""
+            try:
+                while True:
+                    kind, payload = await queue.get()
+                    if kind == "event":
+                        yield encoder.encode(_wbs_progress_event(str(payload)))
+                    elif kind == "done":
+                        tree, notes = payload  # type: ignore[assignment]
+                        break
+                    else:  # "error" — propagate to the RUN_ERROR handler below
+                        raise payload  # type: ignore[misc]
+            finally:
+                if not task.done():
+                    task.cancel()
+
+            # Closing status while the deterministic rollup (complexity factor, backstop, persist) runs.
+            yield encoder.encode(
+                _wbs_progress_event("Balancing effort and finalizing your work breakdown…")
+            )
+            usage = summarize_usage(acc) if acc else None
+            draft_id = str(uuid.uuid4())
+            await save_wbs_draft(
+                _to_storage(
+                    draft_id, project_name=req.project_name or "", raw_input=req.raw_input,
+                    tree=tree, stage2=req.stage2, stage3=req.stage3, llm_usage=usage,
+                ),
+            )
+            snapshot = {
+                "draft_id": draft_id,
+                "tree": [t.model_dump(mode="json") for t in tree],
+                "notes": notes,
+                "llm_usage": usage.model_dump(mode="json") if usage else None,
+            }
+            yield encoder.encode(
+                StateSnapshotEvent(type=EventType.STATE_SNAPSHOT, snapshot=snapshot)
+            )
+            logger.info(
+                "WBS AG-UI run finished (%d package(s), %d task(s), draft=%s)",
+                counts["package"], counts["task"], draft_id,
+            )
+            yield encoder.encode(
+                RunFinishedEvent(
+                    type=EventType.RUN_FINISHED,
+                    thread_id=input_data.thread_id,
+                    run_id=input_data.run_id,
+                )
+            )
+        except Exception:  # noqa: BLE001 - never leak internal LLM/DB details to the client
+            logger.exception("WBS AG-UI run failed; emitting RUN_ERROR")
+            yield encoder.encode(
+                RunErrorEvent(type=EventType.RUN_ERROR, message="wbs draft failed")
+            )
+
+    return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
+
+
+# AG-UI agent-run endpoint for the streaming WBS draft. Registered via add_api_route (like the
+# roster one) so the handler's RunAgentInput body + Request signature drives FastAPI parsing.
+router.add_api_route("/wbs/draft/agui", wbs_agui_endpoint, methods=["POST"])
 
 
 @router.get("/wbs/drafts", response_model=WbsDraftList)
@@ -170,7 +342,15 @@ async def get_draft(draft_id: str) -> WbsDraft:
 
 @router.put("/wbs/drafts/{draft_id}", response_model=WbsDraft)
 async def save_draft(draft_id: str, body: WbsDraftSaveRequest) -> WbsDraft:
-    """Autosave the editor state for a draft (idempotent rebuild-on-save)."""
+    """Autosave the editor state for a draft (idempotent rebuild-on-save).
+
+    The response is a save-echo of the *mutable* editor fields. Server-owned fields the save request
+    doesn't carry — ``llm_usage`` (set once at draft time) and ``created_at``/``updated_at`` — are
+    intentionally omitted here rather than re-read on every debounced autosave; they're preserved in
+    Neo4j (``save_wbs_draft`` uses ``coalesce`` so the absent ``llm_usage`` isn't wiped) and remain
+    available via ``GET /wbs/drafts/{id}``, which the editor reads at mount. Don't treat this echo as
+    the authoritative full draft.
+    """
     await save_wbs_draft(
         _to_storage(
             draft_id, project_name=body.project_name, raw_input=body.raw_input,
@@ -228,7 +408,9 @@ async def duplicate_from_estimate(estimate_id: str) -> WbsDraftResponse:
     contingency = env.final_estimate.contingency_pct if env.final_estimate else None
     return await _duplicate_into_draft(
         tree=env.wbs_tree, stage2=env.wbs_stage2, stage3=env.wbs_stage3,
-        name=env.project_name, raw_input="", contingency_pct=contingency,
+        # Carry the original description so the clone keeps its context (and a later re-draft has prose
+        # to plan from). Older envelopes persisted before wbs_raw_input existed fall back to "".
+        name=env.project_name, raw_input=env.wbs_raw_input or "", contingency_pct=contingency,
     )
 
 
@@ -299,6 +481,7 @@ async def calculate_wbs(req: WbsCalculateRequest) -> EstimateEnvelope:
         wbs_tree=req.tree,
         wbs_stage2=req.stage2,
         wbs_stage3=req.stage3,
+        wbs_raw_input=req.raw_input or None,
     )
     runtime.register_envelope(estimate_id, env, evict=True)
 

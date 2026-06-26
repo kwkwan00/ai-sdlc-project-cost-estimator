@@ -3,14 +3,18 @@ import { describe, expect, it, vi } from "vitest";
 // Stub the AG-UI client so importing the module under test doesn't pull the real
 // HttpAgent (network/rxjs). The capturing stub also lets us assert how
 // proposeRoster constructs the agent (e.g. that it passes a bound fetch).
-const agui = vi.hoisted(() => ({ lastConfig: null as { fetch?: unknown } | null }));
+const agui = vi.hoisted(() => ({
+  lastConfig: null as { fetch?: unknown } | null,
+  lastRunInput: null as { forwardedProps?: Record<string, unknown> } | null,
+}));
 vi.mock("@ag-ui/client", () => ({
   HttpAgent: class {
     state: unknown = undefined;
     constructor(config: { fetch?: unknown }) {
       agui.lastConfig = config;
     }
-    async runAgent() {
+    async runAgent(input: { forwardedProps?: Record<string, unknown> }) {
+      agui.lastRunInput = input;
       return { result: null, newMessages: [] };
     }
   },
@@ -99,5 +103,26 @@ describe("proposeRoster", () => {
       proposeRoster({ stage2: {} as unknown as Stage2Input, rawInput: "x" })
     ).rejects.toThrow();
     expect(typeof agui.lastConfig?.fetch).toBe("function");
+  });
+
+  it("forwards the selected SDLC phases so the agent can scope the roster", async () => {
+    await expect(
+      proposeRoster({
+        stage2: {} as unknown as Stage2Input,
+        rawInput: "x",
+        selectedPhases: ["development", "qa_testing"],
+      })
+    ).rejects.toThrow(); // no snapshot from the stub → rejects; we assert the forwarded props
+    expect(agui.lastRunInput?.forwardedProps?.selected_phases).toEqual([
+      "development",
+      "qa_testing",
+    ]);
+  });
+
+  it("forwards an empty phase list when none is given (full-scope, no constraint)", async () => {
+    await expect(
+      proposeRoster({ stage2: {} as unknown as Stage2Input, rawInput: "x" })
+    ).rejects.toThrow();
+    expect(agui.lastRunInput?.forwardedProps?.selected_phases).toEqual([]);
   });
 });

@@ -72,6 +72,36 @@ def test_build_twin_user_prompt_includes_raw_and_pass_marker() -> None:
     assert "healthcare" in prompt_p1
 
 
+def test_build_twin_user_prompt_includes_phase_scope_when_a_subset_is_selected() -> None:
+    from models.twin_outputs import Phase
+
+    state = {
+        "raw_input": "Build a thing.",
+        "parsed_context": {},
+        "stage2": None,
+        "stage3": None,
+        "clarifying_questions": [],
+        "selected_phases": [Phase.DEVELOPMENT, Phase.QA_TESTING],
+    }
+    prompt = build_twin_user_prompt(state, pass_num=1, phase_value="development")
+    assert "phases_in_scope" in prompt
+    assert "development" in prompt and "qa_testing" in prompt
+    assert "out-of-scope phases" in prompt  # the scope instruction is present
+
+
+def test_build_twin_user_prompt_omits_phase_scope_for_full_scope() -> None:
+    state = {
+        "raw_input": "Build a thing.",
+        "parsed_context": {},
+        "stage2": None,
+        "stage3": None,
+        "clarifying_questions": [],
+        # No selected_phases ⇒ full scope ⇒ no scope note (request unchanged from pre-feature).
+    }
+    prompt = build_twin_user_prompt(state, pass_num=1, phase_value="development")
+    assert "phases_in_scope" not in prompt
+
+
 def test_build_twin_user_prompt_surfaces_technology_stack() -> None:
     from models.project_schema import Stage3Context
 

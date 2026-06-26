@@ -12,6 +12,8 @@ import {
   CODEBASE_CONTEXT_LABELS,
   type CodebaseContext,
 } from "@/lib/schemas";
+import { ALL_PHASES, PhaseScopePicker } from "@/components/PhaseScopePicker";
+import { type Phase } from "@/lib/types";
 import { saveWbsNewDraft } from "@/lib/wbs-store";
 
 const CODEBASE_OPTIONS = Object.keys(CODEBASE_CONTEXT_LABELS) as CodebaseContext[];
@@ -24,8 +26,11 @@ export default function NewWbsPage() {
   const [technology, setTechnology] = useState("");
   const [tooling, setTooling] = useState("");
   const [pick, setPick] = useState("");
+  // SDLC phases to draft. All selected by default; a strict subset scopes the LLM-drafted tree so
+  // disabled phases produce no work packages.
+  const [selectedPhases, setSelectedPhases] = useState<Phase[]>(ALL_PHASES);
 
-  const canSubmit = rawInput.trim().length >= 10;
+  const canSubmit = rawInput.trim().length >= 10 && selectedPhases.length > 0;
 
   function applyExample(ex: ExampleProject) {
     setRawInput(ex.description);
@@ -33,7 +38,16 @@ export default function NewWbsPage() {
   }
 
   function handleContinue() {
-    saveWbsNewDraft({ project_name: projectName, raw_input: rawInput, tooling, codebase, technology });
+    // Persist the full array when all phases are chosen so the team page can omit it for a
+    // full-scope draft (the backend treats a full/empty set as "no constraint").
+    saveWbsNewDraft({
+      project_name: projectName,
+      raw_input: rawInput,
+      tooling,
+      codebase,
+      technology,
+      selected_phases: selectedPhases,
+    });
     router.push("/wbs/team");
   }
 
@@ -106,6 +120,12 @@ export default function NewWbsPage() {
             ))}
           </select>
         </label>
+
+        <PhaseScopePicker
+          selected={selectedPhases}
+          onChange={setSelectedPhases}
+          description="By default we draft the full SDLC. Uncheck any phases to leave them out — the AI won't generate work packages for a disabled phase."
+        />
 
         <label className="block">
           <span className="label">Existing / proposed technologies (optional)</span>

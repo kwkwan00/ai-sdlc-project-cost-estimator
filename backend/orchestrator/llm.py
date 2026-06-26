@@ -12,6 +12,7 @@ import functools
 import json
 import logging
 import time
+from collections.abc import Callable
 from typing import Any, TypeVar
 
 from anthropic import AsyncAnthropic
@@ -230,6 +231,76 @@ async def call_structured(
             "structured output for tool %s failed (%s); retrying once", tool_name, exc
         )
         return await _attempt(corrective=True)
+
+
+@traced(name="claude-structured-stream", as_type="generation")
+async def stream_structured(
+    *,
+    system: str,
+    user: str,
+    response_model: type[T],
+    tool_name: str = "submit",
+    model: str | None = None,
+    max_tokens: int = 4096,
+    on_input_delta: Callable[[str], None] | None = None,
+) -> T:
+    """Streaming sibling of `call_structured`: same forced-tool-use contract, but the tool input is
+    streamed so a caller can react to it *as it is generated*.
+
+    For every `input_json` delta the SDK emits, `on_input_delta(partial_json)` is called with that
+    raw JSON fragment (best-effort progress — e.g. to extract work-package names as they appear). The
+    callback is fully isolated: if it raises, the stream keeps going. After the stream completes the
+    accumulated tool input is validated into `response_model` exactly like `call_structured`, and
+    usage is recorded the same way.
+
+    Unlike `call_structured` there is NO corrective retry here — streaming is a UX enhancement, and
+    callers (the WBS planner) already degrade to a deterministic fallback on any failure.
+    """
+    settings = get_settings()
+    client = _get_client()
+    use_model = model or settings.anthropic_model
+    tool = _pydantic_to_tool_schema(response_model, tool_name)
+
+    create_kwargs: dict[str, Any] = {
+        "model": use_model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "tools": [tool],
+        "tool_choice": {"type": "tool", "name": tool_name},
+        "messages": [{"role": "user", "content": [{"type": "text", "text": user}]}],
+    }
+    # Same sampling-param gate as call_structured: the frontier families 400 on temperature.
+    if _model_accepts_sampling_params(use_model):
+        create_kwargs["temperature"] = 0.0
+
+    logger.debug(
+        "llm stream → model=%s tool=%s max_tokens=%s response_model=%s",
+        use_model, tool_name, max_tokens, response_model.__name__,
+    )
+
+    started = time.perf_counter()
+    async with client.messages.stream(**create_kwargs) as stream:
+        async for event in stream:
+            if on_input_delta is not None and getattr(event, "type", None) == "input_json":
+                try:
+                    on_input_delta(getattr(event, "partial_json", "") or "")
+                except Exception:  # noqa: BLE001 - a progress callback must never break the stream
+                    logger.debug("stream_structured on_input_delta callback raised", exc_info=True)
+        final = await stream.get_final_message()
+
+    _record_call_usage_and_log(final, use_model=use_model, tool_name=tool_name, started=started)
+
+    # `.type == "tool_use"` narrows the content-block union to ToolUseBlock (get_final_message returns
+    # a concrete Message, so unlike call_structured's `create(**kwargs)`→Any the union isn't erased).
+    for block in final.content:
+        if block.type == "tool_use" and block.name == tool_name:
+            return response_model.model_validate(block.input)
+
+    raise RuntimeError(
+        f"Claude did not return tool_use for {tool_name} (stream). "
+        f"Stop reason: {final.stop_reason}. Content types: "
+        f"{[getattr(b, 'type', '?') for b in final.content]}"
+    )
 
 
 def _iter_strings(value: Any) -> list[str]:

@@ -16,8 +16,10 @@ So the editor never receives an invalid tree.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
+from collections.abc import Callable
 from functools import cache
 from pathlib import Path
 
@@ -35,7 +37,7 @@ from models.project_schema import (
 from models.twin_outputs import Phase, RoleCategory
 from models.wbs_schema import WbsDraftRequest
 from models.wbs_task import WbsTaskInput
-from orchestrator.llm import call_structured, render_context_block
+from orchestrator.llm import call_structured, render_context_block, stream_structured
 from orchestrator.nodes.parse_input import ParsedContext, extract_context_from_raw
 from orchestrator.prompts import load_prompt
 from orchestrator.role_attribution import default_role_id
@@ -66,6 +68,13 @@ class WbsPlannerLeaf(BaseModel):
     description: str = Field(default="", max_length=2000)
     phase: str = Field(default="", description="discovery|ux_design|development|code_review|deployment|qa_testing")
     role_id: str = Field(default="", description="A role_id from the roster")
+    # A short, stable handle the model assigns to THIS task so other tasks' `depends_on` can point at
+    # it. The final tree uses real ids; the backstop translates these keys → ids (and drops unknowns).
+    key: str = Field(default="", max_length=64, description="Short unique handle for this task (e.g. 'login-api')")
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="keys of OTHER tasks that must finish before this one (task→task only)",
+    )
     optimistic: float = Field(default=0.0, ge=0)
     most_likely: float = Field(default=0.0, ge=0)
     pessimistic: float = Field(default=0.0, ge=0)
@@ -77,6 +86,11 @@ class WbsPlannerPackage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=300)
     description: str = Field(default="", max_length=2000)
+    key: str = Field(default="", max_length=64, description="Short unique handle for this work package")
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="keys of OTHER work packages that must finish before this one (package→package only)",
+    )
     tasks: list[WbsPlannerLeaf] = Field(default_factory=list)
 
 
@@ -88,6 +102,86 @@ class WbsPlannerResponse(BaseModel):
     notes: str = Field(default="", max_length=2000)
 
 
+class _PackageNameStreamParser:
+    """Incrementally extracts each work-package AND leaf-task ``name`` from the planner's streamed
+    tool-input JSON, tagged by kind, so the UI can narrate what the planner is doing.
+
+    The planner tool input is shaped ``{"packages": [{"name": ..., "tasks": [{"name": ...}]}], "notes": ...}``.
+    A ``name`` key's string value is a *work package* at bracket-depth 3 and a *task* at depth 5 —
+    depth 1 is the root object, 2 the ``packages`` array, 3 a package object, 4 its ``tasks`` array,
+    5 a task object. This depth rule is coupled to ``WbsPlannerResponse`` (the only depth-2 array is
+    ``packages``); revisit ``_PACKAGE_DEPTH`` / ``_TASK_DEPTH`` if that schema changes.
+
+    A tiny character state machine, robust to a value being split across ``feed()`` calls (the SDK
+    chunks the JSON arbitrarily). ``feed(chunk)`` returns the ``(kind, name)`` pairs — ``kind`` is
+    ``"package"`` or ``"task"`` — completed within that chunk, in document order.
+    """
+
+    _PACKAGE_DEPTH = 3
+    _TASK_DEPTH = 5
+
+    def __init__(self) -> None:
+        self._depth = 0
+        self._in_string = False
+        self._escape = False
+        self._buf: list[str] = []  # chars of the in-progress string literal
+        self._last_key: str | None = None  # most recent object key awaiting its value
+        self._value: str | None = None  # a just-closed string not yet consumed as a key or value
+
+    @staticmethod
+    def _decode(raw: str) -> str:
+        """Decode JSON string escapes in a completed literal (the chars were captured verbatim)."""
+        try:
+            return json.loads('"' + raw + '"')
+        except (ValueError, json.JSONDecodeError):
+            return raw
+
+    def feed(self, chunk: str) -> list[tuple[str, str]]:
+        events: list[tuple[str, str]] = []
+        for ch in chunk:
+            if self._in_string:
+                if self._escape:
+                    self._buf.append(ch)
+                    self._escape = False
+                elif ch == "\\":
+                    self._buf.append(ch)
+                    self._escape = True
+                elif ch == '"':
+                    self._in_string = False
+                    self._value = "".join(self._buf)
+                    self._buf = []
+                else:
+                    self._buf.append(ch)
+                continue
+            if ch == '"':
+                self._in_string = True
+                self._buf = []
+            elif ch == ":":
+                # The string we just closed was an object key, not a value.
+                self._last_key = self._value
+                self._value = None
+            elif ch == ",":
+                self._maybe_emit(events)
+                self._last_key = None
+                self._value = None
+            elif ch in "{[":
+                self._depth += 1
+            elif ch in "}]":
+                self._maybe_emit(events)  # a value can terminate by closing its container
+                self._depth -= 1
+                self._last_key = None
+                self._value = None
+        return events
+
+    def _maybe_emit(self, events: list[tuple[str, str]]) -> None:
+        if self._last_key != "name" or self._value is None:
+            return
+        if self._depth == self._PACKAGE_DEPTH:
+            events.append(("package", self._decode(self._value)))
+        elif self._depth == self._TASK_DEPTH:
+            events.append(("task", self._decode(self._value)))
+
+
 def _new_id() -> str:
     return uuid.uuid4().hex
 
@@ -97,6 +191,11 @@ def _coerce_phase(hint: str, default: Phase = Phase.DEVELOPMENT) -> Phase:
         return Phase(hint.strip().lower())
     except (ValueError, AttributeError):
         return default
+
+
+def _phase_in_scope(phase: Phase, selected_phases: list[Phase] | None) -> bool:
+    """Whether a phase is in the engagement's scope. None / empty ⇒ everything is in scope."""
+    return not selected_phases or phase in selected_phases
 
 
 def _role_for_category(roster: RoleRoster, category: RoleCategory, fallback: str) -> str:
@@ -162,8 +261,18 @@ def _effective_stage2_for_factor(
     return base.model_copy(
         update={
             "project_type": project_type,
+            # integration_count is a non-Optional int defaulting to 0, and the WBS wizard always sends
+            # 0 (it doesn't collect integrations), so here 0 == "unset" → fall through to the inferred
+            # count. (A richer future wizard that collects integrations would send a non-zero value.)
             "integration_count": base.integration_count or len(parsed.integration_mentions),
-            "screen_count_estimate": base.screen_count_estimate or (parsed.screen_count_estimate or None),
+            # screen_count_estimate is Optional, so an explicit 0 ("zero screens") is distinct from None
+            # ("unspecified"): only None falls through to the inferred count — a deliberate 0 wins
+            # (don't use `or`, which would treat 0 as falsy and override the user's explicit input).
+            "screen_count_estimate": (
+                base.screen_count_estimate
+                if base.screen_count_estimate is not None
+                else (parsed.screen_count_estimate or None)
+            ),
             "regulatory_requirements": base.regulatory_requirements
             or list(dict.fromkeys(parsed.regulatory_mentions)),
         }
@@ -195,7 +304,11 @@ def _complexity_effort_factor(
 
 
 def _planner_to_tree(
-    resp: WbsPlannerResponse, roster: RoleRoster, *, effort_multiplier: float = 1.0
+    resp: WbsPlannerResponse,
+    roster: RoleRoster,
+    *,
+    effort_multiplier: float = 1.0,
+    selected_phases: list[Phase] | None = None,
 ) -> list[WbsTaskInput]:
     """Convert the lenient planner output into a validated `WbsTaskInput` tree (backstop).
 
@@ -203,44 +316,107 @@ def _planner_to_tree(
     ``_complexity_effort_factor``) — NOT the raw setting — and scales the LLM-drafted hours to
     correct the systematic optimism of bottom-up task estimates; the global
     ``Settings.wbs_effort_scale`` tunes that computed factor. 1.0 leaves the hours as-is.
+
+    ``selected_phases`` scopes the tree: leaf tasks whose (coerced) phase is out of scope are
+    dropped, and any work package left with no in-scope leaves is dropped too — so a disabled phase
+    yields no work packages even if the LLM proposed some. Dependency edges onto a dropped node are
+    pruned automatically (its key never enters the resolution maps). None / full set ⇒ no filtering.
     """
     m = effort_multiplier if effort_multiplier > 0 else 1.0
     default_role = default_role_id(roster)
-    tree: list[WbsTaskInput] = []
+
+    # Pass 1: assign real ids and record the model's key→id maps. Package keys live in one namespace;
+    # task keys are tracked BOTH per-package (`local_leaf_keys`) and globally. Task-key resolution
+    # prefers the SAME package, because LLM-invented slugs like "tests"/"setup"/"api" collide across
+    # packages — a global-only first-wins map would silently route a package's `depends_on=["tests"]`
+    # to some other package's tests. First definition of a key wins within each map.
+    pkg_key_to_id: dict[str, str] = {}
+    leaf_key_to_id: dict[str, str] = {}
+    staged: list[tuple[WbsPlannerPackage, str, list[tuple[WbsPlannerLeaf, str]], dict[str, str]]] = []
     for pkg in resp.packages:
-        leaves: list[WbsTaskInput] = []
-        for leaf in pkg.tasks:
-            leaves.append(
-                WbsTaskInput(
-                    id=_new_id(),
-                    name=leaf.name,
-                    description=leaf.description,
-                    phase=_coerce_phase(leaf.phase),
-                    role_id=_resolve_role(leaf.role_id, roster, default_role),
-                    # Round to 1 decimal (not whole hours): preserves sub-hour precision and avoids
-                    # banker's-rounding a small task's bound down to 0 (e.g. round(0.5)==0).
-                    optimistic=round(leaf.optimistic * m, 1),
-                    most_likely=round(leaf.most_likely * m, 1),
-                    pessimistic=round(leaf.pessimistic * m, 1),
-                )
-            )
-        if not leaves:
+        # Drop out-of-scope leaves up front so their keys never become dependency targets and an
+        # all-out-of-scope package falls away via the empty-package guard below.
+        leaf_pairs = [
+            (leaf, _new_id())
+            for leaf in pkg.tasks
+            if _phase_in_scope(_coerce_phase(leaf.phase), selected_phases)
+        ]
+        if not leaf_pairs:
             continue  # drop empty packages — a branch with no leaves can't be costed
+        pkg_id = _new_id()
+        local_leaf_keys: dict[str, str] = {}
+        pkg_key = pkg.key.strip()
+        if pkg_key and pkg_key not in pkg_key_to_id:
+            pkg_key_to_id[pkg_key] = pkg_id
+        for leaf, leaf_id in leaf_pairs:
+            leaf_key = leaf.key.strip()
+            if leaf_key:
+                local_leaf_keys.setdefault(leaf_key, leaf_id)
+                leaf_key_to_id.setdefault(leaf_key, leaf_id)
+        staged.append((pkg, pkg_id, leaf_pairs, local_leaf_keys))
+
+    def _resolve_deps(keys: list[str], own_id: str, *maps: dict[str, str]) -> list[str]:
+        """Translate the model's dependency keys to real ids, trying each map in order (so a
+        same-package map can shadow the global one), dropping unknown keys + self and de-duplicating
+        while preserving order. (Cross-kind refs drop out: a key only appears in its kind's maps.)"""
+        out: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            k = key.strip()
+            dep_id = next((m[k] for m in maps if k in m), None)
+            if dep_id and dep_id != own_id and dep_id not in seen:
+                seen.add(dep_id)
+                out.append(dep_id)
+        return out
+
+    # Pass 2: build the validated tree, resolving each node's depends_on against the right map(s).
+    tree: list[WbsTaskInput] = []
+    for pkg, pkg_id, leaf_pairs, local_leaf_keys in staged:
+        leaves = [
+            WbsTaskInput(
+                id=leaf_id,
+                name=leaf.name,
+                description=leaf.description,
+                phase=_coerce_phase(leaf.phase),
+                role_id=_resolve_role(leaf.role_id, roster, default_role),
+                # Round to 1 decimal (not whole hours): preserves sub-hour precision and avoids
+                # banker's-rounding a small task's bound down to 0 (e.g. round(0.5)==0).
+                optimistic=round(leaf.optimistic * m, 1),
+                most_likely=round(leaf.most_likely * m, 1),
+                pessimistic=round(leaf.pessimistic * m, 1),
+                # same-package keys first, then the global map (cross-package references still work).
+                depends_on=_resolve_deps(leaf.depends_on, leaf_id, local_leaf_keys, leaf_key_to_id),
+            )
+            for leaf, leaf_id in leaf_pairs
+        ]
         tree.append(
-            WbsTaskInput(id=_new_id(), name=pkg.name, description=pkg.description, children=leaves)
+            WbsTaskInput(
+                id=pkg_id,
+                name=pkg.name,
+                description=pkg.description,
+                children=leaves,
+                depends_on=_resolve_deps(pkg.depends_on, pkg_id, pkg_key_to_id),
+            )
         )
     return tree
 
 
-def _fallback_tree(roster: RoleRoster) -> list[WbsTaskInput]:
+def _fallback_tree(
+    roster: RoleRoster, selected_phases: list[Phase] | None = None
+) -> list[WbsTaskInput]:
     """Deterministic full-lifecycle skeleton (one package + leaf per phase), LLM-free. The task
-    data + wording come from `orchestrator/wbs/fallback_skeleton.yaml`."""
+    data + wording come from `orchestrator/wbs/fallback_skeleton.yaml`.
+
+    ``selected_phases`` scopes the skeleton: tasks for out-of-scope phases are omitted (so a
+    disabled phase yields no work even on the no-API-key path). None / full set ⇒ full lifecycle."""
     cfg = _load_fallback_config()
     default_role = default_role_id(roster)
     default_desc = str(cfg.get("default_task_description") or "Placeholder task — edit or replace.")
     leaves: list[WbsTaskInput] = []
     for t in cfg.get("tasks", []):
         phase = _coerce_phase(str(t.get("phase", "")))
+        if not _phase_in_scope(phase, selected_phases):
+            continue
         try:
             category = RoleCategory(str(t.get("category", "other")).strip().lower())
         except ValueError:
@@ -258,18 +434,27 @@ def _fallback_tree(roster: RoleRoster) -> list[WbsTaskInput]:
             )
         )
     if not leaves:  # config unreadable/empty — keep the draft openable with a minimal leaf
+        # Honor scope even on this degenerate path: use a default phase that's actually in scope.
+        minimal_phase = Phase.DEVELOPMENT
+        if selected_phases and Phase.DEVELOPMENT not in selected_phases:
+            minimal_phase = selected_phases[0]
         leaves = [
             WbsTaskInput(
                 id=_new_id(),
-                name="Development work",
+                name=f"{minimal_phase.value.replace('_', ' ').title()} work",
                 description=default_desc,
-                phase=Phase.DEVELOPMENT,
+                phase=minimal_phase,
                 role_id=default_role,
                 optimistic=40,
                 most_likely=80,
                 pessimistic=160,
             )
         ]
+    # Seed a simple linear dependency chain through the lifecycle (each task waits on the previous
+    # one) so the skeleton demonstrates the "depends on" relationship even with no API key. The user
+    # edits these like everything else.
+    for prev, leaf in zip(leaves, leaves[1:], strict=False):
+        leaf.depends_on = [prev.id]
     pkg = cfg.get("package") or {}
     return [
         WbsTaskInput(
@@ -282,6 +467,11 @@ def _fallback_tree(roster: RoleRoster) -> list[WbsTaskInput]:
 
 
 def _build_user_prompt(req: WbsDraftRequest, roster: RoleRoster, stage3: Stage3Context) -> str:
+    # Phases the LLM may use. A strict subset scopes the draft — out-of-scope phases are removed
+    # from the offered list AND called out explicitly below so the model doesn't draft for them
+    # (the backstop also drops any it slips in).
+    selected = set(req.selected_phases) if req.selected_phases else None
+    phases_in_scope = [p for p in Phase if selected is None or p in selected]
     context = {
         "project_description": req.raw_input,
         "roster": [
@@ -289,18 +479,28 @@ def _build_user_prompt(req: WbsDraftRequest, roster: RoleRoster, stage3: Stage3C
              "seniority": r.seniority.value}
             for r in roster.roles
         ],
-        "phases": [p.value for p in Phase],
+        "phases": [p.value for p in phases_in_scope],
         "codebase_context": stage3.codebase_context.value,
         "ai_tooling": stage3.ai_tooling.model_dump(),
     }
     if req.stage2:
         context["industry"] = req.stage2.industry
         context["project_type"] = req.stage2.project_type.value
+    scope_note = ""
+    if selected is not None and len(phases_in_scope) < len(list(Phase)):
+        labels = ", ".join(p.value for p in phases_in_scope)
+        scope_note = (
+            f" SCOPE: this engagement covers ONLY these SDLC phases — {labels}. Do NOT create any "
+            "work package or leaf task for a phase outside this set; those phases are out of scope."
+        )
     return (
         "Draft a Work Breakdown Structure for this project.\n\n"
         f"{render_context_block({}, context)}\n\n"
         "Return work packages with leaf tasks via the tool. Assign each leaf a phase, a roster "
-        "role_id, and a three-point hour estimate."
+        "role_id, and a three-point hour estimate. Give every package and every task a short unique "
+        "`key`, and use `depends_on` to list the keys of prerequisite nodes — packages depend only "
+        "on other packages, tasks only on other tasks. Reference only keys you defined; keep the "
+        f"dependencies acyclic.{scope_note}"
     )
 
 
@@ -325,6 +525,34 @@ async def run_wbs_planner(req: WbsDraftRequest) -> WbsPlannerResponse:
     )
 
 
+async def run_wbs_planner_streamed(
+    req: WbsDraftRequest, *, on_node: Callable[[str, str], None]
+) -> WbsPlannerResponse:
+    """Streaming variant of `run_wbs_planner`: invokes ``on_node(kind, name)`` — ``kind`` is
+    ``"package"`` or ``"task"`` — as each is drafted, then returns the same validated two-level WBS.
+    Raises on LLM failure (the caller degrades to the deterministic skeleton)."""
+    roster = req.stage2.roster if req.stage2 and req.stage2.roster.roles else RoleRoster.default()
+    stage3 = req.stage3 or Stage3Context()
+    system = load_prompt("wbs_planner")
+    user = _build_user_prompt(req, roster, stage3)
+    parser = _PackageNameStreamParser()
+
+    def _on_delta(partial_json: str) -> None:
+        for kind, name in parser.feed(partial_json):
+            on_node(kind, name)
+
+    logger.debug("streaming WBS planner (model=%s)", get_settings().anthropic_model_wbs)
+    return await stream_structured(
+        system=system,
+        user=user,
+        response_model=WbsPlannerResponse,
+        tool_name="propose_wbs",
+        model=get_settings().anthropic_model_wbs,
+        max_tokens=16384,
+        on_input_delta=_on_delta,
+    )
+
+
 async def generate_wbs_tree(req: WbsDraftRequest) -> tuple[list[WbsTaskInput], str]:
     """Top-level entry point: draft a WBS tree (+ notes), degrading to a deterministic skeleton.
 
@@ -345,7 +573,9 @@ async def generate_wbs_tree(req: WbsDraftRequest) -> tuple[list[WbsTaskInput], s
             req.stage3,
             scale=get_settings().wbs_effort_scale,
         )
-        tree = _planner_to_tree(resp, roster, effort_multiplier=factor)
+        tree = _planner_to_tree(
+            resp, roster, effort_multiplier=factor, selected_phases=req.selected_phases
+        )
         if tree:
             logger.info("WBS planner drafted %d work package(s) (effort factor %.2f)", len(tree), factor)
             return tree, resp.notes
@@ -355,4 +585,44 @@ async def generate_wbs_tree(req: WbsDraftRequest) -> tuple[list[WbsTaskInput], s
             "WBS planner failed (%s); using fallback skeleton. Set ANTHROPIC_API_KEY for real drafts.",
             exc,
         )
-    return _fallback_tree(roster), ""
+    return _fallback_tree(roster, req.selected_phases), ""
+
+
+async def generate_wbs_tree_streamed(
+    req: WbsDraftRequest, *, on_node: Callable[[str, str], None]
+) -> tuple[list[WbsTaskInput], str]:
+    """Streaming sibling of `generate_wbs_tree`: identical rollup + never-fail contract, but the
+    planner runs in streaming mode and ``on_node(kind, name)`` fires for each work package / task as
+    it is drafted. Always returns a valid tree — any LLM failure degrades to the non-streaming draft
+    (and simply emits no node events)."""
+    roster = req.stage2.roster if req.stage2 and req.stage2.roster.roles else RoleRoster.default()
+    try:
+        # Same concurrent draft + complexity-signal extraction as generate_wbs_tree, but the planner
+        # streams its packages + tasks through on_node as they arrive.
+        resp, parsed = await asyncio.gather(
+            run_wbs_planner_streamed(req, on_node=on_node),
+            extract_context_from_raw(req.raw_input),
+        )
+        factor = _complexity_effort_factor(
+            _effective_stage2_for_factor(req.stage2, parsed),
+            req.stage3,
+            scale=get_settings().wbs_effort_scale,
+        )
+        tree = _planner_to_tree(
+            resp, roster, effort_multiplier=factor, selected_phases=req.selected_phases
+        )
+        if tree:
+            logger.info(
+                "WBS planner (streamed) drafted %d work package(s) (effort factor %.2f)",
+                len(tree), factor,
+            )
+            return tree, resp.notes
+        logger.warning("WBS planner (streamed) returned no usable packages; using fallback skeleton")
+        return _fallback_tree(roster, req.selected_phases), ""
+    except Exception as exc:  # noqa: BLE001
+        # Streaming has NO corrective retry (unlike call_structured). On a transient streaming failure
+        # (e.g. a tool-input that fails validation) fall back to the NON-streaming draft, which retries
+        # the planner once before degrading — so a one-off slip still yields a real planned tree rather
+        # than the generic skeleton (which wouldn't match the package names that just streamed by).
+        logger.warning("WBS planner stream failed (%s); retrying via the non-streaming draft path", exc)
+        return await generate_wbs_tree(req)
