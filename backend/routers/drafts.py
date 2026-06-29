@@ -17,6 +17,7 @@ from agents.tooling_classifier import (
     ToolingClassification,
     classify_ai_tooling,
 )
+from orchestrator.usage import capture_usage_to_db
 
 router = APIRouter(prefix="/estimates/draft", tags=["drafts"])
 
@@ -31,7 +32,10 @@ async def prefill_stage2(req: DraftPrefillRequest) -> Stage2Prefill:
     (defaults + low confidence) when the LLM call fails, so the endpoint never
     surfaces an API-key or network error to the user.
     """
-    return await prefill_stage2_from_raw(req.raw_input)
+    # Capture this pre-submission call into the llm_call table (no estimate id yet) so its cost shows
+    # up in Observability; the wizard session id lets it be associated with the estimate on submit.
+    async with capture_usage_to_db(session_id=req.session_id):
+        return await prefill_stage2_from_raw(req.raw_input)
 
 
 @router.post("/classify-tooling", response_model=ToolingClassification)
@@ -45,7 +49,8 @@ async def classify_tooling(req: ClassifyToolingRequest) -> ToolingClassification
     Tools the model can't identify are researched via the self-hosted docs-mcp-server;
     if that's unavailable, those tools stay 'none'.
     """
-    return await classify_ai_tooling(req.description)
+    async with capture_usage_to_db(session_id=req.session_id):
+        return await classify_ai_tooling(req.description)
 
 
 # AG-UI agent-run endpoint for the team-roster proposal (Option B). The frontend

@@ -5,7 +5,8 @@ reinventing any math:
 
 1. Group the tree's leaves by `Phase`.
 2. Per phase, build ONE `PhaseEstimate`: combine the leaf 3-point bands via
-   `montecarlo.combine_pert_leaves` (independent PERT sum + the same skewed AI-reduction sampler
+   `montecarlo.combine_pert_leaves` (correlated PERT sum — a shared per-draw common-factor floors
+   the band's CoV instead of letting it collapse ~1/√N — + the same skewed AI-reduction sampler
    the twins use), and attribute role hours from the leaves' EXPLICIT role assignments (not the
    percentage-based `attribute_roles` — the user assigned a role per leaf).
 3. Feed those `PhaseEstimate`s straight into `commercial_processing` + `synthesize_estimate`
@@ -19,6 +20,7 @@ Load-bearing invariants preserved (same as the twins): `most_likely` is Σ leaf 
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
 
 from admin.contingency_admin import resolve_contingency_pct
@@ -29,23 +31,91 @@ from models.twin_outputs import (
     Phase,
     PhaseEstimate,
     RoleHours,
+    pert_mean,
 )
 from models.wbs_schema import WBS_DEFAULT_CONTINGENCY_PCT, WbsCalculateRequest
 from models.wbs_task import WbsTaskInput, count_tasks, iter_leaves
-from orchestrator.ai_acceleration import ReductionContext, effective_ai_reduction
+from orchestrator.ai_acceleration import ReductionContext, band_for, effective_ai_reduction
 from orchestrator.montecarlo import combine_pert_leaves, make_rng, result_to_hour_range
 from orchestrator.nodes._twin_base import make_reduction_sampler, tooling_for
 from orchestrator.nodes.commercial_processing import compute_total_costs
 from orchestrator.nodes.synthesize_estimate import synthesize_from_phase_estimates
 from orchestrator.role_attribution import default_role_id
+from orchestrator.wbs.critical_path import critical_path_weeks
 
 logger = logging.getLogger(__name__)
+
 
 _WBS_TWIN_NAME = "WBS"
 _WBS_ALGORITHM = "WBS bottom-up (PERT)"
 # Bottom-up estimates carry a moderate, fixed self-confidence (no algorithmic confidence signal
 # like the twins emit); the Monte Carlo band is what conveys the real uncertainty.
 _WBS_CONFIDENCE = 0.6
+
+# High-signal regulatory terms. The WBS wizard collects roster + codebase but NOT the Stage-2
+# regulatory list the twins' LLM parse extracts, so a "healthcare patient portal" would otherwise miss
+# the −8% verification tax the parametric flow applies. We detect it deterministically from the
+# description (over-flagging is mildly conservative — the intended direction).
+_REGULATORY_KEYWORDS: tuple[str, ...] = (
+    "hipaa", "phi", "protected health", "patient", "healthcare", "health care", "medical record",
+    "ehr", "emr", "hl7", "fhir",
+    "pci", "pci-dss", "cardholder", "payment card", "credit card",
+    "soc 2", "soc2", "soc-2",
+    "gdpr", "ccpa",
+    "fedramp",
+    "ferpa", "student record",
+    "sarbanes", "sox compliance",
+)
+
+# The phases where the TWINS use an LLM-PROPOSED reduction (discovery/ux instead use the band
+# midpoint). For these, the raw band midpoint is too optimistic vs the parametric flow, so WBS anchors
+# them toward the LOWER part of the band — see `_reduction_anchor`.
+_TWIN_PROPOSAL_PHASES: frozenset[Phase] = frozenset(
+    {Phase.DEVELOPMENT, Phase.CODE_REVIEW, Phase.DEPLOYMENT, Phase.QA_TESTING}
+)
+
+
+def _reduction_anchor() -> float:
+    """Fraction up the guardrail band WBS anchors its AI reduction for the LLM-proposal phases
+    (0.5 = band midpoint). Below 0.5 makes WBS less optimistic, tracking the parametric flow's typical
+    sub-midpoint per-project reductions instead of the generous midpoint. Env `WBS_AI_REDUCTION_ANCHOR`,
+    default 0.3, clamped to [0, 1] (resolved at call time so a test/env override takes effect)."""
+    try:
+        v = float(os.environ.get("WBS_AI_REDUCTION_ANCHOR", "0.3"))
+    except ValueError:
+        return 0.3
+    return min(1.0, max(0.0, v))
+
+
+def _detect_regulated(raw_input: str, stage2: Stage2Context) -> bool:
+    """Flag a regulated engagement so the WBS AI reduction gets the same −8% verification tax the
+    parametric flow applies. True when Stage 2 carries an explicit regulatory requirement OR the
+    description mentions a known regime (HIPAA/PCI/SOC 2/GDPR/FedRAMP/FERPA/SOX and high-signal
+    domain terms)."""
+    if stage2.regulatory_requirements:
+        return True
+    text = (raw_input or "").lower()
+    return any(kw in text for kw in _REGULATORY_KEYWORDS)
+
+
+def normalize_wbs_inputs(
+    req: WbsCalculateRequest,
+) -> tuple[Stage2Context, RoleRoster, Stage3Context, float]:
+    """Resolve the shared WBS request defaults — roster fallback, stage2/3 defaults, and the
+    WBS-own contingency — used identically by the rollup AND the parametric reconciliation so both
+    compute on the SAME basis (the reconciliation's whole premise). Returns
+    ``(stage2, roster, stage3, contingency_pct)``. Keep this the single source of that normalization."""
+    stage2 = req.stage2 or Stage2Context()
+    roster = stage2.roster if stage2.roster.roles else RoleRoster.default()
+    if roster is not stage2.roster:
+        stage2 = stage2.model_copy(update={"roster": roster})
+    stage3 = req.stage3 or Stage3Context()
+    # The WBS flow carries its OWN explicit contingency (request field, default 30%) — it does NOT
+    # read the global app_settings contingency the parametric/quick estimate uses.
+    raw_contingency = (
+        req.contingency_pct if req.contingency_pct is not None else WBS_DEFAULT_CONTINGENCY_PCT
+    )
+    return stage2, roster, stage3, resolve_contingency_pct(raw_contingency)
 
 
 async def _load_reduction_bands() -> dict:
@@ -133,9 +203,17 @@ def _phase_estimate(
         regulated=regulated,
         bands=reduction_bands,
     )
-    # WBS proposes no LLM reduction (like Discovery/UX): use the guardrail band midpoint.
-    eff = effective_ai_reduction(proposed_reduction=None, **reduction_ctx.reduction_kwargs())
-    sampler = make_reduction_sampler(ctx=reduction_ctx, proposed_point=None, reduction_range=None)
+    # WBS has no per-task LLM reduction. Discovery/UX use the band midpoint (proposed=None), matching
+    # the twins. For the phases where the twins use an LLM-PROPOSED reduction, anchor toward the LOWER
+    # band (not the optimistic midpoint) so WBS tracks the parametric flow instead of overstating AI
+    # savings — applied to BOTH the point and the MC sampler so they stay consistent.
+    proposed: float | None = None
+    if phase in _TWIN_PROPOSAL_PHASES:
+        lo, hi = band_for(phase, reduction_ctx.tooling, reduction_bands)
+        if hi > 0.0:
+            proposed = lo + _reduction_anchor() * (hi - lo)
+    eff = effective_ai_reduction(proposed_reduction=proposed, **reduction_ctx.reduction_kwargs())
+    sampler = make_reduction_sampler(ctx=reduction_ctx, proposed_point=proposed, reduction_range=None)
     rng = make_rng(f"{estimate_id}:{phase.value}:wbs")
     bands = [
         (leaf.optimistic or 0.0, leaf.most_likely or 0.0, leaf.pessimistic or 0.0)
@@ -171,20 +249,11 @@ async def build_wbs_estimate(
     req: WbsCalculateRequest, *, estimate_id: str
 ) -> DualScenarioEstimate:
     """Roll a WBS tree up into a DualScenarioEstimate (no persistence — preview + commit share this)."""
-    stage2 = req.stage2 or Stage2Context()
-    roster = stage2.roster if stage2.roster.roles else RoleRoster.default()
-    if roster is not stage2.roster:
-        stage2 = stage2.model_copy(update={"roster": roster})
-    stage3 = req.stage3 or Stage3Context()
-    regulated = bool(stage2.regulatory_requirements)
-
+    stage2, roster, stage3, contingency_pct = normalize_wbs_inputs(req)
+    # Flag a regulated engagement (HIPAA/PCI/…) from the explicit Stage-2 list OR the description, so
+    # the AI reduction gets the same verification tax the parametric flow applies.
+    regulated = _detect_regulated(req.raw_input, stage2)
     reduction_bands = await _load_reduction_bands()
-    # The WBS flow carries its OWN explicit contingency (the request field, default 30%) — it does
-    # NOT read the global app_settings contingency the parametric/quick estimate uses.
-    raw_contingency = (
-        req.contingency_pct if req.contingency_pct is not None else WBS_DEFAULT_CONTINGENCY_PCT
-    )
-    contingency_pct = resolve_contingency_pct(raw_contingency)
 
     grouped = _remap_unknown_roles(_group_leaves_by_phase(req.tree), roster)
     # Iterate Phase (not dict) so phases stay in canonical order.
@@ -202,6 +271,18 @@ async def build_wbs_estimate(
         if grouped.get(phase)
     ]
 
+    # Critical-path floor: the longest dependency chain (AI-assisted basis, per-phase reduction) sets
+    # a minimum the sequencing-blind staffing duration can't undercut. Built off the same per-phase
+    # `eff` the phase estimates realized, so the floor matches the AI-assisted timeline the band shows.
+    eff_by_phase = {pe.phase: pe.effective_ai_reduction_pct / 100.0 for pe in phase_estimates}
+
+    def _leaf_ai_hours(leaf: WbsTaskInput) -> float:
+        manual = pert_mean(leaf.optimistic or 0.0, leaf.most_likely or 0.0, leaf.pessimistic or 0.0)
+        eff = eff_by_phase.get(leaf.phase, 0.0) if leaf.phase is not None else 0.0
+        return manual * (1.0 - eff)
+
+    duration_floor_weeks = critical_path_weeks(req.tree, hours_of=_leaf_ai_hours)
+
     # Reuse the twin tail through its typed seams: base labor cost, then variance-combine +
     # Brooks staffing + contingency + headcount — no untyped EstimationState dict, no type: ignore.
     total_ai_cost, total_manual_cost = compute_total_costs(phase_estimates, roster)
@@ -211,6 +292,7 @@ async def build_wbs_estimate(
         total_cost_ai_assisted_usd=total_ai_cost,
         total_cost_manual_only_usd=total_manual_cost,
         contingency_pct=contingency_pct,
+        duration_floor_weeks=duration_floor_weeks,
     )
     logger.info(
         "WBS rollup complete: %d task(s) across %d phase(s); ai_ml=%.0fh manual_ml=%.0fh",

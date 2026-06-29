@@ -18,7 +18,7 @@ import asyncio
 import logging
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from db.orm_models import CalibrationAggregate, PhaseHistory
@@ -270,14 +270,10 @@ async def get_calibration_for_all_phases(
 
 
 def _avg(column):
-    from sqlalchemy import func
-
     return func.avg(column)
 
 
 def _count(column):
-    from sqlalchemy import func
-
     return func.count(column)
 
 

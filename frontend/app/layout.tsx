@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { Providers } from "./providers";
 
 export const metadata: Metadata = {
-  title: "AI SDLC Cost Estimator",
+  title: "Software Project Estimator",
   description: "Multi-agent cost estimation for AI-heavy software projects.",
 };
 
@@ -18,11 +18,49 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <header className="border-b border-slate-200 bg-white">
               <div className="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
                 <Link href="/" className="font-semibold text-slate-900">
-                  AI SDLC Cost Estimator
+                  Software Project Estimator
                 </Link>
                 <nav className="flex items-center gap-4 text-sm">
-                  <Link className="text-slate-600 hover:text-slate-900" href="/">
-                    Dashboard
+                  <Link
+                    href="/"
+                    aria-label="Home"
+                    title="Home"
+                    className="text-slate-500 hover:text-slate-900"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      className="h-5 w-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M3 10.5 12 3l9 7.5" />
+                      <path d="M5 9.75V21h14V9.75" />
+                      <path d="M9.5 21v-6h5v6" />
+                    </svg>
+                  </Link>
+                  <Link
+                    href="/observability"
+                    aria-label="Observability"
+                    title="Observability — LLM cost & usage"
+                    className="text-slate-500 hover:text-slate-900"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      className="h-5 w-5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M3 3v18h18" />
+                      <path d="M8 17v-4" />
+                      <path d="M13 17V8" />
+                      <path d="M18 17v-7" />
+                    </svg>
                   </Link>
                   <Link
                     href="/settings"

@@ -18,16 +18,25 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def test_logs_method_path_status_and_latency(
+def test_health_access_log_is_debug_not_info(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # GET /health → 200 is liveness polling: pure noise at INFO, so it's logged at DEBUG. Capturing
+    # at INFO must NOT see it; capturing at DEBUG must, with the full method/path/status/latency line.
     with caplog.at_level(logging.INFO, logger=_LOGGER):
         assert client.get("/health").status_code == 200
+    assert not [
+        r for r in caplog.records if "http GET /health" in r.getMessage()
+    ], "successful GET /health must not log at INFO"
 
-    lines = [r.getMessage() for r in caplog.records if "http GET /health" in r.getMessage()]
-    assert lines, f"no access log for GET /health: {[r.getMessage() for r in caplog.records]}"
-    assert "→ 200" in lines[0]
-    assert "ms)" in lines[0]  # latency is logged
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER):
+        assert client.get("/health").status_code == 200
+    health = [r for r in caplog.records if "http GET /health" in r.getMessage()]
+    assert health, "GET /health should still log at DEBUG"
+    assert health[0].levelno == logging.DEBUG
+    assert "→ 200" in health[0].getMessage()
+    assert "ms)" in health[0].getMessage()  # latency is logged
 
 
 def test_streaming_endpoint_still_streams_through_middleware(

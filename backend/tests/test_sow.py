@@ -75,7 +75,7 @@ def test_company_override_is_read_live_after_config_reload(monkeypatch) -> None:
     """Regression: the company override must be resolved LIVE (via the ``config`` module), not
     frozen into the parse cache nor read through a reference captured at import time.
 
-    A prior test reloading ``config`` (as ``test_langfuse_wrapper`` does) used to leave
+    A prior test that reloads ``config`` used to leave
     ``sow.config`` reading a stale ``get_settings`` whose cached ``Settings`` predated the env —
     so the override was silently skipped. This pins the live read so that can't regress."""
     import importlib

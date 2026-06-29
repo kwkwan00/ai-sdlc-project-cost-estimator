@@ -47,10 +47,19 @@ class RequestLoggingMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         finally:
-            logger.info(
+            path = scope.get("path", "?")
+            # `/health` liveness polling (→ 2xx/3xx) is pure noise at INFO — log it at DEBUG. A
+            # FAILING health check (≥ 400) still surfaces at INFO so real problems aren't hidden.
+            level = (
+                logging.DEBUG
+                if path == "/health" and 200 <= (status or 0) < 400
+                else logging.INFO
+            )
+            logger.log(
+                level,
                 "http %s %s → %s (%dms)",
                 scope.get("method", "?"),
-                scope.get("path", "?"),
+                path,
                 status or "?",
                 int((time.perf_counter() - started) * 1000),
             )

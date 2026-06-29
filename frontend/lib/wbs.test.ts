@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import type { MissingTask } from "./types";
 import {
   addChild,
+  addMissingTask,
   branchIds,
   clampHours,
   countLeaves,
@@ -22,6 +24,7 @@ import {
   rolledCostMap,
   rolledHoursMap,
   rollupRange,
+  scaleLeafHoursByPhase,
   subtreeIds,
   subtreeMostLikely,
   updateNode,
@@ -36,6 +39,81 @@ const TREE: WbsTaskInput[] = [
   { id: "pkg1", name: "Build", children: [leaf("l1", 10, 20, 40), leaf("l2", 5, 10, 20)] },
   { id: "pkg2", name: "Test", children: [leaf("l3", 4, 8, 16)] },
 ];
+
+describe("scaleLeafHoursByPhase", () => {
+  it("scales each leaf's 3-point hours by its phase's factor, leaving others untouched", () => {
+    const tree: WbsTaskInput[] = [
+      { id: "p", name: "p", children: [
+        { id: "dev", name: "dev", phase: "development", role_id: "r", optimistic: 10, most_likely: 20, pessimistic: 40, children: [] },
+        { id: "qa", name: "qa", phase: "qa_testing", role_id: "r", optimistic: 4, most_likely: 8, pessimistic: 16, children: [] },
+      ] },
+    ];
+    const out = scaleLeafHoursByPhase(tree, { development: 2 });
+    const dev = out[0].children[0];
+    const qa = out[0].children[1];
+    expect([dev.optimistic, dev.most_likely, dev.pessimistic]).toEqual([20, 40, 80]); // ×2
+    expect([qa.optimistic, qa.most_likely, qa.pessimistic]).toEqual([4, 8, 16]); // untouched (no factor)
+    expect(dev.optimistic! <= dev.most_likely! && dev.most_likely! <= dev.pessimistic!).toBe(true);
+  });
+
+  it("preserves structure, ids, roles, and dependencies", () => {
+    const tree: WbsTaskInput[] = [
+      { id: "p", name: "p", children: [
+        { id: "a", name: "a", phase: "development", role_id: "sr", optimistic: 10, most_likely: 20, pessimistic: 30, depends_on: ["b"], children: [] },
+      ] },
+    ];
+    const out = scaleLeafHoursByPhase(tree, { development: 1.5 });
+    const a = out[0].children[0];
+    expect(a.id).toBe("a");
+    expect(a.role_id).toBe("sr");
+    expect(a.depends_on).toEqual(["b"]);
+    expect(a.most_likely).toBe(30); // 20 × 1.5
+  });
+
+  it("rounds to 1 decimal and is a no-op when no phase factor applies", () => {
+    const tree: WbsTaskInput[] = [
+      { id: "x", name: "x", phase: "development", role_id: "r", optimistic: 8, most_likely: 16, pessimistic: 32, children: [] },
+    ];
+    expect(scaleLeafHoursByPhase(tree, { qa_testing: 2 })[0].most_likely).toBe(16); // unaffected phase
+    expect(scaleLeafHoursByPhase(tree, { development: 1.85 })[0].most_likely).toBe(29.6); // 16 × 1.85
+  });
+});
+
+describe("addMissingTask", () => {
+  const missing: MissingTask = {
+    phase: "deployment",
+    title: "HIPAA audit logging",
+    rationale: "Regulated PHI access must be logged.",
+    optimistic: 20,
+    most_likely: 40,
+    pessimistic: 80,
+  };
+
+  it("creates a 'Recommended additions' package with the suggestion as a leaf on first add", () => {
+    const out = addMissingTask([], missing, "sr_engineer");
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe("Recommended additions");
+    const leaf = out[0].children[0];
+    expect(leaf.name).toBe("HIPAA audit logging");
+    expect(leaf.phase).toBe("deployment");
+    expect(leaf.role_id).toBe("sr_engineer");
+    expect([leaf.optimistic, leaf.most_likely, leaf.pessimistic]).toEqual([20, 40, 80]);
+  });
+
+  it("appends to the existing additions package on later adds (never a second one)", () => {
+    const first = addMissingTask([], missing, "r");
+    const second = addMissingTask(first, { ...missing, title: "PHI encryption" }, "r");
+    const pkgs = second.filter((n) => n.name === "Recommended additions");
+    expect(pkgs).toHaveLength(1);
+    expect(pkgs[0].children.map((c) => c.name)).toEqual(["HIPAA audit logging", "PHI encryption"]);
+  });
+
+  it("preserves the existing tree", () => {
+    const out = addMissingTask([{ id: "p", name: "Build", children: [] }], missing, "r");
+    expect(out[0].name).toBe("Build");
+    expect(out[1].name).toBe("Recommended additions");
+  });
+});
 
 describe("pertMean", () => {
   it("weights the mode 4x", () => {

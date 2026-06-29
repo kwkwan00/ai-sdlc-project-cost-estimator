@@ -58,6 +58,19 @@ export interface LlmModelUsage {
   cost_usd: number;
 }
 
+/** Per-agent (by forced-tool name) LLM cost, with the time span of the agent's calls. */
+export interface LlmAgentUsage {
+  agent: string;
+  model: string;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
 export interface LlmUsage {
   call_count: number;
   input_tokens: number;
@@ -65,6 +78,81 @@ export interface LlmUsage {
   cache_read_tokens: number;
   cost_usd: number;
   by_model: LlmModelUsage[];
+  by_agent: LlmAgentUsage[];
+}
+
+/** One estimate's LLM cost row in the top-level observability view. */
+export interface EstimateLlmUsage {
+  estimate_id: string;
+  project_name: string;
+  method: string;
+  created_at: string | null;
+  llm_usage: LlmUsage;
+}
+
+/** Aggregate LLM cost/usage across all persisted estimates (GET /observability/llm-usage). */
+export interface LlmObservability {
+  enabled: boolean;
+  total: LlmUsage;
+  by_estimate: EstimateLlmUsage[];
+}
+
+/** How the bottom-up WBS total compares to a parametric (twin) estimate of the same brief. */
+export type ReconciliationVerdict =
+  | "aligned"
+  | "likely_omitted_work"
+  | "likely_double_count";
+
+/** Per-phase bottom-up vs parametric comparison (manual-only most-likely hours). */
+export interface PhaseDivergence {
+  phase: Phase;
+  wbs_hours: number;
+  parametric_hours: number;
+  delta_pct: number;
+  /** No WBS tasks for this phase but the parametric expects work — the phase was *omitted*, not
+   *  under-sized. Calibration can't scale an empty phase; the user must add tasks. */
+  omitted: boolean;
+}
+
+/** A task the completeness critic believes the WBS is missing (within-phase omission). */
+export interface MissingTask {
+  phase: Phase;
+  title: string;
+  rationale: string;
+  optimistic: number;
+  most_likely: number;
+  pessimistic: number;
+}
+
+/** Completeness-critic result (POST /estimates/wbs/completeness) — likely-missing tasks. */
+export interface WbsCompletenessResponse {
+  missing: MissingTask[];
+  notes: string;
+  llm_usage: LlmUsage | null;
+}
+
+/** Per-leaf hour suggestion (POST /estimates/wbs/suggest-hours, #5c). `available` is false when the
+ *  leaf isn't found / no API key / any failure — the editor only applies the numbers when true. */
+export interface WbsLeafHoursSuggestion {
+  available: boolean;
+  optimistic: number;
+  most_likely: number;
+  pessimistic: number;
+  rationale: string;
+  llm_usage: LlmUsage | null;
+}
+
+/** Twin↔WBS reconciliation (POST /estimates/wbs/reconcile) — omitted-work / double-count signal. */
+export interface WbsReconciliation {
+  wbs_total_hours: number;
+  parametric_total_hours: number;
+  total_delta_pct: number;
+  verdict: ReconciliationVerdict;
+  per_phase: PhaseDivergence[];
+  note: string;
+  /** False when no API key was configured — the parametric ran on stubs (structural check only). */
+  parametric_available: boolean;
+  llm_usage: LlmUsage | null;
 }
 
 export interface Assumption {
@@ -114,6 +202,9 @@ export interface DualScenarioEstimate {
   confidence: number;
   duration_weeks_low: number;
   duration_weeks_high: number;
+  /** WBS only: critical-path length (longest dependency chain) the duration was floored to. 0 when
+   *  no task graph constrains the schedule. > duration_weeks_low ⇒ the timeline is sequencing-bound. */
+  critical_path_weeks?: number;
   headcount_by_role: RoleHeadcount[];
   weekly_burn_rate_usd: number;
   // Team-scaling (Brooks's Law + diminishing returns) outputs — optional so persisted

@@ -44,7 +44,7 @@ function TrashIcon() {
   );
 }
 
-export default function Dashboard() {
+export default function Home() {
   const router = useRouter();
   const [items, setItems] = useState<EstimateHistoryItem[]>([]);
   const [total, setTotal] = useState(0);

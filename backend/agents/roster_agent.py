@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
 from typing import Annotated, NamedTuple
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
@@ -31,6 +30,7 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 from config import get_settings
 from models.project_schema import CustomRole, RoleRoster, Stage2Context
 from models.twin_outputs import Phase, RoleCategory, RoleSeniority
+from models.validators import clip_text
 from orchestrator.llm import call_structured, render_context_block
 from orchestrator.prompts import load_prompt
 from pricing import resolve_rate
@@ -41,21 +41,6 @@ logger = logging.getLogger(__name__)
 _MAX_ROLES = 8
 
 
-def _clip(limit: int) -> Callable[[object], object]:
-    """Truncate an over-long LLM string to ``limit`` chars instead of failing validation.
-
-    The model sometimes ignores the schema's ``maxLength`` — e.g. a rationale a few words over the
-    cap — and a slightly-too-long free-text field shouldn't sink the whole structured-output call,
-    which forces a retry and, if that also overshoots, a fallback to the deterministic roster. We
-    keep ``max_length`` in the schema as a hint to the model and clip as the safety net (a 'before'
-    validator, so it runs ahead of the length constraint)."""
-
-    def _truncate(value: object) -> object:
-        return value[:limit] if isinstance(value, str) else value
-
-    return _truncate
-
-
 # ---------- agent response model (enum-constrained; LLM emits structure only) ----------
 
 
@@ -63,8 +48,8 @@ class ProjectPlanItem(BaseModel):
     """One high-level workstream in the proposed delivery plan."""
 
     model_config = ConfigDict(extra="forbid")
-    workstream: Annotated[str, BeforeValidator(_clip(80))] = Field(min_length=1, max_length=80)
-    summary: Annotated[str, BeforeValidator(_clip(160))] = Field(min_length=1, max_length=160)
+    workstream: Annotated[str, BeforeValidator(clip_text(80))] = Field(min_length=1, max_length=80)
+    summary: Annotated[str, BeforeValidator(clip_text(160))] = Field(min_length=1, max_length=160)
 
 
 class ProposedRole(BaseModel):
@@ -77,7 +62,7 @@ class ProposedRole(BaseModel):
     deterministic key lookup, not a fuzzy label match). Null / unknown → priced from the grid."""
 
     model_config = ConfigDict(extra="forbid")
-    description: Annotated[str, BeforeValidator(_clip(120))] = Field(min_length=1, max_length=120)
+    description: Annotated[str, BeforeValidator(clip_text(120))] = Field(min_length=1, max_length=120)
     category: RoleCategory = RoleCategory.OTHER
     seniority: RoleSeniority = RoleSeniority.OTHER
     percentage: float = Field(default=0.0, ge=0, le=100)
@@ -95,7 +80,7 @@ class RosterProposal(BaseModel):
     project_plan: list[ProjectPlanItem] = Field(default_factory=list, max_length=6)
     # 400, not 300: the prompt asks for ≤45 words naming specific integrations/regimes, which runs
     # past 300 chars in practice — the old cap mismatched its own instruction and tripped the retry.
-    staffing_rationale: Annotated[str, BeforeValidator(_clip(400))] = Field(default="", max_length=400)
+    staffing_rationale: Annotated[str, BeforeValidator(clip_text(400))] = Field(default="", max_length=400)
     roles: list[ProposedRole] = Field(min_length=1, max_length=_MAX_ROLES)
 
 

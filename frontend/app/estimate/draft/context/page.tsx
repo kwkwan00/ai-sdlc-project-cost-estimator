@@ -15,7 +15,7 @@ import {
   type CustomRoleInput,
   type Stage2Input,
 } from "@/lib/schemas";
-import { loadDraft, saveDraft } from "@/lib/wizard-store";
+import { currentWizardSession, loadDraft, saveDraft } from "@/lib/wizard-store";
 
 interface PrefillState {
   prefilled: boolean;
@@ -111,7 +111,12 @@ export default function Stage2DraftPage() {
     setRosterError(null);
     setRosterLoading(true);
     try {
-      const result = await proposeRoster({ stage2, rawInput, selectedPhases });
+      const result = await proposeRoster({
+        stage2,
+        rawInput,
+        selectedPhases,
+        sessionId: currentWizardSession(),
+      });
       if (!mountedRef.current) return;
       setValue("roster", { roles: result.roster });
       const latest = loadDraft();

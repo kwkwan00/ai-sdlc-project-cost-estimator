@@ -23,6 +23,7 @@ import {
   saveWbsCache,
   type WbsNewDraft,
 } from "@/lib/wbs-store";
+import { currentWizardSession, startWizardSession } from "@/lib/wizard-store";
 
 // Time-based progress for the "Draft WBS" action. The planner is a single opaque LLM call with no
 // sub-progress to stream, so the bar trickles toward a ceiling < 100 during each phase and only the
@@ -118,6 +119,7 @@ export default function WbsTeamPage() {
         stage2: buildStage2([]),
         rawInput,
         selectedPhases: d.selected_phases,
+        sessionId: currentWizardSession(),
       });
       setRoster(result.roster);
       setRationale(result.rationale || "");
@@ -137,8 +139,12 @@ export default function WbsTeamPage() {
   useEffect(() => {
     if (!draft || ranRef.current) return;
     ranRef.current = true;
+    // Mint a fresh wizard-run UUID up front so the tooling + roster pre-submission calls and the
+    // eventual commit (the editor's calculateWbs) all share one id — the backend associates them in
+    // Observability. Cleared on a successful commit; an abandoned draft's calls stay orphaned.
+    startWizardSession();
     toolingRef.current = draft.tooling.trim()
-      ? classifyTooling(draft.tooling)
+      ? classifyTooling(draft.tooling, currentWizardSession())
           .then((r) => r.ai_tooling)
           .catch(() => NO_TOOLING)
       : Promise.resolve(NO_TOOLING);

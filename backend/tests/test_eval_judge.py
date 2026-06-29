@@ -129,10 +129,12 @@ async def test_judge_structured_anthropic_falls_back_to_call_structured(monkeypa
 
 
 def test_get_openai_client_requires_key(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setattr(judge, "_client", None)
-    monkeypatch.setattr(
-        judge, "get_settings", lambda: SimpleNamespace(openai_api_key="")
-    )
+    # The OpenAI client getter is now shared in orchestrator.llm (judge re-exports it); patch the
+    # client cache + settings there, where the function reads them.
+    import orchestrator.llm as llm
+
+    monkeypatch.setattr(llm, "_openai_client", None)
+    monkeypatch.setattr(llm, "get_settings", lambda: SimpleNamespace(openai_api_key=""))
     with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
         judge._get_openai_client()
 

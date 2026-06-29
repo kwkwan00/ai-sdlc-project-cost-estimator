@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 
+import { ALL_PHASES } from "@/components/PhaseScopePicker";
 import { StageProgress } from "@/components/StageProgress";
 import {
   buildCreatePayload,
@@ -15,11 +16,14 @@ import {
   type PhaseTooling,
   type Stage3Input,
 } from "@/lib/schemas";
-import { PHASE_LABELS, type Phase } from "@/lib/types";
-import { clearDraft, loadDraft, saveDraft, saveSession } from "@/lib/wizard-store";
-
-// Canonical phase order for the scope picker (mirrors the review page's label source).
-const ALL_PHASES = Object.keys(PHASE_LABELS) as Phase[];
+import {
+  clearDraft,
+  clearWizardSession,
+  currentWizardSession,
+  loadDraft,
+  saveDraft,
+  saveSession,
+} from "@/lib/wizard-store";
 
 const NO_TOOLING: PhaseTooling = {
   discovery: "none",
@@ -65,6 +69,9 @@ export default function Stage3DraftPage() {
     }
     setSubmitting(true);
     setError(null);
+    // The wizard-run UUID set on Stage 1 — threaded through the tooling classifier
+    // and the create call so their LLM usage associates with this estimate.
+    const sessionId = currentWizardSession();
     try {
       // Classify the freeform tooling description into per-phase levels. The
       // backend always returns a valid mapping; only a network failure throws —
@@ -73,7 +80,7 @@ export default function Stage3DraftPage() {
       const description = stage3.ai_tooling_description.trim();
       if (description) {
         try {
-          ai_tooling = (await classifyTooling(description)).ai_tooling;
+          ai_tooling = (await classifyTooling(description, sessionId)).ai_tooling;
         } catch {
           ai_tooling = { ...NO_TOOLING };
         }
@@ -91,7 +98,8 @@ export default function Stage3DraftPage() {
         draft.project_name,
         draft.stage2,
         classifiedStage3,
-        phasesArg
+        phasesArg,
+        sessionId
       );
       const envelope = await createEstimate(payload);
       saveSession(envelope.estimate_id, {
@@ -101,6 +109,9 @@ export default function Stage3DraftPage() {
         stage3: classifiedStage3,
       });
       clearDraft();
+      // The run is committed; the session id now lives on the estimate, so retire
+      // it — the next wizard starts a fresh one on Stage 1.
+      clearWizardSession();
       router.push(`/estimate/${envelope.estimate_id}/questions`);
     } catch (e) {
       setError((e as Error).message);

@@ -125,5 +125,4 @@ code_review_pass1, code_review_pass2 = make_twin_nodes(
     stub_ai_mid=100,
     stub_manual_mid=130,
     proposed_reduction_fn=_proposed_reduction,
-    trace_name="twin.code_review",
 )

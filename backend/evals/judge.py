@@ -18,37 +18,15 @@ from __future__ import annotations
 
 import logging
 
-from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel
 
-from config import get_settings
-from orchestrator.llm import call_structured
+# Shared with the production path — one OpenAI client getter + model-prefix check (a `claude-*`
+# judge-model routes to the Anthropic `call_structured` fallback below). Imported (not re-defined) so
+# there's a single copy; tests still `monkeypatch.setattr(judge, "_get_openai_client", ...)`.
+from orchestrator.llm import _get_openai_client, _is_openai_model, call_structured
 
 logger = logging.getLogger(__name__)
-
-# Model-name prefixes that route to OpenAI: gpt-* plus the o-series / chatgpt reasoning
-# models. Anything else (e.g. ``claude-*``) routes to the Anthropic fallback.
-_OPENAI_PREFIXES: tuple[str, ...] = ("gpt", "o1", "o3", "o4", "chatgpt")
-
-_client: AsyncOpenAI | None = None
-
-
-def _is_openai_model(model: str) -> bool:
-    return model.lower().startswith(_OPENAI_PREFIXES)
-
-
-def _get_openai_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        settings = get_settings()
-        if not settings.openai_api_key:
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set — the eval judge defaults to OpenAI. Set it "
-                "in .env, or pass an Anthropic --judge-model to use the Claude fallback."
-            )
-        _client = AsyncOpenAI(api_key=settings.openai_api_key)
-    return _client
 
 
 async def judge_structured[T: BaseModel](

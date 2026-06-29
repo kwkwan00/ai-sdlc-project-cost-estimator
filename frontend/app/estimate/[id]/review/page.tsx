@@ -8,7 +8,6 @@ import { use, useMemo, useState } from "react";
 import { AiSavingsSection } from "@/components/AiSavingsSection";
 import { AlgorithmBadge } from "@/components/AlgorithmBadge";
 import { EffortShareDonut, EFFORT_PALETTE } from "@/components/EffortShareDonut";
-import { LlmUsageModal } from "@/components/LlmUsageModal";
 import { BreakdownView } from "@/components/BreakdownView";
 import { ConfidenceMeter } from "@/components/ConfidenceMeter";
 import { DualScenarioToggle } from "@/components/DualScenarioToggle";
@@ -55,7 +54,6 @@ export default function ReviewPage({ params }: PageProps) {
   const router = useRouter();
   const [mode, setMode] = useState<"ai_assisted" | "manual_only">("ai_assisted");
   const [openPhase, setOpenPhase] = useState<number | null>(null);
-  const [showLlmUsage, setShowLlmUsage] = useState(false);
   const [showSow, setShowSow] = useState(false);
   const [duplicating, setDuplicating] = useState(false);
   const { data, isLoading, error } = useQuery({
@@ -563,29 +561,6 @@ export default function ReviewPage({ params }: PageProps) {
           >
             Export SOW
           </button>
-          {fe.llm_usage && fe.llm_usage.call_count > 0 && (
-            <button
-              type="button"
-              onClick={() => setShowLlmUsage(true)}
-              aria-label="Estimation LLM cost & usage"
-              title="Estimation LLM cost & usage"
-              className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-slate-300 text-slate-500 hover:bg-slate-50 hover:text-slate-700 focus:outline-none focus:ring-2 focus:ring-brand-400"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                className="h-5 w-5"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <circle cx="12" cy="12" r="9" />
-                <path d="M14.5 9.3a2.4 2.4 0 0 0-2.5-1.3c-1.5 0-2.5.8-2.5 1.9 0 1 .8 1.6 2.5 2 1.7.3 2.5 1 2.5 2.1 0 1.1-1 1.9-2.5 1.9a2.4 2.4 0 0 1-2.5-1.3" />
-                <path d="M12 6.3v1.7M12 16v1.7" />
-              </svg>
-            </button>
-          )}
           <DualScenarioToggle value={mode} onChange={setMode} />
         </div>
       </header>
@@ -615,6 +590,14 @@ export default function ReviewPage({ params }: PageProps) {
           {contingencyPct > 0 && (
             <p className="text-xs muted mt-1">incl. {contingencyPct}% contingency</p>
           )}
+          {isWbs &&
+            (fe.critical_path_weeks ?? 0) > 0 &&
+            (fe.critical_path_weeks ?? 0) >= fe.duration_weeks_low - 0.5 && (
+              <p className="text-xs text-amber-700 mt-1">
+                Critical path {Math.round(fe.critical_path_weeks ?? 0)} wk — sequencing-bound; more
+                people won&apos;t make it faster.
+              </p>
+            )}
         </div>
         <div className="card">
           <p className="text-xs muted">AI savings</p>
@@ -695,16 +678,6 @@ export default function ReviewPage({ params }: PageProps) {
         projectName={data.project_name}
         scenario={mode}
       />
-
-      {fe.llm_usage && fe.llm_usage.call_count > 0 && (
-        <LlmUsageModal
-          open={showLlmUsage}
-          onClose={() => setShowLlmUsage(false)}
-          usage={fe.llm_usage}
-          title="Estimation LLM cost & usage"
-          subtitle="What it cost to produce this estimate via the Anthropic API — separate from the project labor cost."
-        />
-      )}
 
       {phaseModal && (
         <Modal

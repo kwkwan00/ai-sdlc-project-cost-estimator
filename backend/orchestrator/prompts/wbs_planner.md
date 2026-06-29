@@ -12,14 +12,25 @@ Decompose the project into a two-level hierarchy:
     `qa_testing`.
   - `role_id` — the id of the team member who does it, chosen from the **roster** in the context
     (use the `role_id` values exactly as given; match the work to the most appropriate role).
-  - `optimistic`, `most_likely`, `pessimistic` — a three-point PERT effort estimate in **hours**
-    (optimistic ≤ most_likely ≤ pessimistic).
+  - `optimistic`, `most_likely`, `pessimistic` — a three-point PERT estimate in **hours**:
+    - `optimistic` = the best *realistic* case — requirements clear, nothing surprising, no rework
+      (about a 1-in-10 good outcome). NOT a fantasy zero-friction number: it still includes this
+      task's own design, tests, and review rework.
+    - `most_likely` = the single most probable actual effort for an experienced engineer (the mode).
+    - `pessimistic` = a plausible bad case — unclear spec, integration friction, debugging, several
+      rework cycles (about a 1-in-10 bad outcome). For genuinely uncertain, novel, integration-heavy,
+      or research work this is commonly **2–4× the optimistic**; for routine, well-understood work it
+      can be as little as **1.3–1.5×**. **Widen the spread when you are less sure** — a narrow band
+      asserts confidence you don't have.
+    - Always keep optimistic ≤ most_likely ≤ pessimistic.
 
 ## Keys and dependencies (sequencing)
 
-Give **every work package and every leaf task a short, unique `key`** (a slug like `auth-api`,
-`login-ui`, `pkg-auth`) — these are just handles for wiring up dependencies, so make them readable
-and distinct.
+Give **every work package and every leaf task a short `key` that is unique across the entire WBS**,
+not just within its package (a slug like `auth-api`, `login-ui`, `pkg-auth`) — these are handles for
+wiring up dependencies, so make them readable and distinct. **Prefix generic slugs with their
+package** so they can't collide — use `auth-tests`, `report-tests`, `auth-setup`, never a bare
+`tests` / `setup` / `api`. Reused slugs across packages get mis-wired when dependencies are resolved.
 
 Use `depends_on` to capture **what must finish before a node can start**, as a list of the **keys**
 of its prerequisites:
@@ -39,9 +50,8 @@ of its prerequisites:
   understanding the requirement, design, implementation, handling edge cases and error states,
   that task's own tests, addressing code-review feedback, integration, and debugging — **not** the
   ideal happy-path coding time.
-- Software work is almost always **under-estimated**. Lean realistic-to-conservative. `most_likely`
-  is what an experienced engineer would *actually* take; `pessimistic` reflects genuine risk
-  (commonly 1.5–2.5× the optimistic).
+- Software work is almost always **under-estimated**. Lean realistic-to-conservative: `most_likely`
+  is what an experienced engineer would *actually* take, sized per the three-point definitions above.
 - Rough calibration anchors for a competent team (scale up/down for complexity):
   - A non-trivial UI screen built end-to-end (layout + state + API wiring + tests): **~16–40 h**.
   - A third-party/external API integration (auth, data mapping, error handling, retries):
@@ -51,9 +61,12 @@ of its prerequisites:
     run **high** — size generously.
   - Discovery/analysis, project & environment setup, CI/CD, and QA each take real time — never
     trivialize them.
-- Keep each leaf at an estimable size (roughly **8–40 h** of `most_likely`). If a piece is larger,
-  split it into several leaves — but then include **all** of those leaves so the total still
-  reflects the real effort.
+  - Integration, novel, and compliance work are also the **most uncertain** — give them the widest
+    pessimistic-to-optimistic gaps, not just the highest magnitudes.
+- Keep each leaf at an estimable size (roughly **8–40 h** of `most_likely`). The larger anchors
+  above (e.g. 40–160 h for a backend subsystem) are **package-level totals to split into several
+  8–40 h leaves**, not single leaves. If a piece is larger, split it — but then include **all** of
+  those leaves so the total still reflects the real effort.
 - **Commonly under-counted work — include it explicitly** (these are where bottom-up estimates go
   wrong): requirements clarification & design iteration, project/repo/environment setup, auth &
   authorization, security hardening & threat review, data modeling & migrations, API/contract
@@ -74,9 +87,11 @@ these rough full-delivery ranges for a competent team building from the describe
 - Large, multi-integration, or **regulated/compliance-heavy** platform (HIPAA, PCI-DSS, SOC 2,
   FedRAMP): **~10,000–25,000+ h**
 
-If your total lands **below** the band that fits this project's true complexity, you have
-**under-decomposed or under-sized** — add the missing tasks and raise the low estimates until the
-total is realistic. Do not pad arbitrarily; reach the realistic total by capturing real work.
+If your total lands **below** the band that fits this project's true complexity, the usual cause is
+**missing work, not under-sized leaves** — a dropped integration, a whole phase left thin, no
+hardening / observability / data-migration / release tasks. Go back and **add the missing tasks**.
+Do not simply scale up the leaves you already have, and do not pad: size each leaf honestly on its
+own merits and let the decomposition reach a realistic total by capturing real work.
 
 ## Coverage
 
@@ -100,6 +115,12 @@ total is realistic. Do not pad arbitrarily; reach the realistic total by capturi
   system from its current state.
 - Assign roles sensibly: discovery/analysis → product; UX → ui_ux; build/review → engineering;
   deployment → devops; testing → qa (or the closest roster role available).
+- **Code review splits in two:** the **author's** rework time stays inside the development leaf; the
+  **reviewer's** time is a separate `code_review`-phase task (e.g. "Review auth-API PRs"). Count each
+  side once — never both for the same review.
+- **Do NOT add standalone "project management", "standups", or "team coordination" leaves** —
+  coordination overhead is applied automatically downstream. Capture only concrete planning /
+  discovery work as tasks.
 - **Stay technology-agnostic unless the user's description names the stack.** Don't invent
   specific vendor products or cloud services — e.g. ECS Fargate, RabbitMQ, Kafka, Auth0,
   Snowflake, Kubernetes — in task names or descriptions unless that exact technology is
@@ -112,8 +133,10 @@ total is realistic. Do not pad arbitrarily; reach the realistic total by capturi
 
 Return the work packages with their leaf tasks via the tool. Spend your output budget on the
 `packages` — that is the deliverable. **Decompose into real work packages, each grouping its leaf
-tasks — never a flat list of tasks with no packages.** Keep each leaf `description` very short or
-omit it, and keep `notes` to at most one short sentence (or leave it empty) — **do NOT state a total
-hour figure in `notes`** (any total is computed from your leaf hours downstream; a claimed total
-that doesn't match your leaves reads as an inconsistency). Always populate `packages`; never return
-an empty list.
+tasks — never a flat list of tasks with no packages.** **Omit `description` on leaf tasks entirely**
+unless the name is genuinely ambiguous — the task name should carry the meaning. Keep `notes` to at
+most one short sentence (or leave it empty) — **do NOT state a total hour figure in `notes`** (any
+total is computed from your leaf hours downstream; a claimed total that doesn't match your leaves
+reads as an inconsistency). **Finishing every package matters far more than describing any single
+task** — do not let descriptions crowd out tasks. Always populate `packages`; never return an empty
+list.

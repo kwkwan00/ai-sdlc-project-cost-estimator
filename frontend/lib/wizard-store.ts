@@ -60,6 +60,29 @@ export function clearSession(id: string) {
   window.localStorage.removeItem(KEY(id));
 }
 
+/** The current wizard-run UUID. Generated when a new wizard starts (Stage 1) and passed to every
+ *  pre-submission LLM call (prefill / roster / tooling) + the final create, so the backend can
+ *  associate those calls with the eventual estimate (Observability per-agent breakdown). */
+const WIZARD_SESSION_KEY = "sdlc-est:wizard-session";
+
+export function startWizardSession(): string {
+  const id =
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if (typeof window !== "undefined") window.localStorage.setItem(WIZARD_SESSION_KEY, id);
+  return id;
+}
+
+export function currentWizardSession(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  return window.localStorage.getItem(WIZARD_SESSION_KEY) ?? undefined;
+}
+
+export function clearWizardSession(): void {
+  if (typeof window !== "undefined") window.localStorage.removeItem(WIZARD_SESSION_KEY);
+}
+
 /** A pre-create draft (used between Stage 1 typing and the POST after Stage 3). */
 export const DRAFT_KEY = "sdlc-est:draft";
 

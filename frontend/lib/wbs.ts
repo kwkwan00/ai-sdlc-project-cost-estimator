@@ -5,7 +5,7 @@
  */
 
 import type { Stage2Input, Stage3Input } from "./schemas";
-import type { LlmUsage, Phase } from "./types";
+import type { LlmUsage, MissingTask, Phase } from "./types";
 
 export interface WbsTaskInput {
   id: string;
@@ -125,6 +125,32 @@ export function rollupRange(nodes: WbsTaskInput[]): ThreePoint {
   return acc;
 }
 
+/** Rescale every leaf's 3-point hours by its phase's factor from `byPhase` (default 1 — unchanged),
+ *  returning a NEW tree (structure, ids, deps, roles, names all preserved; only the magnitudes move).
+ *  Uniform scaling per leaf keeps the optimistic ≤ most_likely ≤ pessimistic ordering and the
+ *  within-phase task ratios — it stays a bottom-up rollup, just calibrated. Used by the editor's
+ *  "Apply calibration" action to anchor the tree toward the parametric estimate. Pure. */
+export function scaleLeafHoursByPhase(
+  tree: WbsTaskInput[],
+  byPhase: Record<string, number>,
+): WbsTaskInput[] {
+  const round1 = (n: number) => Math.round(Math.max(0, n) * 10) / 10;
+  const scale = (node: WbsTaskInput): WbsTaskInput => {
+    if (isLeaf(node)) {
+      const f = (node.phase && byPhase[node.phase]) || 1;
+      if (f === 1) return node;
+      return {
+        ...node,
+        optimistic: round1((node.optimistic ?? 0) * f),
+        most_likely: round1((node.most_likely ?? 0) * f),
+        pessimistic: round1((node.pessimistic ?? 0) * f),
+      };
+    }
+    return { ...node, children: node.children.map(scale) };
+  };
+  return tree.map(scale);
+}
+
 /** Sum of a subtree's leaf most-likely hours (the deterministic mid). */
 export function subtreeMostLikely(node: WbsTaskInput): number {
   if (isLeaf(node)) return node.most_likely ?? 0;
@@ -241,6 +267,34 @@ export function newLeaf(phase: Phase, roleId: string): WbsTaskInput {
 /** A new work package (branch) seeded with one blank task. */
 export function newPackage(phase: Phase, roleId: string): WbsTaskInput {
   return { id: newTaskId(), name: "New work package", children: [newLeaf(phase, roleId)] };
+}
+
+/** The package the completeness critic's accepted suggestions are grouped under. */
+export const ADDITIONS_PACKAGE_NAME = "Recommended additions";
+
+/** Insert a completeness-critic suggestion as a new leaf — its title/phase/3-point hours — grouped
+ *  under a single "Recommended additions" work package (created on first add). Returns a new tree;
+ *  pure except for the fresh ids. */
+export function addMissingTask(
+  tree: WbsTaskInput[],
+  missing: MissingTask,
+  roleId: string,
+): WbsTaskInput[] {
+  const leaf: WbsTaskInput = {
+    id: newTaskId(),
+    name: missing.title,
+    phase: missing.phase,
+    role_id: roleId,
+    optimistic: missing.optimistic,
+    most_likely: missing.most_likely,
+    pessimistic: missing.pessimistic,
+    children: [],
+  };
+  const idx = tree.findIndex((n) => !isLeaf(n) && n.name === ADDITIONS_PACKAGE_NAME);
+  if (idx >= 0) {
+    return tree.map((n, i) => (i === idx ? { ...n, children: [...n.children, leaf] } : n));
+  }
+  return [...tree, { id: newTaskId(), name: ADDITIONS_PACKAGE_NAME, children: [leaf] }];
 }
 
 // --- immutable tree edits (shared by the treemap editor; pure + tested) --------------------

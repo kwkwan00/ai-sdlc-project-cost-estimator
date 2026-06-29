@@ -9,7 +9,7 @@ import { useMemo, useState } from "react";
 import { Modal } from "@/components/Modal";
 import { type CustomRoleInput } from "@/lib/schemas";
 import { designateTeamMembers, type TeamMember } from "@/lib/team-roster";
-import { PHASE_LABELS, type Phase } from "@/lib/types";
+import { PHASE_LABELS, type Phase, type WbsLeafHoursSuggestion } from "@/lib/types";
 import {
   addChild,
   branchIds,
@@ -36,6 +36,9 @@ interface Props {
   tree: WbsTaskInput[];
   roster: CustomRoleInput[];
   onChange: (next: WbsTaskInput[]) => void;
+  // #5c: per-leaf "Suggest hours". Resolves to the suggestion (or null on failure/unavailable). When
+  // omitted, the affordance is hidden. The page owns it (it has the project brief + session).
+  onSuggestHours?: (leafId: string) => Promise<WbsLeafHoursSuggestion | null>;
 }
 
 interface LeafFieldsProps {
@@ -44,6 +47,7 @@ interface LeafFieldsProps {
   defaultRole: string;
   dependsOnOptions: { id: string; name: string }[];
   patch: (id: string, p: Partial<WbsTaskInput>) => void;
+  onSuggestHours?: (leafId: string) => Promise<WbsLeafHoursSuggestion | null>;
 }
 
 type HourField = "optimistic" | "most_likely" | "pessimistic";
@@ -112,11 +116,46 @@ function DependsOnField({
 }
 
 /** Edit-modal body for a leaf task: phase, assignee, 3-point hours, PERT readout, description. */
-function LeafFields({ leaf, members, defaultRole, dependsOnOptions, patch }: LeafFieldsProps) {
+function LeafFields({
+  leaf,
+  members,
+  defaultRole,
+  dependsOnOptions,
+  patch,
+  onSuggestHours,
+}: LeafFieldsProps) {
   // Keep a transient string draft for the ONE hour field currently being edited so the user can
   // clear it / type a partial value ("", "12.") without the controlled value snapping back to a
   // number mid-typing. The committed tree value is always the clamped non-negative number.
   const [draft, setDraft] = useState<{ field: HourField; value: string } | null>(null);
+  // #5c per-leaf "Suggest hours" — an explicit, billable LLM call (debounced by the button), not
+  // per-keystroke. On success it fills the three fields + shows the model's one-line rationale.
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestNote, setSuggestNote] = useState<string | null>(null);
+  const [suggestError, setSuggestError] = useState<string | null>(null);
+  const requestSuggestion = async () => {
+    if (!onSuggestHours) return;
+    setSuggesting(true);
+    setSuggestNote(null);
+    setSuggestError(null);
+    try {
+      const s = await onSuggestHours(leaf.id);
+      if (s && s.available) {
+        patch(leaf.id, {
+          optimistic: s.optimistic,
+          most_likely: s.most_likely,
+          pessimistic: s.pessimistic,
+        });
+        setSuggestNote(s.rationale || "Updated the 3-point estimate.");
+      } else {
+        setSuggestError("No suggestion available — set ANTHROPIC_API_KEY to enable it.");
+      }
+    } catch (e) {
+      setSuggestError((e as Error).message);
+    } finally {
+      setSuggesting(false);
+    }
+  };
   return (
     <>
       <div className="grid grid-cols-2 gap-2">
@@ -191,6 +230,21 @@ function LeafFields({ leaf, members, defaultRole, dependsOnOptions, patch }: Lea
           );
         })}
       </div>
+      {onSuggestHours && (
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="btn-secondary px-2 py-1 text-xs"
+            disabled={suggesting}
+            onClick={requestSuggestion}
+          >
+            {suggesting ? "Suggesting…" : "✨ Suggest hours"}
+          </button>
+          {suggestNote && <span className="text-xs muted">{suggestNote}</span>}
+          {suggestError && <span className="text-xs text-red-600">{suggestError}</span>}
+        </div>
+      )}
+
       <p className="text-xs muted">
         PERT mean ≈{" "}
         <span className="font-semibold text-slate-700">
@@ -299,7 +353,7 @@ function BranchFields({
 
 /** Edit WBS via a MUI X Tree View. Each row has an edit (pencil) icon that opens a modal to edit
  *  the node (name / phase / role / 3-point hours), add a child task, move it, or delete it. */
-export function WbsTreeViewEditor({ tree, roster, onChange }: Props) {
+export function WbsTreeViewEditor({ tree, roster, onChange, onSuggestHours }: Props) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string[]>(() => branchIds(tree));
 
@@ -439,6 +493,7 @@ export function WbsTreeViewEditor({ tree, roster, onChange }: Props) {
                 defaultRole={defaultRole}
                 dependsOnOptions={dependsOnOptions}
                 patch={patch}
+                onSuggestHours={onSuggestHours}
               />
             ) : (
               <BranchFields

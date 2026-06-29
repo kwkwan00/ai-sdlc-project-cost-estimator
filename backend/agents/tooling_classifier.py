@@ -77,6 +77,9 @@ class ClassifyToolingRequest(BaseModel):
         max_length=2000,
         description="Freeform description of the team's AI development tooling.",
     )
+    # The wizard-run UUID, so this pre-submission call's cost can be associated with the eventual
+    # estimate (Observability). Optional.
+    session_id: str | None = Field(default=None, max_length=36)
 
 
 class ToolingClassification(BaseModel):

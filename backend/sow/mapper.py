@@ -20,22 +20,16 @@ from collections.abc import Callable
 
 from models.project_schema import EstimateEnvelope
 from models.twin_outputs import (
+    PHASE_LABELS,
     DualScenarioEstimate,
-    Phase,
     RoleHeadcount,
 )
 
 from .models import Scenario, SowTable
 
-# Human-readable phase labels for the schedule / level-of-effort table.
-PHASE_LABELS: dict[str, str] = {
-    Phase.DISCOVERY.value: "Discovery & Analysis",
-    Phase.UX_DESIGN.value: "UX & Design",
-    Phase.DEVELOPMENT.value: "Development",
-    Phase.CODE_REVIEW.value: "Code Review",
-    Phase.DEPLOYMENT.value: "Deployment & DevOps",
-    Phase.QA_TESTING.value: "QA & Testing",
-}
+# Re-exported from models.twin_outputs (the canonical source) so existing `from .mapper import
+# PHASE_LABELS` call sites keep working without coupling to a second copy.
+__all__ = ["PHASE_LABELS"]
 
 
 def _final(envelope: EstimateEnvelope) -> DualScenarioEstimate:

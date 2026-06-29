@@ -56,6 +56,34 @@ def _draws_from_env(default: int = 2000) -> int:
 
 DEFAULT_DRAWS = _draws_from_env()
 
+
+# Systemic ("common-factor") uncertainty shared across WBS leaves. Summing leaves as INDEPENDENT
+# makes the combined band collapse ~1/√N as the tree grows — backwards for real projects, where a
+# hard team/domain makes MANY tasks overrun together. Each draw multiplies the leaf sum by ONE shared
+# lognormal factor exp(N(0, σ)): median 1 (so the deterministic mode / most_likely is untouched) and
+# right-skewed (overruns heavier than equivalent underruns, matching the reduction sampler's
+# deliberate pessimism). σ acts as a CoV floor on the combined band regardless of leaf count.
+# Env-overridable; σ=0 recovers the exact independent-sum behavior.
+def _leaf_corr_sigma_from_env(default: float = 0.15) -> float:
+    """Parse MC_LEAF_CORR_SIGMA, degrading to the default on a malformed/negative value.
+
+    Evaluated at import time, so a bad env value must NOT raise (it would crash the orchestrator
+    module import); it harmlessly falls back instead.
+    """
+    raw = os.getenv("MC_LEAF_CORR_SIGMA")
+    if raw is None:
+        return default
+    try:
+        s = float(raw)
+    except ValueError:
+        return default
+    # Require a finite, non-negative value: `inf`/`1e400` pass `>= 0` but blow every draw up to
+    # inf → NaN hours/costs across the whole WBS estimate; `nan` already fails `>= 0`.
+    return s if (math.isfinite(s) and s >= 0) else default
+
+
+DEFAULT_LEAF_CORR_SIGMA = _leaf_corr_sigma_from_env()
+
 _EPS = 1e-9
 # Percentiles reported for the fan chart (HourRange.percentiles).
 _PCTS: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
@@ -169,7 +197,7 @@ def propagate_phase(
     reduction_sampler: ReductionSampler,
     risk_specs: Sequence[tuple[float, float, float]],
     eff_point: float,
-    n_draws: int = DEFAULT_DRAWS,
+    n_draws: int | None = None,
     rng: random.Random,
 ) -> tuple[MCResult, MCResult]:
     """Run the Monte Carlo for one phase and return ``(manual_result, ai_result)``.
@@ -179,7 +207,11 @@ def propagate_phase(
     ``compute_fn``. ``reduction_sampler`` yields a realized reduction per draw;
     ``risk_specs`` are ``(probability, low, high)`` tuples. The ``.point`` anchors
     are the deterministic mids (``compute_fn(point_inputs)`` and that × (1−eff_point)).
+
+    ``n_draws`` defaults to ``MC_DRAWS`` resolved at CALL time (not import) so a test/env override
+    actually takes effect even after this module is imported.
     """
+    n_draws = n_draws if n_draws is not None else _draws_from_env()
     base_point = compute_fn(point_inputs)[0]
     manual_draws: list[float] = []
     ai_draws: list[float] = []
@@ -204,20 +236,27 @@ def combine_pert_leaves(
     reduction_sampler: ReductionSampler,
     eff_point: float,
     rng: random.Random,
-    n_draws: int = DEFAULT_DRAWS,
+    n_draws: int | None = None,
+    leaf_corr_sigma: float | None = None,
 ) -> tuple[MCResult, MCResult]:
     """Bottom-up sibling of ``propagate_phase`` for the WBS flow.
 
     Each ``leaves`` entry is a leaf's ``(low, mode, high)`` PERT band. Every draw sums one
-    Beta-PERT sample per leaf (the leaves are treated as INDEPENDENT — their variances add
-    in quadrature, narrower than a comonotonic sum) to get that draw's manual hours, then
-    applies a per-draw AI reduction ``ai_i = manual_i · (1 − r)``. The deterministic anchors
-    are the comonotonic sums of the leaf modes: ``point = Σ mode`` for manual and
-    ``point · (1 − eff_point)`` for AI — so ``most_likely`` is exactly Σ leaf modes and the
-    ``ai.most_likely == manual.most_likely · (1 − eff_point)`` identity holds. Returns
-    ``(manual_result, ai_result)`` via ``_summarize`` so ``result_to_hour_range`` consumes
-    them unchanged. Pure stdlib; no risk events at the leaf level (the three-point band already
-    carries the leaf's uncertainty)."""
+    Beta-PERT sample per leaf, then multiplies that sum by ONE shared lognormal ``factor =
+    exp(N(0, leaf_corr_sigma))`` before applying a per-draw AI reduction ``ai_i = manual_i ·
+    (1 − r)``. The shared factor is a **systemic ("common-factor") correlation**: the leaves are no
+    longer purely independent (which collapses the band ~1/√N as the tree grows) — a single project
+    can run hard or easy across ALL its tasks at once. The factor's median is 1, so it widens the band
+    without moving the deterministic anchors: ``point = Σ mode`` for manual and ``point · (1 −
+    eff_point)`` for AI — ``most_likely`` is exactly Σ leaf modes and the ``ai.most_likely ==
+    manual.most_likely · (1 − eff_point)`` identity holds. ``leaf_corr_sigma=0`` recovers the exact
+    independent-sum behavior. Returns ``(manual_result, ai_result)`` via ``_summarize`` so
+    ``result_to_hour_range`` consumes them unchanged. Pure stdlib; no risk events at the leaf level
+    (the three-point band already carries the leaf's uncertainty). ``n_draws`` (``MC_DRAWS``) and
+    ``leaf_corr_sigma`` (``MC_LEAF_CORR_SIGMA``) both default to their env values resolved at CALL time
+    (not import) so a test/env override takes effect after import."""
+    n_draws = n_draws if n_draws is not None else _draws_from_env()
+    leaf_corr_sigma = leaf_corr_sigma if leaf_corr_sigma is not None else _leaf_corr_sigma_from_env()
     point = sum(mode for (_lo, mode, _hi) in leaves)
     if not leaves:
         zero = _summarize([0.0], point=0.0)
@@ -225,7 +264,9 @@ def combine_pert_leaves(
     manual_draws: list[float] = []
     ai_draws: list[float] = []
     for _ in range(n_draws):
-        base = sum(sample_pert(lo, mode, hi, rng) for (lo, mode, hi) in leaves)
+        # One shared factor per draw, applied to every leaf → positive cross-leaf correlation.
+        factor = math.exp(rng.gauss(0.0, leaf_corr_sigma)) if leaf_corr_sigma > 0 else 1.0
+        base = factor * sum(sample_pert(lo, mode, hi, rng) for (lo, mode, hi) in leaves)
         r = reduction_sampler(rng)
         manual_draws.append(base)
         ai_draws.append(base * (1.0 - r))

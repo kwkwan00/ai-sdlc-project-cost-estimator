@@ -59,7 +59,7 @@ Given a free-text project description (Stage 1) and optional context / maturity 
 2. **Interrupt** — the orchestrator dedupes overlapping gaps into 5–10 clarifying questions and pauses the graph (Stage 4).
 3. **Pass 2** — once the user answers (or skips with defaults), all six twins re-run with the new context.
 4. **Synthesize** — aggregates per-phase outputs into a `DualScenarioEstimate`: total hours, $ cost, duration band, weekly burn, headcount by role, **AI hours/cost saved** (manual − AI), and the **LLM usage/cost** of producing the estimate (per-model token + dollar breakdown).
-5. **Review** (Stage 5) — frontend renders per-phase bars, a toggle between AI-assisted and manual-only views, a role-attributed cost table, graphical algorithm breakdowns, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" readout + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout), an AI-assistance-savings section, and an LLM cost/usage modal.
+5. **Review** (Stage 5) — frontend renders per-phase bars, a toggle between AI-assisted and manual-only views, a role-attributed cost table, graphical algorithm breakdowns, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" readout + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout), and an AI-assistance-savings section. (The Anthropic token cost of *producing* estimates now lives on a top-level **Observability** page next to Settings — see [HTTP API](#http-api) — not on the estimate itself.)
 
 Before submission, two pre-submission agents help fill the wizard: a **prefill** agent normalizes the Stage 1 free text into a Stage 2 context, and a **roster** agent proposes the team roster. On Stage 3 submit, a **tooling classifier** turns the user's freeform AI-tooling description into per-phase tooling levels (researching unfamiliar tools via a self-hosted docs-mcp-server). Stage 3 also lets you **scope the estimate to a subset of the six phases**. Past estimates are listed on the landing page and can be redisplayed — and any completed estimate can be **exported as an editable Statement of Work** (`.docx`) from its review page (see [Statement of Work export](#statement-of-work-export)).
 
@@ -199,10 +199,12 @@ The **WBS (Work Breakdown Structure)** flow is the bottom-up complement to the p
 
 **Draft → edit → deterministic re-roll.** The numbers the user sees are always a deterministic rollup of the *current* tree; the LLM only seeds the starting draft.
 
-1. **LLM planner** (`backend/agents/wbs_agent.py`, pinned to `ANTHROPIC_MODEL_WBS`, default Sonnet) drafts a two-level WBS (work packages → leaf tasks) from the project description via forced tool-use, assigning each leaf a phase, a roster `role_id`, and 3-point hours. It degrades to a deterministic full-lifecycle skeleton when the LLM is unavailable, so the editor always opens with something editable. Prompt: `orchestrator/prompts/wbs_planner.md`.
+1. **LLM planner** (`backend/agents/wbs_agent.py`, `WBS_MODEL` + `WBS_REASONING_EFFORT` — default **Claude Opus 4.8 / `max`** effort, a whole-project brainstorm) drafts a two-level WBS (work packages → leaf tasks) from the project description via forced tool-use, assigning each leaf a phase, a roster `role_id`, and 3-point hours. It degrades to a deterministic full-lifecycle skeleton when the LLM is unavailable, so the editor always opens with something editable. Prompt: `orchestrator/prompts/wbs_planner.md`. The draft is **streamed to the editor over AG-UI** (`POST /wbs/draft/agui`): `stream_structured(...)` streams the planner's tool-input JSON, a small parser extracts each work-package + task name as it lands, and the endpoint narrates friendly status messages ("Planning work package 2: Authentication…", "Adding task to Authentication: Build login API…", reviewing → finalizing) as `wbs_progress` custom events — so the user watches the system work in real time. A transient streaming hiccup falls back to the non-streaming draft (which has a corrective retry), never the generic skeleton. (If `WBS_MODEL` is switched to an **OpenAI** id the draft uses the non-streaming path directly — OpenAI streams content only after its hidden reasoning phase, so the narration would burst at the end — identical tree, opening/closing milestone messages only.) The planner's own LLM token cost is captured and carried through commit onto the estimate, where it rolls up into the top-level **Observability** page (it's no longer shown per-draft). On no API key it falls back to the skeleton with only the milestone messages.
 2. **Complexity-aware realism factor** — bottom-up task estimates are systematically optimistic, so `_complexity_effort_factor(...)` scales the drafted leaf hours by a factor derived from the project's hidden complexity (regulatory regimes, integrations, surface area, project type, brownfield codebase — inferred from the parsed description, since the WBS wizard collects only roster + codebase). Clamped to `[1.2, 3.0]` and globally tunable via `WBS_EFFORT_SCALE`.
-3. **User edits the tree** in an interactive MUI X Tree View editor (`frontend/components/WbsTreeViewEditor.tsx`) — add/remove/move tasks, set each leaf's phase, role, and 3-point hours via edit-modal. Debounced autosave persists to the server draft.
-4. **Deterministic rollup** (`backend/orchestrator/wbs/rollup.py`) groups leaves by `Phase`, builds one `PhaseEstimate` per phase via `montecarlo.combine_pert_leaves` (the bottom-up sibling of `propagate_phase` — sums independent leaf Beta-PERT draws + the **same** skewed AI-reduction sampler the twins use), attributes role hours from the leaves' **explicit** assignments, then feeds those phase estimates straight into the twins' typed tail seams `compute_total_costs(...)` + `synthesize_from_phase_estimates(...)` — so cost, Brooks staffing, headcount, durations, and the variance-combined project band are all computed by the **exact same code** as the twin flow. The load-bearing invariants hold (`most_likely` = Σ leaf modes; `ai.most_likely == manual.most_likely × (1 − eff)`; Σ role-hours == `most_likely`).
+3. **User edits the tree** in an interactive MUI X Tree View editor (`frontend/components/WbsTreeViewEditor.tsx`) — add/remove/move tasks, set each leaf's phase, role, and 3-point hours via edit-modal. Debounced autosave persists to the server draft. Three LLM-assisted editor actions help close the bottom-up estimate's blind spots: **Reconcile** (`POST /estimates/wbs/reconcile`) triangulates the rollup against a parametric/twin estimate of the same brief to flag omitted or double-counted phases — with an **Apply calibration** action that rescales the diverging phases' task hours toward the parametric (per-phase, clamped — magnitudes only, the breakdown is preserved); **Check completeness** (`POST /estimates/wbs/completeness`) lists project-specific tasks the WBS likely *omitted within a phase*, each addable in one click; and a per-leaf **✨ Suggest hours** (`POST /estimates/wbs/suggest-hours`) re-estimates one leaf's 3-point hours from the brief + its siblings.
+4. **Deterministic rollup** (`backend/orchestrator/wbs/rollup.py`) groups leaves by `Phase`, builds one `PhaseEstimate` per phase via `montecarlo.combine_pert_leaves` (the bottom-up sibling of `propagate_phase` — sums the leaf Beta-PERT draws, each scaled by **one shared lognormal common-factor** so the leaves are *correlated*, flooring the band's CoV instead of letting it collapse ~1/√N as the tree grows, + the **same** skewed AI-reduction sampler the twins use), attributes role hours from the leaves' **explicit** assignments, then feeds those phase estimates straight into the twins' typed tail seams `compute_total_costs(...)` + `synthesize_from_phase_estimates(...)` — so cost, Brooks staffing, headcount, durations, and the variance-combined project band are all computed by the **exact same code** as the twin flow. The load-bearing invariants hold (`most_likely` = Σ leaf modes; `ai.most_likely == manual.most_likely × (1 − eff)`; Σ role-hours == `most_likely`).
+
+   The rollup also computes a **critical-path duration floor** (`orchestrator/wbs/critical_path.py`): the staffing model derives duration from effort ÷ team throughput and is **sequencing-blind**, so the longest dependency chain through the leaf graph (pure sequencing, AI-assisted hours, mirroring the frontend Gantt's `depends_on` semantics) is passed as `duration_floor_weeks` and the timeline is set to `max(staffing, critical-path)`. A long serial chain and a fully-parallel tree with the same hours no longer get the same duration; when the floor binds, the review page flags the timeline as **sequencing-bound** (`DualScenarioEstimate.critical_path_weeks`).
 
 **WBS-specific contingency.** Because bottom-up estimates run optimistic even after the realism factor, the WBS flow carries its **own** explicit contingency reserve — an editable input on the editor defaulting to **30%** (`WBS_DEFAULT_CONTINGENCY_PCT`) — that uplifts final cost + timeline. It is **independent** of the global `app_settings` contingency the Quick Estimate uses (that one is unchanged).
 
@@ -237,8 +239,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 - MCP SDK (`mcp>=1.12`) — client for the docs-mcp-server tool research
 - Neo4j driver (`neo4j>=5.25`) for graph-snapshot persistence
 - SQLAlchemy 2.0 async + asyncpg + Alembic for Postgres history + calibration
-- Qdrant client (`qdrant-client>=1.12`) — scaffolded, not populated in MVP
-- Langfuse SDK (`langfuse>=2.50`) — optional; transparent no-op when env keys are absent
+- Qdrant client (`qdrant-client>=1.12`) — vector-similarity calibration store (completed estimates embedded via OpenAI for reference-class lookups; additive to Neo4j/Postgres)
 - SSE via `sse-starlette`
 - `python-docx` + `pyyaml` — server-side `.docx` Statement-of-Work rendering from a YAML template spec
 
@@ -253,9 +254,8 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 
 **Infra**
 
-- Docker Compose: Neo4j 5.20-community + Postgres + Qdrant + a `docs-mcp-server` (host port `6280`, backs the tooling classifier) + (optional) the dockerized backend & frontend
-- The self-hosted Langfuse stack (Langfuse web + worker, ClickHouse, Redis, MinIO) is **gated behind the `langfuse` compose profile** (`profiles: ["langfuse"]`) — a plain `docker compose up` excludes it. Enable with `COMPOSE_PROFILES=langfuse` in `.env`.
-- Bind-mount under `./data/{neo4j,postgres,clickhouse,redis,minio}/` (sidesteps the Docker VM disk limit)
+- Docker Compose: Neo4j 5.20-community + Postgres + Qdrant + a `docs-mcp-server` (host port `6280`, backs the tooling classifier) + the dockerized backend & frontend
+- Bind-mount under `./data/{neo4j,postgres}/` (sidesteps the Docker VM disk limit)
 
 ---
 
@@ -264,7 +264,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 ```
 .
 ├── ai-sdlc-project-cost-estimator-planning-outline.md   # canonical design spec
-├── docker-compose.yml         # neo4j + postgres + qdrant + (optional) estimator-backend / estimator-frontend
+├── docker-compose.yml         # neo4j + postgres + qdrant + docs-mcp-server + estimator-backend + estimator-frontend
 ├── Makefile                   # up / down / install-be / install-fe / be / fe / smoke / clean
 ├── .env.example               # required + optional env vars
 ├── data/neo4j/                # bind-mounted neo4j data + logs
@@ -277,6 +277,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 │   ├── config.py              # pydantic-settings, reads ../.env or .env
 │   ├── routers/               # HTTP surface, mounted by main.py:
 │   │   ├── estimates.py       #   POST /estimates (+history, +{id}, +stream, +answers, +delete), /health
+│   │   ├── observability.py   #   GET /observability/llm-usage — aggregate LLM cost across estimates
 │   │   ├── drafts.py          #   /estimates/draft/{prefill, classify-tooling, roster/agui}
 │   │   ├── admin.py           #   /admin/* (reduction-bands, staffing-coefficients, default-rates,
 │   │   │                      #     {discovery,development,qa}-sizing-method, contingency)
@@ -306,6 +307,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 │   │   ├── montecarlo.py      # Monte Carlo uncertainty propagation (pure stdlib Beta-PERT)
 │   │   ├── staffing.py        # team-scaling model: Brooks coordination + diminishing returns (pure stdlib)
 │   │   ├── wbs/rollup.py      # bottom-up WBS rollup → DualScenarioEstimate (reuses the twin tail seams)
+│   │   ├── wbs/critical_path.py # longest dependency chain → duration floor (max(staffing, sequencing))
 │   │   ├── usage.py           # per-run Anthropic token-usage capture + cost estimation
 │   │   ├── role_attribution.py# shared role-split with phase-specific overrides
 │   │   ├── smoke.py           # CLI: `uv run python -m orchestrator.smoke [--no-llm]`
@@ -348,12 +350,11 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
 │   ├── alembic/               # async migrations (env.py reads settings.resolved_postgres_dsn)
 │   │   ├── env.py
 │   │   ├── script.py.mako
-│   │   └── versions/          # 0001 history+calibration … 0013 (reduction bands, envelope_json, band retunes,
-│   │                          #   staffing_coefficients, default rate card, app_settings, custom_rate_roles)
+│   │   └── versions/          # 0001 history+calibration … 0015 (reduction bands, envelope_json, band retunes,
+│   │                          #   staffing_coefficients, default rate card, app_settings, custom_rate_roles, llm_call)
 │   ├── alembic.ini
 │   │
 │   ├── observability/
-│   │   ├── langfuse_wrapper.py# @traced(...) decorator — no-op when env keys absent, async-preserving
 │   │   ├── correlation.py     # per-request correlation-id contextvar (threaded into logs)
 │   │   ├── logging_config.py  # configure_logging() — root log level + format
 │   │   └── request_logging.py # ASGI middleware: method / path / status / latency per request
@@ -364,6 +365,7 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
     ├── app/
     │   ├── layout.tsx / page.tsx / providers.tsx   # landing page lists + redisplays past estimates
     │   ├── settings/page.tsx  # tabbed admin: sizing methods + AI-reduction bands + team-scaling + rates/contingency
+    │   ├── observability/page.tsx # top-level LLM cost/usage view (icon next to Settings in the header)
     │   ├── globals.css        # html { font-size: 14px } — global UI scale
     │   ├── wbs/{,new,team,edit/[draftId]}/  # WBS bottom-up flow: landing+resume, describe, team, tree editor
     │   └── estimate/
@@ -376,12 +378,14 @@ The flow separates generation (one LLM call) from rendering (pure) so the user e
     │                          #   Tabs (review-page panels), GanttChart + PertChart (Timeline),
     │                          #   WbsTreeViewEditor (MUI X Tree View) + WbsTreePanel (read-only review),
     │                          #   SowExportModal (editable SOW preview → .docx download),
-    │                          #   DocumentUpload (Stage 1 file upload), RosterRationaleModal, FieldHint
+    │                          #   DocumentUpload (Stage 1 file upload), RosterRationaleModal, FieldHint,
+    │                          #   ProgressBar (WBS draft status line) + LlmUsagePanel (LLM cost/usage, Observability page)
     ├── lib/                   # schemas (Zod), api-client (fetch + SSE), wizard-store, types, format,
     │                          #   algorithms, breakdown, fan-chart (MC math), staffing (team-scaling),
     │                          #   schedule (Gantt/PERT/critical-path + MC finish-risk), document-extract (PDF/Word/text),
     │                          #   wbs (client PERT rollup + tree helpers) + wbs-store (localStorage cache),
-    │                          #   sow (docx filename + placeholder helpers), review-ui, estimate-status, roster-agui
+    │                          #   sow (docx filename + placeholder helpers), review-ui, estimate-status,
+    │                          #   roster-agui + wbs-agui (AG-UI streaming clients), progress (trickle-bar math)
     ├── instrumentation.ts     # Next.js startup hook — logs `✓ Frontend ready ...`
     ├── next.config.mjs        # output: "standalone"
     ├── vitest.config.ts       # globs: lib/**, components/**, instrumentation.test.ts
@@ -435,23 +439,7 @@ docker compose logs estimator-backend  | grep "Backend ready"
 docker compose logs estimator-frontend | grep "Frontend ready"
 ```
 
-**Langfuse is optional and off by default.** The self-hosted Langfuse stack is gated behind the `langfuse` compose profile, so a plain `docker compose up` skips it. To run it:
-
-```bash
-# 1. Enable the profile and rotate the Langfuse secrets in .env before anything non-throwaway:
-#      COMPOSE_PROFILES=langfuse
-#      openssl rand -hex 32      # -> LANGFUSE_ENCRYPTION_KEY
-#      openssl rand -base64 32   # -> LANGFUSE_NEXTAUTH_SECRET / LANGFUSE_SALT
-# 2. Bring up the full stack (profile is read from .env's COMPOSE_PROFILES):
-docker compose up -d --build
-# 3. First-run Langfuse setup (only needed once):
-#      a. open http://localhost:3100 → sign up → create org → create project
-#      b. project settings → API keys → "Create new API key"
-#      c. paste pk-lf-... / sk-lf-... into .env's LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY
-#      d. docker compose restart estimator-backend
-# (Alternative: set the LANGFUSE_INIT_* env vars in .env to seed an org/user on first
-# boot — see .env.example for the full list.)
-```
+The core stack — Neo4j, Postgres, Qdrant, the docs-mcp-server, and the two estimator apps — comes up with a plain `docker compose up`; there are no optional profiles.
 
 Notes:
 
@@ -477,18 +465,18 @@ All settings are read by `backend/config.py` (pydantic-settings) from `.env`. Th
 | `ANTHROPIC_MODEL_ROSTER` | no | `claude-sonnet-4-6` | Team-roster proposal agent (knowledge-heavy → Sonnet). |
 | `ANTHROPIC_MODEL_MERGE` | no | `claude-haiku-4-5` | Clarifying-question consolidation in `merge_pass1` (cheap → Haiku; deterministic fallback). |
 | `ANTHROPIC_MODEL_TOOLING` | no | `claude-sonnet-4-6` | AI-tooling classifier (broad tool knowledge → Sonnet). |
-| `ANTHROPIC_MODEL_WBS` | no | `claude-sonnet-4-6` | WBS planner agent that drafts the bottom-up task tree (knowledge-heavy decomposition → Sonnet). |
+| `WBS_MODEL` | no | `claude-opus-4-8` | The WBS **planner** (drafts the task tree) + **completeness critic** + per-leaf **suggest-hours** estimator. A deep-reasoning decomposition task → Claude Opus 4.8 by default; routed by `call_structured`/`stream_structured`'s provider-aware path (set a `gpt-*` value to use OpenAI instead). Degrades to the deterministic skeleton / empty findings without the relevant API key. |
+| `WBS_REASONING_EFFORT` | no | `max` | Reasoning effort sent with `WBS_MODEL` — `output_config.effort` (`low`/`medium`/`high`/`xhigh`*/`max`; *`xhigh` model-dependent, `max` universally supported) on Anthropic, `reasoning_effort` (adds `minimal`/`xhigh`) on OpenAI. Defaults to `max` (a 50–150-leaf decomposition is a whole-project brainstorm); drop to `high`/`medium` to trade depth for latency/cost. |
 | `ANTHROPIC_MODEL_SOW` | no | `claude-sonnet-4-6` | SOW generator agent (project-specific prose + client-fact extraction → Sonnet). |
 | `SOW_COMPANY_NAME` | no | `""` | Deploy-time override of the delivering firm's name in exported SOWs. Empty ⇒ use the template's `branding.company`. Keeps a specific firm out of the repo. |
 | `WBS_EFFORT_SCALE` | no | `1.0` | Global multiplier on the WBS bottom-up realism factor (`_complexity_effort_factor`). Raise to push every WBS estimate up, lower to trust the LLM's hours more. |
-| `OPENAI_API_KEY` | no | `""` | Authenticates the eval harness LLM-as-judge (`make evals`). Not used by the production estimator. Also satisfies the docs-mcp-server embeddings provider when scraping. |
+| `OPENAI_API_KEY` | no | `""` | Authenticates OpenAI: the eval harness LLM-as-judge (`make evals`), the docs-mcp-server embeddings provider when scraping, and the WBS planner/completeness **only if** `WBS_MODEL` is set to a `gpt-*` id (the default is Anthropic Opus). |
 | `OPENAI_MODEL_EVAL` | no | `gpt-5.5` | Default judge model for the eval harness's LLM rubrics. Override per run with `--judge-model` (an Anthropic id routes to the `call_structured` fallback). |
 | `DOCS_MCP_URL` | no | `http://localhost:6280/mcp` | Self-hosted docs-mcp-server the tooling classifier consults (MCP over streamable HTTP). Blank disables lookups (unknown tools → `none`). Compose overrides this to the in-network hostname. |
 | `DOCS_MCP_AUTH_TOKEN` | no | `""` | Optional bearer token for docs-mcp-server. |
 | `DOCS_MCP_RESEARCH_TIMEOUT_S` | no | `25.0` | Hard ceiling on the docs-mcp search lookup (it runs in the Stage 3 submit path). On timeout, unknown tools → `none`. |
 | `DOCS_MCP_AUTO_SCRAPE` | no | `true` | When set, an unindexed tool is scraped (docs crawled + embedded) before continuing, not just searched. Requires an embeddings provider (`OPENAI_API_KEY`) on docs-mcp-server. |
 | `DOCS_MCP_SCRAPE_TIMEOUT_S` | no | `240.0` | Larger ceiling for the scrape path. On timeout/failure tools → `none`. |
-| `COMPOSE_PROFILES` | no | `""` | Docker Compose profile selector. Set to `langfuse` to bring up the self-hosted Langfuse stack (off by default). |
 | `NEO4J_URI` | no | `bolt://localhost:7687` | Bolt URI. |
 | `NEO4J_USER` | no | `neo4j` | |
 | `NEO4J_PASSWORD` | no (recommended) | `""` | When empty, persistence is silently disabled — the backend still runs. |
@@ -499,21 +487,12 @@ All settings are read by `backend/config.py` (pydantic-settings) from `.env`. Th
 | `POSTGRES_DSN` | no | `""` | Full async DSN (e.g. `postgresql+asyncpg://user:pass@host:5432/db`). Overrides the discrete vars. |
 | `POSTGRES_MIGRATE_ON_START` | no | `true` | Run Alembic upgrade in the FastAPI lifespan. Set to `false` in CI/CD if migrations run separately. |
 | `POSTGRES_POOL_SIZE` / `POSTGRES_MAX_OVERFLOW` | no | `5` / `5` | SQLAlchemy connection-pool tuning. |
-| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | no | `""` | Both must be set to enable tracing. Otherwise `@traced` is a no-op. Generated in the Langfuse UI after first launch (`http://localhost:3100`). |
-| `LANGFUSE_HOST` | no | `https://cloud.langfuse.com` (`.env.example` sets `http://localhost:3100` for the self-hosted stack) | Langfuse ingest host. Docker-compose overrides this to `http://langfuse-web:3000` for the dockerized estimator backend. |
-| `LANGFUSE_NEXTAUTH_SECRET` / `LANGFUSE_NEXTAUTH_URL` / `LANGFUSE_SALT` | no | placeholder | NextAuth secrets for the Langfuse UI. Rotate before anything non-throwaway. |
-| `LANGFUSE_ENCRYPTION_KEY` | no | placeholder zeros | 32-byte hex key for Langfuse field-level encryption. Generate with `openssl rand -hex 32`. |
-| `LANGFUSE_CLICKHOUSE_USER` / `LANGFUSE_CLICKHOUSE_PASSWORD` | no | `clickhouse` / placeholder | ClickHouse credentials (Langfuse event store). |
-| `LANGFUSE_REDIS_AUTH` | no | placeholder | Redis password (Langfuse queues + cache). |
-| `LANGFUSE_MINIO_ROOT_USER` / `LANGFUSE_MINIO_ROOT_PASSWORD` / `LANGFUSE_S3_BUCKET` | no | `minio` / placeholder / `langfuse` | MinIO root creds + bucket name for Langfuse event uploads. |
-| `LANGFUSE_POSTGRES_DB` | no | `langfuse` | Name of the Langfuse metadata DB on the shared Postgres instance. Auto-created on a fresh volume via `data/postgres-init/01-create-langfuse-db.sh`. |
-| `LANGFUSE_INIT_*` | no | `""` | Optional org/project/user seeding on first boot. Leave blank to use the UI signup flow. |
 | `BACKEND_HOST` / `BACKEND_PORT` | no | `0.0.0.0` / `8000` | |
 | `BACKEND_CORS_ORIGINS` | no | `http://localhost:3000` | Comma-separated. |
 | `LOG_LEVEL` | no | `INFO` | Root backend log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`), applied by `observability.logging_config`. |
 | `NEXT_PUBLIC_API_URL` | no | `http://localhost:8000` | Inlined at frontend **build** time. |
 
-Graceful degradation is intentional — every external dependency (Anthropic, Neo4j, Qdrant, Langfuse) can be absent and the system still starts. You'll get stubs or warnings instead of crashes.
+Graceful degradation is intentional — every external dependency (Anthropic, Neo4j, Qdrant) can be absent and the system still starts. You'll get stubs or warnings instead of crashes.
 
 ---
 
@@ -545,9 +524,13 @@ Graceful degradation is intentional — every external dependency (Anthropic, Ne
 | `POST` | `/wbs/drafts/{id}/duplicate` | WBS: clone an in-progress draft into a new editable draft (fresh task ids, " (Copy)" name). |
 | `POST` | `/estimates/{id}/wbs/duplicate` | WBS: clone a completed WBS estimate (from its review) into a new draft. Sources the tree + context from `envelope_json`, so it works with Neo4j off. `409` if the estimate isn't a WBS estimate. |
 | `POST` | `/estimates/wbs/preview` | WBS: roll the current tree up into a `DualScenarioEstimate` **without persisting** — powers the editor's "Re-evaluate" button. Body carries `tree`, `stage2?`, `stage3?`, `contingency_pct?` (default 30). |
+| `POST` | `/estimates/wbs/reconcile` | WBS: triangulate the bottom-up rollup against a **parametric (twin)** estimate of the same brief — returns per-phase + total divergence classified `aligned`/`likely_omitted_work`/`likely_double_count` to catch forgotten or double-counted work before commit. Estimates the **full lifecycle** so a fully-**omitted phase** (no WBS tasks) surfaces with `omitted: true` (add tasks), distinct from an under-sized one (calibrate). Runs the six twins' Pass-1 (≈7 LLM calls), explicit "Reconcile" button; degrades to a structural-only comparison (`parametric_available: false`) with no API key. |
+| `POST` | `/estimates/wbs/completeness` | WBS: a **completeness critic** — one LLM call audits the tree against the work a project of this kind typically needs and returns project-specific tasks the WBS likely **omitted** (within-phase omission the totals-only reconciliation can't see), each with phase + 3-point estimate so the editor can add it in one click. Degrades to an empty list with no API key. |
+| `POST` | `/estimates/wbs/suggest-hours` | WBS: re-estimate a **single leaf's** 3-point hours from the brief + its sibling tasks (so the number stays proportionate to the rest of the tree) — powers the per-task **✨ Suggest hours** button in the editor's edit modal. Degrades to the leaf's existing hours with no API key. |
 | `POST` | `/estimates/wbs` | WBS: commit the tree — computes, persists a `method: "wbs"` envelope (Postgres history + Neo4j subgraph), retires the draft, and returns the envelope. Synchronous (the rollup is fast/deterministic). |
 | `POST` | `/estimates` | Start a new estimation. Body: `CreateEstimateRequest { project_name?, raw_input, stage2?, stage3?, selected_phases? }`. `selected_phases` (omitted ⇒ all six) restricts which twins run, so you can estimate a subset of the SDLC. Returns the envelope with status `pending`; Pass 1 runs as a background task. |
 | `GET` | `/estimates/history` | Paginated persisted estimates (newest first) for the dashboard history list. Query: `?limit=&offset=`; returns `{ items, total }`. Empty when Postgres is disabled. |
+| `GET` | `/observability/llm-usage` | The top-level **Observability** view. *Every* LLM call is persisted to the **`llm_call`** table (agent, model, tokens, cost, timestamp) — including the pre-submission prefill/roster/tooling agents, which persist with a null `estimate_id` but the **wizard-run `session_id`**. This endpoint aggregates it **DB-side** (SUM / GROUP BY) into a grand total + per-model **and per-agent** breakdown + a per-estimate list (`{ enabled, total, by_estimate }`); each estimate carries its `created_at` and expands to a per-agent breakdown with **call timestamps**. (When the wizard commits, those pre-submission calls are reparented onto the estimate via their `session_id`, so they roll up per-estimate too; an abandoned wizard's calls stay in the grand total + by-agent only.) `enabled: false` / empty when Postgres is off. |
 | `GET` | `/estimates/{id}` | Fetch the current envelope (status, pass1/pass2 estimates, clarifying questions, final). **Authoritative source of truth.** On in-memory cache miss it falls back to the persisted `envelope_json` (when Postgres is connected) so completed estimates redisplay after a restart / in a fresh session. |
 | `DELETE` | `/estimates/{id}` | Delete an estimate — removes it from the in-memory registries and Postgres history (+ phase rows). Idempotent → `204`. |
 | `GET` | `/estimates/{id}/stream` | **SSE** event stream — emits `status` / `questions` / `final` / `error` as the graph progresses. Best-effort, via a per-estimate fan-out broker with a replay buffer: late / reconnecting / multiple concurrent subscribers all receive the backlog (no event stealing). Closes after `final` or `error`. |
@@ -571,7 +554,7 @@ OpenAPI docs are served at `http://localhost:8000/docs` once the backend is up.
 | `/estimate/draft/context` | 2. Project context | MVP subset of planning outline §4.2 — industry, project type, screen count, integrations, engagement model, **and the team roster** (description + category + seniority + rate + percentage per role). The `<RoleRosterEditor>` lives here, with a separate "Auto-adjust to 100%" button (no auto-rebalance on blur). A prefill/roster agent can pre-populate both. Client-side state in `lib/wizard-store.ts`. |
 | `/estimate/draft/maturity` | 3. AI tooling & codebase | A **freeform AI-tooling description** text field (classified into per-phase tooling levels on submit via `POST /estimates/draft/classify-tooling`), a codebase-context selector (greenfield / brownfield small / large-unfamiliar / large-familiar), an **existing/proposed technology-stack** field (a sizing signal the twins read; lets the estimate reference the real stack), and a **"Phases to estimate"** picker (all six checked by default; sends `selected_phases` only when a subset is chosen). The old per-phase L0–L4 maturity sliders are gone. Team composition lives in Stage 2. |
 | `/estimate/[id]/questions` | 4. Clarifying questions | Renders questions returned by Pass 1; POSTs answers to resume Pass 2. |
-| `/estimate/[id]/review` | 5. Review | Organized into four tabs (`<Tabs>`) — **Cost breakdown**, **Timeline**, **AI assistance**, **Risk & uncertainty** — so it reads as focused views (only the active panel is mounted). Across them: per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout via `lib/staffing.ts`), a **Timeline** (overlapping-phase **Gantt** with a milestone strip + a **PERT** critical-path/slack network + a Monte-Carlo finish-risk readout — P10–P90 weeks, P(finish ≤ target), per-phase criticality — all derived on the client in `lib/schedule.ts`), algorithm tooltips, an AI-assistance-savings section, risks/assumptions in modals off the phase cards, and an LLM cost/token-usage modal. Copy-as-markdown, and an **Export SOW** action (`<SowExportModal>`) that generates an editable Statement of Work and downloads it as `.docx` — see [Statement of Work export](#statement-of-work-export). |
+| `/estimate/[id]/review` | 5. Review | Organized into four tabs (`<Tabs>`) — **Cost breakdown**, **Timeline**, **AI assistance**, **Risk & uncertainty** — so it reads as focused views (only the active panel is mounted). Across them: per-phase bar chart, AI-vs-manual toggle, role-attributed cost table, graphical algorithm breakdown charts, a confidence meter, a **Monte Carlo "Confidence" section** (fan chart + "80% confident: X–Y h" + "P(AI saves time)"), a **team-scaling section** (coordination-overhead cost row + scaling-efficiency / sweet-spot readout via `lib/staffing.ts`), a **Timeline** (overlapping-phase **Gantt** with a milestone strip + a **PERT** critical-path/slack network + a Monte-Carlo finish-risk readout — P10–P90 weeks, P(finish ≤ target), per-phase criticality — all derived on the client in `lib/schedule.ts`), algorithm tooltips, an AI-assistance-savings section, and risks/assumptions in modals off the phase cards. Copy-as-markdown, and an **Export SOW** action (`<SowExportModal>`) that generates an editable Statement of Work and downloads it as `.docx` — see [Statement of Work export](#statement-of-work-export). |
 
 The landing page at `/` lists historical estimates pulled from the backend and redisplays the review page for completed ones. A gear icon opens `/settings`, which edits the AI-reduction guardrail bands (`GET`/`PUT /admin/reduction-bands`), the team-scaling (Brooks's Law + diminishing-returns) coefficients (`GET`/`PUT /admin/staffing-coefficients`), and the default hourly **rate card** per role category × seniority (`GET`/`PUT /admin/default-rates`).
 
@@ -584,7 +567,7 @@ A second, separate wizard under `frontend/app/wbs/` (reachable via "WBS Estimate
 | `/wbs` | Landing + resume | "New WBS estimate" plus a **"Resume a draft"** list (`GET /wbs/drafts`); each row links to the editor and offers Duplicate / Delete. Notes when resume needs Neo4j. |
 | `/wbs/new` | 1. Describe | Project description + codebase-context picker + freeform AI-tooling field (with a prefill helper). |
 | `/wbs/team` | 2. Team | Transition page that prefills the **roster** (roster agent) and classifies the **AI tooling** from the description before drafting; classification is awaited at submit so the per-phase tooling — hence the AI-savings — is never baked in as all-`none`. Drafting **streams live progress** over AG-UI (`lib/wbs-agui.ts` → `POST /wbs/draft/agui`): a `<ProgressBar>` shows a single rolling status line narrating each work package + task as the planner produces it (no fake percentage), falling back to the plain `POST /wbs/draft` if streaming fails. |
-| `/wbs/edit/[draftId]` | 3. Edit & review | The interactive tree editor (`<WbsTreeViewEditor>`), a **Contingency reserve %** input (default 30%), debounced autosave (`PUT /wbs/drafts/{id}`), a **Re-evaluate** button (`POST /estimates/wbs/preview`, live total + duration), an **LLM-cost** modal (`<LlmUsageModal>` — what the planner draft cost), and **Submit** (`POST /estimates/wbs` → redirect to the shared `/estimate/{id}/review`). |
+| `/wbs/edit/[draftId]` | 3. Edit & review | The interactive tree editor (`<WbsTreeViewEditor>`), a **Contingency reserve %** input (default 30%), debounced autosave (`PUT /wbs/drafts/{id}`), a **Re-evaluate** button (`POST /estimates/wbs/preview`, live total + duration), a **Reconcile** button (`POST /estimates/wbs/reconcile` — cross-checks the bottom-up total against the parametric/twin model to flag omitted or double-counted work before commit) with an **Apply calibration** action that rescales the diverging phases' task hours toward the parametric (per-phase, clamped — keeps the full task breakdown, only the magnitudes move; fixes bottom-up's systematic under-sizing), a **Check completeness** button (`POST /estimates/wbs/completeness` — an LLM critic that lists project-specific tasks the WBS likely *omitted*, each addable as a leaf in one click), a per-task **✨ Suggest hours** button in each leaf's edit modal (`POST /estimates/wbs/suggest-hours` — re-estimates that one leaf's 3-point hours from the brief + its sibling tasks, so the number stays proportionate), and **Submit** (`POST /estimates/wbs` → redirect to the shared `/estimate/{id}/review`; the planner-draft LLM cost rides along to the Observability page). |
 
 The shared review page (`/estimate/[id]/review`) renders a WBS estimate from the same `DualScenarioEstimate`, hiding the twin-only algorithm badges/breakdown charts and adding a read-only WBS-tree panel; it offers "Duplicate as new draft".
 
@@ -642,14 +625,15 @@ The frontend Stage 2 page hosts the `<RoleRosterEditor>` component — add/remov
 - **LangGraph checkpointer** — `db/neo4j_adapter.py::make_checkpointer()` returns `langgraph.checkpoint.memory.InMemorySaver` in MVP. State survives within a process (so `interrupt()` works) but **not** across restarts. A real Neo4j-backed `BaseCheckpointSaver` is a Phase-3 swap at this exact call site.
 - **Neo4j estimate snapshots** — `save_estimate_envelope(...)` writes one `Estimate` node + N `Phase` nodes via idempotent Cypher `MERGE`. Called at status transitions via `runtime.py::persist_completed_estimate` (shared by the twin flow and the WBS commit). **Silently no-ops** when Neo4j is unavailable.
 - **Neo4j WBS drafts** — the bottom-up flow stores its hierarchy graph-natively (`save_wbs_draft` / `load_wbs_draft` / `list_wbs_drafts` / `delete_wbs_draft` / `save_wbs_tree`): a `(:WbsDraft)` node with its `[:HAS_CHILD]` `(:WbsTask)` subgraph, written in a single managed transaction so resume never sees a half-saved tree. The committed estimate hangs the same subgraph under its `(:Estimate)` node. Same never-raise contract — when Neo4j is off, drafts degrade to the client's localStorage cache.
-- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` (including the full `envelope_json` for verbatim redisplay) and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, **codebase-context**) aggregates in `calibration_aggregates`. The codebase-context code (0–3, `-1` = "any") rides in the column historically named `maturity_level` — it no longer holds an AI-maturity level. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. `list_estimate_history(...)` / `get_estimate_envelope(...)` back the history list and the redisplay-after-restart fallback. **Silently no-ops** when Postgres is unavailable. Alembic migrations (`0001`–`0012`) run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
+- **Postgres history + calibration** — `save_estimate_history(...)` upserts the envelope into `estimate_history` (including the full `envelope_json` for verbatim redisplay) and replaces its rows in `phase_history` on every status transition (Pass 1 phases get superseded by Pass 2 in place). On status `completed`, `refresh_calibration_for_phase(...)` recomputes the rolling per-(phase, industry, project_type, **codebase-context**) aggregates in `calibration_aggregates`. The codebase-context code (0–3, `-1` = "any") rides in the column historically named `maturity_level` — it no longer holds an AI-maturity level. Twins read these aggregates during Pass 1 via `parse_input → state["calibration_examples"]` so the LLM has historical anchors for its UCP / FP / SLOC → hours mapping. `list_estimate_history(...)` / `get_estimate_envelope(...)` back the history list and the redisplay-after-restart fallback. Per-call LLM usage is persisted to the relational **`llm_call`** table (`save_llm_calls`; the pre-submission prefill/roster/tooling agents persist their calls with a null `estimate_id` but the wizard-run `session_id` via `insert_llm_calls`, and `associate_llm_calls` reparents them onto the estimate on commit) and aggregated DB-side for the Observability page (`aggregate_llm_usage`). **Silently no-ops** when Postgres is unavailable. Alembic migrations (`0001`–`0016`) run on startup when `POSTGRES_MIGRATE_ON_START=true` (default).
 - **AI-reduction bands** — the admin-tunable `ai_reduction_bands` table holds the per-(phase, tooling) guardrail bands, merged with the in-code defaults and loaded into graph state by `parse_input`. Editable from the `/settings` screen via `GET`/`PUT /admin/reduction-bands`.
 - **Staffing coefficients** — the admin-tunable `staffing_coefficients` table holds the team-scaling parameters (Brooks's Law coordination + diminishing returns), merged with the in-code `DEFAULT_STAFFING_COEFFS` fallback. Read/written by `get_staffing_coefficients` / `upsert_staffing_coefficients` (never-raise) and editable from the `/settings` screen via `GET`/`PUT /admin/staffing-coefficients`.
 - **Rate card + app settings** — the `default_rates` (+ `custom_rate_roles`) table holds the per-`(category, seniority)` hourly **rate card** the roster agent seeds new estimates from (`pricing.DEFAULT_RATES` fallback), and the generic `app_settings` key→value table holds the string-valued admin settings — the three per-twin **sizing methods** (`{discovery,development,qa}_sizing_method`) and the global **contingency** reserve %. All flow through the same code-default + DB-override pattern and are edited from `/settings`.
-- **LLM usage/cost** — `orchestrator/usage.py` captures each Anthropic call's token usage into a per-estimate accumulator (bound around the Pass 1/Pass 2 run), then summarizes it into `DualScenarioEstimate.llm_usage` (per-model token + dollar breakdown) — the meta-cost of producing the estimate, surfaced in the review page's LLM cost modal. Best-effort: a no-op when no accumulator is bound.
-- **Langfuse** — `@traced(name=..., as_type=...)` decorates LLM calls and graph nodes. With keys absent, it installs a no-op decorator that **preserves `inspect.iscoroutinefunction`** — important because LangGraph inspects node fns to decide sync vs async dispatch. Self-hosted via docker-compose but **gated behind the `langfuse` compose profile** (off by default; enable with `COMPOSE_PROFILES=langfuse`): a `langfuse-web` (UI on `http://localhost:3100`) + `langfuse-worker` + ClickHouse + Redis + MinIO stack, sharing the project's Postgres for metadata under a separate `langfuse` database. The estimator backend points at `http://langfuse-web:3000` inside the compose network; on the host (`make be`) it uses whatever `LANGFUSE_HOST` is set to (`.env.example` ships `http://localhost:3100`).
+- **LLM usage/cost** — `orchestrator/usage.py` captures each Anthropic call's token usage into a per-estimate accumulator (bound around the Pass 1/Pass 2 run), then summarizes it into `DualScenarioEstimate.llm_usage` (per-model token + dollar breakdown) — the meta-cost of producing the estimate. Best-effort: a no-op when no accumulator is bound.
+- **Observability page** — the LLM token cost of *producing* estimates is surfaced on an in-app **Observability** page at `/observability` (frontend `app/observability/page.tsx`, an icon next to the Settings gear in `app/layout.tsx`), backed by `GET /observability/llm-usage` (`backend/routers/observability.py`). It aggregates the `llm_call` table **DB-side** (SUM / GROUP BY): a grand total + per-model + per-agent breakdown, plus a per-estimate rollup that expands to per-agent rows with call timestamps. Pre-submission + WBS-assist calls (prefill / roster / tooling / reconcile / completeness / suggest-hours) are captured against a wizard `session_id` and **reparented** onto the estimate when the wizard commits (an abandoned wizard's calls stay in the grand total + by-agent only). `enabled: false` / empty when Postgres is off.
+- **Backend logging** — structured request logging via `observability/request_logging.py` (a pure-ASGI middleware that's streaming/SSE-safe) plus per-request correlation ids (`observability/correlation.py`), configured by `observability/logging_config.py` (`LOG_LEVEL`).
 - **docs-mcp-server** — a co-located compose service (host port `6280`) the tooling classifier queries (and optionally scrapes-then-indexes) to research unfamiliar AI tools. Degrades gracefully: when unreachable or timed out, unknown tools stay `none`.
-- **Qdrant** — client + collection bootstrap is in place but no data is ingested. Vector calibration is Phase 3 (the SQL aggregates above are the MVP version).
+- **Qdrant** — vector-similarity calibration store. On completion, `orchestrator/calibration_index.py` embeds each estimate (OpenAI `EMBEDDING_MODEL`) into four collections — `reference_cases`, `phase_cases`, `wbs_tasks`, `clarifying_questions` — as a third best-effort task **alongside** the Neo4j + Postgres writes (additive, never replacing them). Retrieval (`nearest_reference_cases` / `nearest_wbs_tasks` / `nearest_phase_cases` / `similar_questions`) powers reference-class lookups; the Postgres SQL aggregates remain the exact-bucket calibration and Qdrant complements them. Degrades silently without an OpenAI key or Qdrant. **First consumer:** the per-leaf "Suggest hours" estimator retrieves similar past tasks (`nearest_wbs_tasks`) and feeds their realized hours into the prompt as calibration anchors. The other retrieval functions + the twins aren't consumed yet, and true *accuracy* calibration awaits delivered actuals.
 
 ---
 
@@ -721,7 +705,7 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 - Estimate history landing page + verbatim redisplay of completed estimates
 - Neo4j envelope persistence + Postgres history & twin calibration aggregates (when reachable)
 - Alembic migrations + programmatic upgrade on startup
-- Langfuse SDK wired but optional (gated behind a compose profile)
+- In-app **Observability** page aggregating the LLM token cost of producing estimates (per-model / per-agent / per-estimate, DB-side over the `llm_call` table)
 - Dockerized full stack
 
 **Deferred (Phase 2 / 3 / 4 — scaffolded, not implemented)**
@@ -729,10 +713,9 @@ Lifespan tests assert the ready-log line shape (`✓ Backend ready ...` / `✓ F
 - A2A peer-to-peer cross-phase signaling between twins
 - Server-side / OCR document parsing (the MVP extracts text **client-side** for PDF / Word / text; scanned image-only PDFs aren't OCR'd)
 - Full Stage 2 / 3 field set per planning outline §4.2
-- Qdrant vector-similarity calibration (Postgres SQL aggregates are the MVP version)
+- Qdrant vector-similarity calibration — indexing + retrieval is built and its **first consumer is live** (the per-leaf "Suggest hours" estimator anchors to similar past tasks via `nearest_wbs_tasks`); the other retrieval functions + the twins aren't consumed yet, and it lacks delivered actuals for true accuracy calibration (the Postgres SQL aggregates remain the live exact-bucket version)
 - Neo4j-backed LangGraph checkpointer (in-memory only today)
 - Side-by-side estimate comparison views (history list + single-estimate redisplay exist; multi-estimate diffing does not)
-- Langfuse trace viewer page (`/estimate/[id]/explain`)
 - Proposal document export / PM-tool integration
 
 Each deferred area has either a corresponding TODO comment or a scaffolded folder pointing to the relevant planning-outline section.
@@ -743,17 +726,12 @@ Each deferred area has either a corresponding TODO comment or a scaffolded folde
 
 - **Neo4j fails to start with `JettyWebServer.loadStaticContent: Path is null`** — newer 5.x community images regress on arm64. The image is pinned to `neo4j:5.20-community` for that reason. Don't bump without testing on arm64.
 - **Neo4j "no space left on device"** — the Docker VM's virtual disk is full. The compose file uses **bind mounts** under `./data/neo4j/{data,logs}` so the host (which has space) holds the data. If you also see Docker layer build failures, prune: `docker image prune -af && docker builder prune -f`.
-- **Backend says "Langfuse disabled"** — expected when `LANGFUSE_PUBLIC_KEY` or `LANGFUSE_SECRET_KEY` is empty. Langfuse is also **off by default** at the compose level — set `COMPOSE_PROFILES=langfuse` in `.env` to start the stack, then sign up at `http://localhost:3100`, create a project, and paste the generated `pk-lf-…` / `sk-lf-…` into `.env`.
 - **Tooling classifier maps unknown tools to `none`** — the docs-mcp-server is unreachable, timed out (`DOCS_MCP_RESEARCH_TIMEOUT_S` / `DOCS_MCP_SCRAPE_TIMEOUT_S`), or has no embeddings provider (`OPENAI_API_KEY`) to search/index against. This is the conservative fallback; the rest of the estimate proceeds. Confirm the `docs-mcp-server` service is healthy on `:6280` and `DOCS_MCP_URL` is reachable from the backend.
-- **Langfuse UI 500s on first load** — usually a `langfuse-web` ↔ Postgres migration race. `docker compose logs langfuse-web | grep -i prisma` will show the migration; wait for it to finish (~30s on first boot) then refresh.
-- **`langfuse-web` healthcheck failing with `password authentication failed` for `estimator`** — the Postgres init script didn't run because `./data/postgres` already had content. Create the DB manually: `docker exec sdlc-postgres psql -U estimator -c "CREATE DATABASE langfuse;"` then `docker compose restart langfuse-web langfuse-worker`.
-- **ClickHouse / MinIO data taking space** — bind-mounted at `./data/clickhouse/` and `./data/minio/`. `docker compose down -v` does NOT wipe them; remove the directories manually for a fully clean reset.
 - **Backend says "Neo4j connect failed; persistence disabled"** — `NEO4J_PASSWORD` not set or Neo4j is down. The backend keeps working without persistence.
 - **Backend says "Postgres disabled (no POSTGRES_DSN / POSTGRES_PASSWORD)"** — expected when neither is set. History writes + twin calibration silently no-op; the rest of the API works. Set `POSTGRES_PASSWORD` (or `POSTGRES_DSN`) to enable.
 - **Backend says "Alembic upgrade failed"** — the lifespan logs but doesn't crash. Run `uv run alembic upgrade head` from `backend/` to apply migrations manually and inspect the error.
 - **Twins not improving across runs** — calibration only refreshes when an estimate reaches status `completed`. Check `calibration_aggregates` in Postgres (`psql -U estimator -d estimator -c "select * from calibration_aggregates"`) to see what's accumulated. Note `maturity_level` there is a codebase-context code (0–3, `-1` = any), not an AI-maturity level.
 - **Twin returns a stub estimate** — the twin's LLM call failed (often: `ANTHROPIC_API_KEY` missing or model id wrong). Check the low confidence + stub note in the response. Set the env var and restart.
-- **"Expected dict, got coroutine" from LangGraph** — something wrapped an async node with a sync decorator. The Langfuse no-op decorator already branches on `inspect.iscoroutinefunction`; if you add new decorators, mirror that pattern.
 - **Next.js build fails on `useSearchParams()`** — wrap the page component in `<Suspense>`. `/estimate/new` and `/estimate/draft/create` already do this; copy the pattern.
 - **Frontend can't reach the backend in Docker** — `NEXT_PUBLIC_API_URL` is build-time and is called from the browser. It must be `http://localhost:8000`, never the internal service name.
 

@@ -119,5 +119,4 @@ deployment_pass1, deployment_pass2 = make_twin_nodes(
     stub_ai_mid=340,
     stub_manual_mid=390,
     proposed_reduction_fn=_proposed_reduction,
-    trace_name="twin.deployment",
 )

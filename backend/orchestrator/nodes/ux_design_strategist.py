@@ -123,5 +123,4 @@ ux_design_pass1, ux_design_pass2 = make_twin_nodes(
     stub_algorithm="SCP",
     stub_ai_mid=230,
     stub_manual_mid=260,
-    trace_name="twin.ux_design",
 )

@@ -94,7 +94,10 @@ async def test_run_wbs_planner_streamed_fires_on_node_per_package_and_task(monke
         '{"name":"Build","tasks":[]}],"notes":"ok"}'
     )
 
-    async def fake_stream(*, on_input_delta=None, **_: object) -> WbsPlannerResponse:
+    captured: dict = {}
+
+    async def fake_stream(*, on_input_delta=None, **kwargs: object) -> WbsPlannerResponse:
+        captured.update(kwargs)
         if on_input_delta is not None:
             # Split mid-stream to exercise the parser's cross-chunk state through the real wiring.
             on_input_delta(blob[:40])
@@ -114,6 +117,13 @@ async def test_run_wbs_planner_streamed_fires_on_node_per_package_and_task(monke
     # Packages + tasks stream through on_node in document order (Build has no tasks → no task event).
     assert seen == [("package", "Discovery"), ("task", "Interviews"), ("package", "Build")]
     assert [p.name for p in resp.packages] == ["Discovery", "Build"]
+    # The streaming planner forwards the configured WBS model + effort (Opus 4.8 / max by default),
+    # so the streamed draft runs at the same reasoning depth as the non-streaming fallback.
+    assert captured["model"] == "claude-opus-4-8"
+    assert captured["effort"] == "max"
+    # A generous max_tokens so max-effort reasoning + the full tree both fit (reasoning shares the
+    # output-token envelope). Guards against regressing to a budget that truncates to the skeleton.
+    assert captured["max_tokens"] >= 32000
 
 
 # --- AG-UI endpoint -------------------------------------------------------------------------

@@ -19,6 +19,19 @@ def test_health_endpoint_returns_ok() -> None:
         assert r.json() == {"status": "ok", "service": "ai-sdlc-estimator"}
 
 
+def test_observability_llm_usage_returns_aggregate_shape() -> None:
+    # The aggregate (total + per-estimate) must validate through the response model — including the
+    # per-model AND per-agent breakdowns. Shape-only so it's env-independent (Postgres on or off).
+    with _client() as c:
+        r = c.get("/observability/llm-usage")
+        assert r.status_code == 200
+        body = r.json()
+        assert "enabled" in body
+        assert isinstance(body["total"]["by_model"], list)
+        assert isinstance(body["total"]["by_agent"], list)
+        assert isinstance(body["by_estimate"], list)
+
+
 def test_get_unknown_estimate_returns_404(monkeypatch) -> None:
     import db.postgres_adapter as postgres_adapter
 
@@ -110,6 +123,7 @@ def test_remove_estimate_pops_all_registries() -> None:
     saved_env = dict(runtime._envelopes)
     saved_streams = dict(runtime._event_streams)
     saved_usage = dict(runtime._llm_usage)
+    saved_sessions = dict(runtime._wizard_sessions)
     try:
         runtime._envelopes["x"] = EstimateEnvelope(
             estimate_id="x",
@@ -119,12 +133,16 @@ def test_remove_estimate_pops_all_registries() -> None:
         )
         runtime._event_streams["x"] = runtime._EventBroker()
         runtime._llm_usage["x"] = []
+        # A wizard session registered for an estimate that's then deleted (e.g. while still
+        # AWAITING_ANSWERS) must not leak — remove_estimate has to pop it like the other registries.
+        runtime.register_wizard_session("x", "wiz-x")
 
         runtime.remove_estimate("x")
 
         assert "x" not in runtime._envelopes
         assert "x" not in runtime._event_streams
         assert "x" not in runtime._llm_usage
+        assert "x" not in runtime._wizard_sessions
         runtime.remove_estimate("x")  # idempotent — unknown id doesn't raise
     finally:
         runtime._envelopes.clear()
@@ -133,6 +151,8 @@ def test_remove_estimate_pops_all_registries() -> None:
         runtime._event_streams.update(saved_streams)
         runtime._llm_usage.clear()
         runtime._llm_usage.update(saved_usage)
+        runtime._wizard_sessions.clear()
+        runtime._wizard_sessions.update(saved_sessions)
 
 
 def test_staffing_coefficients_admin_get_and_validation() -> None:

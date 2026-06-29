@@ -17,7 +17,6 @@ from models.twin_outputs import (
     PhaseEstimate,
     RoleHeadcount,
 )
-from observability.langfuse_wrapper import traced
 from orchestrator.nodes._twin_base import rate_by_role
 from orchestrator.staffing import (
     coordination_overhead,
@@ -346,6 +345,7 @@ def _apply_cost_and_duration_uplifts(
     duration_high: float,
     overhead: float,
     contingency_pct: float,
+    duration_floor_weeks: float | None = None,
 ) -> tuple[float, float, float, float]:
     """Apply the two project-level uplifts and return ``(cost_ai, cost_manual, dur_low, dur_high)``:
 
@@ -364,6 +364,13 @@ def _apply_cost_and_duration_uplifts(
     contingency = contingency_pct / 100.0
     cost_ai *= 1.0 + contingency
     cost_manual *= 1.0 + contingency
+    # Critical-path FLOOR (WBS only): a project can't finish faster than its longest dependency chain
+    # no matter how many people are added — but the staffing model above is sequencing-blind. Lift the
+    # RAW schedule to the floor BEFORE the contingency uplift so the floored timeline carries the same
+    # reserve as the rest. `None` (every twin) ⇒ no-op, bit-identical to the prior form.
+    if duration_floor_weeks is not None and duration_floor_weeks > 0:
+        duration_low = max(duration_low, duration_floor_weeks)
+        duration_high = max(duration_high, duration_floor_weeks)
     duration_low *= 1.0 + contingency
     duration_high *= 1.0 + contingency
     return cost_ai, cost_manual, duration_low, duration_high
@@ -376,6 +383,7 @@ async def synthesize_from_phase_estimates(
     total_cost_ai_assisted_usd: float,
     total_cost_manual_only_usd: float,
     contingency_pct: float = 0.0,
+    duration_floor_weeks: float | None = None,
     consistency_warnings: list[str] | None = None,
 ) -> DualScenarioEstimate:
     """Typed core of the synthesize tail: combine per-phase ``PhaseEstimate``s + their base labor
@@ -406,6 +414,11 @@ async def synthesize_from_phase_estimates(
         target_weeks=target_weeks,
         coeffs=coeffs,
     )
+    # The critical-path floor only corrects the sequencing-blind NO-TARGET path. When the user pinned
+    # a target timeline, the staffing model already sized the team to hit it — silently flooring the
+    # duration above the target would leave team_size, burn, and duration incoherent (an over-staffed
+    # team delivering over a longer schedule). So the floor is suppressed in the target regime.
+    effective_floor = duration_floor_weeks if not target_weeks else None
     cost_ai, cost_manual, duration_low, duration_high = _apply_cost_and_duration_uplifts(
         cost_ai=total_cost_ai_assisted_usd,
         cost_manual=total_cost_manual_only_usd,
@@ -413,7 +426,11 @@ async def synthesize_from_phase_estimates(
         duration_high=plan.duration_high,
         overhead=plan.overhead,
         contingency_pct=contingency_pct,
+        duration_floor_weeks=effective_floor,
     )
+    # Report the floor on the SAME basis as the duration band (contingency-applied) so the review page
+    # can compare them directly; 0 when no task graph constrained the schedule (or it was suppressed).
+    critical_path_weeks = round((effective_floor or 0.0) * (1.0 + contingency_pct / 100.0), 1)
 
     avg_confidence = sum(p.confidence for p in pass2) / len(pass2) if pass2 else 0.0
 
@@ -426,6 +443,7 @@ async def synthesize_from_phase_estimates(
         confidence=avg_confidence,
         duration_weeks_low=duration_low,
         duration_weeks_high=duration_high,
+        critical_path_weeks=critical_path_weeks,
         headcount_by_role=plan.headcount_rows,
         weekly_burn_rate_usd=plan.weekly_burn,
         brooks_overhead_pct=round(plan.overhead * 100.0, 1),
@@ -458,7 +476,6 @@ async def synthesize_from_phase_estimates(
     return final
 
 
-@traced(name="synthesize_estimate")
 async def synthesize_estimate(state: EstimationState) -> dict:
     """Graph node: adapt the untyped ``EstimationState`` onto the typed synthesize core."""
     final = await synthesize_from_phase_estimates(

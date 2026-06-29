@@ -19,7 +19,6 @@ from db.repositories import (
     get_reduction_bands,
 )
 from models.estimation_state import EstimationState
-from observability.langfuse_wrapper import traced
 from orchestrator.llm import call_structured
 from orchestrator.nodes.development_architect import DEFAULT_DEV_SIZING_METHOD
 from orchestrator.nodes.discovery_analyst import DEFAULT_DISCOVERY_SIZING_METHOD
@@ -142,7 +141,6 @@ def _load_contingency_pct(settings_map: dict[str, str]) -> float:
     return resolve_contingency_pct(settings_map.get("contingency_pct", "0"))
 
 
-@traced(name="parse_input")
 async def parse_input(state: EstimationState) -> dict:
     # Short-circuit when an external caller has pre-populated parsed_context
     # (used by the smoke harness and tests so they can skip the LLM call).

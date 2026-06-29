@@ -96,6 +96,43 @@ def test_combine_pert_leaves_all_zero_bands_are_zero() -> None:
     assert manual.std == 0.0 and manual.mean == 0.0
 
 
+def test_combine_pert_leaves_common_factor_widens_band() -> None:
+    # The shared per-draw lognormal factor adds systemic (correlated) variance: for the SAME leaves
+    # and RNG seed, a positive leaf_corr_sigma yields a strictly wider band than the independent
+    # (sigma=0) sum — while leaving the deterministic mode (Σ modes) untouched.
+    leaves = [(8.0, 10.0, 16.0)] * 6
+    indep, _ = combine_pert_leaves(
+        leaves, reduction_sampler=lambda r: 0.0, eff_point=0.0,
+        rng=make_rng("corr"), n_draws=2000, leaf_corr_sigma=0.0,
+    )
+    corr, _ = combine_pert_leaves(
+        leaves, reduction_sampler=lambda r: 0.0, eff_point=0.0,
+        rng=make_rng("corr"), n_draws=2000, leaf_corr_sigma=0.2,
+    )
+    assert corr.std > indep.std
+    assert corr.point == pytest.approx(indep.point) == pytest.approx(60.0)  # mode unmoved
+
+
+def test_combine_pert_leaves_common_factor_floors_cov_as_leaves_grow() -> None:
+    # Independent summation collapses the band's CoV ~1/√N as leaves grow; the shared factor floors
+    # it near leaf_corr_sigma regardless of N. With 40 identical leaves, sigma=0's CoV nearly
+    # vanishes while sigma>0 keeps it in the neighborhood of sigma — the whole point of the change.
+    leaves = [(9.0, 10.0, 12.0)] * 40
+    indep, _ = combine_pert_leaves(
+        leaves, reduction_sampler=lambda r: 0.0, eff_point=0.0,
+        rng=make_rng("floor"), n_draws=3000, leaf_corr_sigma=0.0,
+    )
+    corr, _ = combine_pert_leaves(
+        leaves, reduction_sampler=lambda r: 0.0, eff_point=0.0,
+        rng=make_rng("floor"), n_draws=3000, leaf_corr_sigma=0.18,
+    )
+    indep_cov = indep.std / indep.mean
+    corr_cov = corr.std / corr.mean
+    assert indep_cov < 0.05   # 40 independent leaves → band nearly collapsed
+    assert corr_cov > 0.12    # shared factor floors CoV near sigma (~0.18)
+    assert corr_cov > indep_cov
+
+
 def test_combine_pert_leaves_negative_reduction_makes_ai_slower() -> None:
     # AI net-slower (METR): a negative reduction must push AI hours ABOVE manual, and the
     # ai.most_likely == manual.most_likely·(1−eff) identity must still hold exactly.
@@ -179,6 +216,166 @@ async def test_build_wbs_estimate_uses_explicit_contingency_default_30(monkeypat
         WbsCalculateRequest(tree=_sample_tree(), contingency_pct=0), estimate_id="c3"
     )
     assert final.contingency_pct == pytest.approx(0.0)
+
+
+async def test_build_wbs_estimate_ai_tooling_reduces_the_ai_scenario(monkeypatch) -> None:
+    # Stage-3 AI tooling MUST flow through to the rollup and reduce the AI-assisted scenario relative
+    # to manual (it's applied via tooling_for → effective_ai_reduction band midpoint). With all-`none`
+    # the two scenarios are equal; with agentic coding tooling, AI hours drop materially.
+    import db.postgres_adapter as pg
+    from models.project_schema import (
+        AiToolingLevel,
+        CodebaseContext,
+        PhaseToolingLevels,
+        Stage3Context,
+    )
+
+    pg._reset_for_tests()
+    monkeypatch.setattr(pg, "get_sessionmaker", lambda: None)
+    monkeypatch.setenv("MC_DRAWS", "200")
+
+    def _req(tooling: PhaseToolingLevels) -> WbsCalculateRequest:
+        return WbsCalculateRequest(
+            tree=_sample_tree(), contingency_pct=0,
+            stage3=Stage3Context(codebase_context=CodebaseContext.GREENFIELD, ai_tooling=tooling),
+        )
+
+    none = await build_wbs_estimate(_req(PhaseToolingLevels()), estimate_id="t-none")
+    assert none.total_ai_assisted_hours.most_likely == pytest.approx(
+        none.total_manual_only_hours.most_likely
+    )  # no tooling → no reduction
+
+    agentic = await build_wbs_estimate(
+        _req(PhaseToolingLevels(
+            development=AiToolingLevel.AGENTIC, qa_testing=AiToolingLevel.AGENTIC
+        )),
+        estimate_id="t-agentic",
+    )
+    # Manual (size) is unchanged by tooling; the AI scenario is materially smaller.
+    assert agentic.total_manual_only_hours.most_likely == pytest.approx(
+        none.total_manual_only_hours.most_likely
+    )
+    assert agentic.total_ai_assisted_hours.most_likely < (
+        0.9 * agentic.total_manual_only_hours.most_likely
+    )
+
+
+def test_detect_regulated_from_description_and_stage2() -> None:
+    from models.project_schema import Stage2Context
+    from orchestrator.wbs.rollup import _detect_regulated
+
+    assert _detect_regulated("a HIPAA patient portal", Stage2Context()) is True
+    assert _detect_regulated("a payment app handling cardholder data", Stage2Context()) is True
+    assert _detect_regulated("an internal todo app", Stage2Context()) is False
+    # An explicit Stage-2 regulatory requirement flags it regardless of the description text.
+    assert _detect_regulated("plain app", Stage2Context(regulatory_requirements=["SOC 2"])) is True
+
+
+async def test_build_wbs_flags_regulation_and_anchors_reduction_below_midpoint(monkeypatch) -> None:
+    # (1) A regulated description gets a LOWER AI reduction than the same project non-regulated (the
+    # −8% verification tax now applies to WBS, like the parametric flow). (2) The reduction is anchored
+    # toward the lower band, not the optimistic midpoint — so a smaller anchor yields a smaller reduction.
+    import db.postgres_adapter as pg
+    from models.project_schema import (
+        AiToolingLevel,
+        CodebaseContext,
+        PhaseToolingLevels,
+        Stage3Context,
+    )
+
+    pg._reset_for_tests()
+    monkeypatch.setattr(pg, "get_sessionmaker", lambda: None)
+    monkeypatch.setenv("MC_DRAWS", "200")
+    monkeypatch.setenv("WBS_AI_REDUCTION_ANCHOR", "0.3")
+
+    s3 = Stage3Context(
+        codebase_context=CodebaseContext.GREENFIELD,
+        ai_tooling=PhaseToolingLevels(development=AiToolingLevel.AGENTIC),
+    )
+    tree = [WbsTaskInput(id="p", name="Build", children=[
+        _leaf("l1", Phase.DEVELOPMENT, "sr_engineer", 80, 160, 320)])]
+
+    async def _dev_reduction(raw: str) -> float:
+        est = await build_wbs_estimate(
+            WbsCalculateRequest(raw_input=raw, tree=tree, contingency_pct=0, stage3=s3),
+            estimate_id=f"r:{raw[:6]}",
+        )
+        return next(p for p in est.phases if p.phase == Phase.DEVELOPMENT).effective_ai_reduction_pct
+
+    regulated = await _dev_reduction("HIPAA healthcare patient portal")
+    non_regulated = await _dev_reduction("an internal tooling app")
+    assert regulated < non_regulated  # the regulated verification tax lands
+
+    # A lower anchor → strictly smaller reduction (proves WBS no longer uses the raw midpoint).
+    monkeypatch.setenv("WBS_AI_REDUCTION_ANCHOR", "0.1")
+    lower_anchor = await _dev_reduction("an internal tooling app")
+    assert lower_anchor < non_regulated
+
+
+@pytest.mark.asyncio
+async def test_critical_path_floor_makes_sequential_take_longer_than_parallel(monkeypatch) -> None:
+    # The headline of WBS #3: two trees with IDENTICAL total hours — one a long dependency chain, one
+    # fully parallel — must NOT get the same duration. The sequential one is floored to its critical
+    # path; the parallel one isn't. (The old staffing-only model gave both the same duration.)
+    import db.postgres_adapter as pg
+
+    pg._reset_for_tests()
+    monkeypatch.setattr(pg, "get_sessionmaker", lambda: None)
+    monkeypatch.setenv("MC_DRAWS", "120")
+
+    # 5 leaves × 80h = 400h either way; the chain wires a→t0→t1→t2→t3.
+    chain = [
+        WbsTaskInput(id="p", name="p", children=[
+            _leaf("a", Phase.DEVELOPMENT, "sr_engineer", 80, 80, 80),
+            *[_dep_leaf(f"t{i}", f"t{i - 1}" if i > 0 else "a") for i in range(4)],
+        ])
+    ]
+    parallel = [
+        WbsTaskInput(id="p", name="p", children=[
+            _leaf(f"t{i}", Phase.DEVELOPMENT, "sr_engineer", 80, 80, 80) for i in range(5)
+        ])
+    ]
+
+    seq = await build_wbs_estimate(WbsCalculateRequest(tree=chain), estimate_id="seq")
+    par = await build_wbs_estimate(WbsCalculateRequest(tree=parallel), estimate_id="par")
+
+    # The chain has a real critical path; the parallel tree's is just one task.
+    assert seq.critical_path_weeks > par.critical_path_weeks > 0
+    # The floor binds the duration band: duration_low can't fall below the (contingency-applied) floor.
+    assert seq.duration_weeks_low >= seq.critical_path_weeks - 0.05
+    # Same total hours, longer because it's sequencing-bound.
+    assert seq.duration_weeks_low > par.duration_weeks_low
+
+
+def _dep_leaf(tid: str, dep: str) -> WbsTaskInput:
+    return WbsTaskInput(
+        id=tid, name=tid, phase=Phase.DEVELOPMENT, role_id="sr_engineer",
+        optimistic=80, most_likely=80, pessimistic=80, depends_on=[dep],
+    )
+
+
+@pytest.mark.asyncio
+async def test_critical_path_floor_suppressed_when_target_timeline_set(monkeypatch) -> None:
+    # When the user pins a target timeline, the staffing model sizes the team to hit it; the
+    # critical-path floor must NOT silently override the target upward (which would leave team_size,
+    # burn, and duration incoherent). The floor only corrects the sequencing-blind no-target path.
+    import db.postgres_adapter as pg
+    from models.project_schema import Stage2Context
+
+    pg._reset_for_tests()
+    monkeypatch.setattr(pg, "get_sessionmaker", lambda: None)
+    monkeypatch.setenv("MC_DRAWS", "120")
+
+    chain = [
+        WbsTaskInput(id="p", name="p", children=[
+            _leaf("a", Phase.DEVELOPMENT, "sr_engineer", 80, 80, 80),
+            *[_dep_leaf(f"t{i}", f"t{i - 1}" if i > 0 else "a") for i in range(4)],
+        ])
+    ]
+    req = WbsCalculateRequest(tree=chain, stage2=Stage2Context(target_timeline_weeks=2))
+    final = await build_wbs_estimate(req, estimate_id="tgt")
+    # Floor suppressed in the target regime → reported as 0 (not the 5-week chain length).
+    assert final.critical_path_weeks == 0.0
 
 
 # --- tree bounds (DoS guard on user-submitted requests) ------------------------------------

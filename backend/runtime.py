@@ -25,7 +25,13 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from db.neo4j_adapter import save_estimate_envelope, save_wbs_tree
-from db.repositories import refresh_calibration_for_phase, save_estimate_history
+from db.repositories import (
+    associate_llm_calls,
+    calls_from_summary,
+    refresh_calibration_for_phase,
+    save_estimate_history,
+    save_llm_calls,
+)
 from models.project_schema import (
     EstimateEnvelope,
     EstimateStatus,
@@ -100,6 +106,16 @@ _event_streams: dict[str, _EventBroker] = {}
 # Always cleaned up in the run's `finally` block (both success and failure paths).
 _llm_usage: dict[str, list[dict]] = {}
 
+# Wizard-run UUID per estimate (set at creation). Lets `persist_completed_estimate` associate the
+# pre-submission agents' `llm_call` rows (which carry the same session id) with this estimate.
+_wizard_sessions: dict[str, str] = {}
+
+
+def register_wizard_session(estimate_id: str, session_id: str | None) -> None:
+    """Record the wizard-run UUID for an estimate so its pre-submission LLM calls are linked on persist."""
+    if session_id:
+        _wizard_sessions[estimate_id] = session_id
+
 # Retained handles for fire-and-forget background tasks. Without this, the event
 # loop only holds a weak reference and the task can be garbage-collected mid-run;
 # the done-callback also surfaces otherwise-swallowed exceptions to the logger.
@@ -128,11 +144,15 @@ def _is_in_flight(env: EstimateEnvelope) -> bool:
 
 def remove_estimate(estimate_id: str) -> None:
     """Drop an estimate from the in-memory registries (envelope, event broker, usage
-    accumulator). Idempotent — unknown ids are ignored. Persisted Postgres history is
-    removed separately via the repository layer."""
+    accumulator, wizard-session map). Idempotent — unknown ids are ignored. Persisted
+    Postgres history is removed separately via the repository layer."""
     _envelopes.pop(estimate_id, None)
     _event_streams.pop(estimate_id, None)
     _llm_usage.pop(estimate_id, None)
+    # Pop the wizard-session entry too: deleting (or evicting) an estimate that paused at
+    # AWAITING_ANSWERS means the persist `finally` that normally pops it never runs again,
+    # so without this the map grows unbounded over create-then-delete-before-answer cycles.
+    _wizard_sessions.pop(estimate_id, None)
 
 
 # --- Public API for the HTTP layer (routers) ---------------------------------------------
@@ -295,7 +315,7 @@ async def _run_graph_phase(
     was byte-identical and lives here.
     """
     from observability.correlation import bind_estimate_id
-    from orchestrator.usage import bind_usage_accumulator
+    from orchestrator.usage import bind_usage_accumulator, usage_call_rows
 
     env = _envelopes[estimate_id]
     try:
@@ -320,9 +340,12 @@ async def _run_graph_phase(
             raw_input=persist["raw_input"],
             stage2=persist["stage2"],
             stage3=persist["stage3"],
+            # The raw per-call records (twin flow) → one llm_call row per call.
+            llm_calls=usage_call_rows(_llm_usage.get(estimate_id) or []),
         )
         if not keep_usage_when(env.status):
             _llm_usage.pop(estimate_id, None)
+            _wizard_sessions.pop(estimate_id, None)
         _evict_if_over_capacity()
 
 
@@ -441,6 +464,8 @@ async def persist_completed_estimate(
     stage2: Stage2Context | None,
     stage3: Stage3Context | None,
     wbs_tree: list | None = None,
+    llm_calls: list[dict] | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Persist an estimate to both stores + refresh calibration — the single fan-out shared by the
     twin flow and the WBS commit (so neither re-implements the persist/calibration contract).
@@ -469,6 +494,18 @@ async def persist_completed_estimate(
     async def _history() -> None:
         try:
             await save_estimate_history(env, stage2=stage2, stage3=stage3)
+            # Per-call LLM-usage rows (queryable + DB-aggregatable). Twins pass the raw per-call list;
+            # the WBS commit passes None, so we derive per-agent rows from the carried-through summary.
+            # Runs after the history upsert so the estimate row exists for the FK.
+            rows = llm_calls
+            if rows is None and env.final_estimate and env.final_estimate.llm_usage:
+                rows = calls_from_summary(env.final_estimate.llm_usage.model_dump())
+            await save_llm_calls(env.estimate_id, rows or [])
+            # Associate the wizard's pre-submission calls (prefill/roster/tooling), which carry the
+            # wizard session id, with this estimate now that its history row exists (FK). Idempotent.
+            await associate_llm_calls(
+                session_id or _wizard_sessions.get(env.estimate_id), env.estimate_id
+            )
             if env.status == EstimateStatus.COMPLETED:
                 # Iterate the Phase enum so a future 7th twin is picked up automatically instead of
                 # silently missing calibration refresh. The per-phase refreshes write disjoint rows.
@@ -481,4 +518,18 @@ async def persist_completed_estimate(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Postgres history write failed (%s); continuing", exc)
 
-    await asyncio.gather(_graph(), _history())
+    async def _vectors() -> None:
+        # Additive vector-similarity index (Qdrant) — completed estimates only, alongside (never
+        # instead of) the Neo4j/Postgres writes above. Best-effort: no-ops without embeddings/Qdrant.
+        if env.status != EstimateStatus.COMPLETED:
+            return
+        try:
+            from orchestrator.calibration_index import index_completed_estimate
+
+            await index_completed_estimate(
+                env, raw_input=raw_input, stage2=stage2, stage3=stage3, wbs_tree=wbs_tree
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Qdrant index write failed (%s); continuing", exc)
+
+    await asyncio.gather(_graph(), _history(), _vectors())

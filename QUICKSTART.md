@@ -19,14 +19,13 @@ There are two supported ways to run the project; pick one:
 - [4. Path A — Local development](#4-path-a--local-development)
 - [5. Path B — Full Docker stack](#5-path-b--full-docker-stack)
 - [6. Verify it works (both flows)](#6-verify-it-works-both-flows)
-- [7. (Optional) Enable the Langfuse tracing stack](#7-optional-enable-the-langfuse-tracing-stack)
-- [8. (Optional) Tooling research via docs-mcp-server](#8-optional-tooling-research-via-docs-mcp-server)
-- [9. Database migrations](#9-database-migrations)
-- [10. Running the tests](#10-running-the-tests)
-- [11. Ports reference](#11-ports-reference)
-- [12. Command cheatsheet](#12-command-cheatsheet)
-- [13. Stopping and cleaning up](#13-stopping-and-cleaning-up)
-- [14. Troubleshooting](#14-troubleshooting)
+- [7. (Optional) Tooling research via docs-mcp-server](#7-optional-tooling-research-via-docs-mcp-server)
+- [8. Database migrations](#8-database-migrations)
+- [9. Running the tests](#9-running-the-tests)
+- [10. Ports reference](#10-ports-reference)
+- [11. Command cheatsheet](#11-command-cheatsheet)
+- [12. Stopping and cleaning up](#12-stopping-and-cleaning-up)
+- [13. Troubleshooting](#13-troubleshooting)
 
 ---
 
@@ -45,7 +44,7 @@ Install these on your machine first. Versions below are the minimums tested.
 
 **You do not need:** a system-installed Python, PostgreSQL, or Neo4j — Docker and `uv` provide them.
 
-> The app **degrades gracefully**: it starts and serves requests even when Neo4j, Postgres, Qdrant, the OpenAI key, or Langfuse are absent — you just lose that layer's features (persistence, history, tool research, tracing). The only hard requirement for *real* (non-stub) estimates is `ANTHROPIC_API_KEY`.
+> The app **degrades gracefully**: it starts and serves requests even when Neo4j, Postgres, Qdrant, or the OpenAI key are absent — you just lose that layer's features (persistence, history, tool research). The only hard requirement for *real* (non-stub) estimates is `ANTHROPIC_API_KEY`.
 
 ---
 
@@ -80,8 +79,7 @@ Now open `.env` and set the values:
 
 ### Optional
 
-- **`OPENAI_API_KEY`** — set it to enable docs-mcp-server tool research ([§8](#8-optional-tooling-research-via-docs-mcp-server)) and the eval judge. Leave blank otherwise (unknown AI tools then map to "none").
-- **`COMPOSE_PROFILES`** — leave **blank** to keep the optional Langfuse stack off. Set to `langfuse` to enable it ([§7](#7-optional-enable-the-langfuse-tracing-stack)).
+- **`OPENAI_API_KEY`** — set it to enable docs-mcp-server tool research ([§7](#7-optional-tooling-research-via-docs-mcp-server)) and the eval judge. Leave blank otherwise (unknown AI tools then map to "none").
 - **Model tiers** (`ANTHROPIC_MODEL`, `ANTHROPIC_MODEL_PREFILL`, `ANTHROPIC_MODEL_ROSTER`, `ANTHROPIC_MODEL_MERGE`, `ANTHROPIC_MODEL_TOOLING`, `ANTHROPIC_MODEL_WBS`) — sensible defaults are set; override only if you want different models.
 - **`WBS_EFFORT_SCALE`** — global multiplier on the WBS bottom-up realism factor (default `1.0`).
 
@@ -183,7 +181,7 @@ Everything runs in Docker — no host Python/Node needed beyond Docker itself.
 docker compose up -d --build
 ```
 
-This builds and starts the default services: **neo4j, postgres, qdrant, docs-mcp-server, estimator-backend, estimator-frontend**. (The Langfuse stack stays off unless you enabled the profile — see [§7](#7-optional-enable-the-langfuse-tracing-stack).)
+This builds and starts the default services: **neo4j, postgres, qdrant, docs-mcp-server, estimator-backend, estimator-frontend**.
 
 First build takes a few minutes. Then confirm everything is up:
 
@@ -233,40 +231,7 @@ Past estimates appear on the landing dashboard and can be reopened.
 
 ---
 
-## 7. (Optional) Enable the Langfuse tracing stack
-
-Langfuse (self-hosted LLM observability) is **off by default**. The rest of the app works fine without it — `@traced` no-ops when keys are absent.
-
-1. **Enable the profile** in `.env`:
-   ```bash
-   COMPOSE_PROFILES=langfuse
-   ```
-2. **Rotate the Langfuse secrets** in `.env` before anything non-throwaway:
-   ```bash
-   openssl rand -hex 32      # -> LANGFUSE_ENCRYPTION_KEY (must be 64 hex chars)
-   openssl rand -base64 32   # -> LANGFUSE_NEXTAUTH_SECRET   (run again for LANGFUSE_SALT)
-   ```
-3. **Bring up the stack** (the profile is read from `.env`):
-   ```bash
-   docker compose up -d --build
-   ```
-   This adds `langfuse-web`, `langfuse-worker`, ClickHouse, Redis, MinIO, and a one-shot `minio-init`.
-4. **First-run setup** (once):
-   1. Open http://localhost:3100 → sign up → create an org → create a project.
-   2. Project settings → **API keys** → "Create new API key".
-   3. Paste `pk-lf-...` / `sk-lf-...` into `.env` as `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`.
-   4. Restart the backend so it picks them up:
-      ```bash
-      docker compose restart estimator-backend   # Docker stack
-      # or, for local dev (Path A), just restart `make be`
-      ```
-   *(Alternative: set the `LANGFUSE_INIT_*` vars in `.env` to seed an org/project/user on first boot and skip the UI signup.)*
-
-Langfuse UI: http://localhost:3100. MinIO console: http://localhost:9021.
-
----
-
-## 8. (Optional) Tooling research via docs-mcp-server
+## 7. (Optional) Tooling research via docs-mcp-server
 
 The `docs-mcp-server` container (started by default on `:6280`) lets the Stage-3 tooling classifier research AI tools it doesn't recognize. For it to **return or index anything it must have an embeddings provider**:
 
@@ -278,7 +243,7 @@ This is purely an enrichment step; everything works without it.
 
 ---
 
-## 9. Database migrations
+## 8. Database migrations
 
 Migrations run **automatically** on backend startup when `POSTGRES_MIGRATE_ON_START=true` (the default), so for normal use you don't need to do anything.
 
@@ -295,7 +260,7 @@ Set `POSTGRES_MIGRATE_ON_START=false` if you prefer to run migrations out-of-ban
 
 ---
 
-## 10. Running the tests
+## 9. Running the tests
 
 ### Backend (pytest, ruff, mypy)
 
@@ -331,7 +296,7 @@ make evals                          # uses ANTHROPIC_MODEL_EVAL as judge
 
 ---
 
-## 11. Ports reference
+## 10. Ports reference
 
 | Service | Host port(s) | URL / use |
 |---|---|---|
@@ -341,13 +306,10 @@ make evals                          # uses ANTHROPIC_MODEL_EVAL as judge
 | Postgres | `5432` | `postgresql://estimator:…@localhost:5432/estimator` |
 | Qdrant | `6333`, `6334` | REST `6333` · gRPC `6334` (scaffolded, unused in MVP) |
 | docs-mcp-server | `6280` | MCP over HTTP at `/mcp` |
-| Langfuse web **(optional)** | `3100` | http://localhost:3100 |
-| ClickHouse **(optional)** | `8123` | Langfuse event store HTTP |
-| MinIO **(optional)** | `9020`, `9021` | S3 API `9020` · console http://localhost:9021 |
 
 ---
 
-## 12. Command cheatsheet
+## 11. Command cheatsheet
 
 Driven from the root `Makefile`:
 
@@ -378,7 +340,7 @@ docker compose down                                          # stop everything
 
 ---
 
-## 13. Stopping and cleaning up
+## 12. Stopping and cleaning up
 
 ```bash
 make down            # stop containers (keeps data)
@@ -394,11 +356,11 @@ Full reset (⚠️ destructive):
 make clean           # docker compose down -v  — removes named Docker volumes (e.g. Qdrant)
 ```
 
-> **Note on data:** the stateful services (Neo4j, Postgres, and the Langfuse stack's ClickHouse/Redis/MinIO) **bind-mount under `./data/`** rather than using named volumes. `make clean` / `down -v` does **not** wipe `./data/`. For a truly fresh database, delete the relevant directory manually, e.g. `rm -rf ./data/neo4j ./data/postgres`.
+> **Note on data:** the stateful services (Neo4j and Postgres) **bind-mount under `./data/`** rather than using named volumes. `make clean` / `down -v` does **not** wipe `./data/`. For a truly fresh database, delete the relevant directory manually, e.g. `rm -rf ./data/neo4j ./data/postgres`.
 
 ---
 
-## 14. Troubleshooting
+## 13. Troubleshooting
 
 - **`docker compose: command not found`** — you have the old standalone `docker-compose`. Install Docker Compose v2 (bundled with recent Docker Desktop / the `docker-compose-plugin`). All commands here use `docker compose` (with a space).
 - **Port already in use (`3000`/`8000`/`5432`/`7687`/`6280`)** — another process (or a stray container) holds the port. Find it (`lsof -i :8000`) and stop it, or change the host-side port mapping in `docker-compose.yml`. A common cause in Path A is having run `make up` (which also starts the dockerized apps); use the datastores-only command from [§4.1](#41-start-the-datastores-only) instead, or `docker compose stop estimator-backend estimator-frontend`.
@@ -410,8 +372,7 @@ make clean           # docker compose down -v  — removes named Docker volumes 
 - **Frontend can't reach the backend in Docker** — `NEXT_PUBLIC_API_URL` must be `http://localhost:8000` (browser-reachable), never the internal service name. It's build-time, so rebuild the frontend image after changing it.
 - **Next.js build fails on `useSearchParams()`** — wrap the page in `<Suspense>` (existing pages show the pattern).
 - **Backend logs "Alembic upgrade failed"** — startup logs it but doesn't crash. Run `cd backend && uv run alembic upgrade head` manually to see the error.
-- **`langfuse-web` 500s on first load / `password authentication failed` for `estimator`** — the Langfuse metadata DB wasn't created (the Postgres init script only runs on a *fresh* `./data/postgres` volume). Create it manually: `docker exec sdlc-postgres psql -U estimator -c "CREATE DATABASE langfuse;"` then `docker compose restart langfuse-web langfuse-worker`.
-- **Tooling classifier maps every tool to "none"** — docs-mcp-server is unreachable/timed out, or has no `OPENAI_API_KEY` to embed/search with. This is the safe fallback; the estimate still completes. See [§8](#8-optional-tooling-research-via-docs-mcp-server).
+- **Tooling classifier maps every tool to "none"** — docs-mcp-server is unreachable/timed out, or has no `OPENAI_API_KEY` to embed/search with. This is the safe fallback; the estimate still completes. See [§7](#7-optional-tooling-research-via-docs-mcp-server).
 
 ---
 

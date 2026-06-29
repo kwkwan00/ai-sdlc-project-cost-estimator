@@ -44,6 +44,9 @@ async def create_estimate(req: CreateEstimateRequest) -> EstimateEnvelope:
         created_at=datetime.now(UTC),
     )
     runtime.register_envelope(estimate_id, env, with_event_stream=True)
+    # Tie the wizard's pre-submission LLM calls (prefill/roster/tooling) to this estimate, so they're
+    # associated with it in the llm_call table when it persists (Observability).
+    runtime.register_wizard_session(estimate_id, req.session_id)
 
     initial_state: dict[str, Any] = {
         "estimate_id": estimate_id,

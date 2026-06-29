@@ -21,3 +21,22 @@ describe("buildCreatePayload — selected_phases", () => {
     expect(payload.selected_phases).toEqual(["development", "qa_testing"]);
   });
 });
+
+describe("buildCreatePayload — session_id", () => {
+  it("carries the wizard-run session id so pre-submission LLM calls associate with the estimate", () => {
+    const payload = buildCreatePayload(
+      "Build an internal tool.",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "sess-abc"
+    );
+    expect(payload.session_id).toBe("sess-abc");
+  });
+
+  it("omits session_id (undefined) when none is given", () => {
+    const payload = buildCreatePayload("Build an internal tool.", undefined, undefined, undefined);
+    expect(payload.session_id).toBeUndefined();
+  });
+});

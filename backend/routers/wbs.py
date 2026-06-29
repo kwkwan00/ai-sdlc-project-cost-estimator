@@ -34,6 +34,8 @@ from fastapi.responses import StreamingResponse
 
 import runtime
 from agents.wbs_agent import generate_wbs_tree, generate_wbs_tree_streamed
+from agents.wbs_completeness import check_completeness
+from agents.wbs_leaf_estimator import suggest_leaf_hours
 from db.neo4j_adapter import (
     delete_wbs_draft,
     get_driver,
@@ -51,16 +53,22 @@ from models.project_schema import (
 from models.twin_outputs import DualScenarioEstimate, LlmUsage
 from models.wbs_schema import (
     WbsCalculateRequest,
+    WbsCompletenessRequest,
+    WbsCompletenessResponse,
     WbsDraft,
     WbsDraftList,
     WbsDraftRequest,
     WbsDraftResponse,
     WbsDraftSaveRequest,
     WbsDraftSummary,
+    WbsLeafHoursRequest,
+    WbsLeafHoursSuggestion,
+    WbsReconciliation,
     _sanitize_dependencies,
 )
 from models.wbs_task import WbsTaskInput, flatten_tree, rebuild_tree, regenerate_ids
-from orchestrator.usage import bind_usage_accumulator, summarize_usage
+from orchestrator.reconcile import parametric_estimate, reconcile
+from orchestrator.usage import bind_usage_accumulator, capture_usage_to_db, summarize_usage
 from orchestrator.wbs.rollup import build_wbs_estimate
 
 logger = logging.getLogger(__name__)
@@ -450,6 +458,64 @@ async def preview_wbs(req: WbsCalculateRequest) -> DualScenarioEstimate:
     return await build_wbs_estimate(req, estimate_id=seed)
 
 
+@router.post("/estimates/wbs/reconcile", response_model=WbsReconciliation)
+async def reconcile_wbs(req: WbsCalculateRequest) -> WbsReconciliation:
+    """Triangulate the bottom-up WBS rollup against a parametric (twin) estimate of the SAME brief
+    and return the per-phase + total divergence — a sanity check for omitted work (WBS below
+    parametric) or double-counting (WBS above). On-demand (explicit user action): runs the six twins'
+    Pass-1 + parse_input (~7 LLM calls), so it's a separate button, not part of Re-evaluate. The
+    parametric token cost is returned in the response AND persisted to `llm_call` so it shows in global
+    Observability (stamped with the wizard `session_id` to reparent onto the estimate on commit).
+    Degrades to a structural-only comparison (``parametric_available=false``) with no API key."""
+    from config import get_settings
+    from observability.correlation import bind_estimate_id
+
+    seed = _stable_seed(req)
+    bind_estimate_id(f"wbs-reconcile:{seed}")
+    wbs = await build_wbs_estimate(req, estimate_id=seed)
+
+    # `capture_usage_to_db` binds the accumulator, persists the parametric twins' per-call cost to
+    # `llm_call` (no estimate id yet — the wizard `session_id` reparents it onto the estimate on
+    # commit), and never-raises; we `summarize_usage` the yielded accumulator for the response too.
+    async with capture_usage_to_db(session_id=req.session_id) as acc:
+        parametric = await parametric_estimate(req)
+        return reconcile(
+            wbs,
+            parametric,
+            parametric_available=bool(get_settings().anthropic_api_key),
+            llm_usage=summarize_usage(acc) if acc else None,
+        )
+
+
+@router.post("/estimates/wbs/completeness", response_model=WbsCompletenessResponse)
+async def wbs_completeness(req: WbsCompletenessRequest) -> WbsCompletenessResponse:
+    """Audit the tree for OMITTED work — the editor's "Check completeness" button. Catches WITHIN-phase
+    omission (a present phase missing a specific task, e.g. no data-migration/security-review) that the
+    totals-only reconciliation can't see. One streamed LLM call (cheaper than Reconcile); the token
+    cost is returned AND persisted to `llm_call` so it shows in global Observability. Degrades to an
+    empty result (no findings) without an API key — never errors."""
+    # capture_usage_to_db binds + persists the call cost (reparented onto the estimate on commit via
+    # the wizard session_id) and yields the accumulator so we also surface it on the response.
+    async with capture_usage_to_db(session_id=req.session_id) as acc:
+        resp = await check_completeness(req)
+        resp.llm_usage = summarize_usage(acc) if acc else None
+        return resp
+
+
+@router.post("/estimates/wbs/suggest-hours", response_model=WbsLeafHoursSuggestion)
+async def wbs_suggest_hours(req: WbsLeafHoursRequest) -> WbsLeafHoursSuggestion:
+    """Suggest a 3-point estimate for ONE leaf — the editor's per-task "Suggest hours" button (#5c).
+    Grounded in the brief + the leaf's package/siblings so it stays proportionate to the rest of the
+    tree. The token cost is returned AND persisted to `llm_call` (global Observability), like the
+    completeness critic. Degrades to `available=false` (no suggestion) without an API key — never
+    errors."""
+    # Same usage capture+persist seam as completeness/reconcile (see capture_usage_to_db).
+    async with capture_usage_to_db(session_id=req.session_id) as acc:
+        resp = await suggest_leaf_hours(req)
+        resp.llm_usage = summarize_usage(acc) if acc else None
+        return resp
+
+
 @router.post("/estimates/wbs", response_model=EstimateEnvelope)
 async def calculate_wbs(req: WbsCalculateRequest) -> EstimateEnvelope:
     """Commit a WBS estimate: roll up, persist (Postgres history + Neo4j graph), retire the draft.
@@ -471,6 +537,10 @@ async def calculate_wbs(req: WbsCalculateRequest) -> EstimateEnvelope:
     # Identity is the fresh uuid above; the MC seed is the SAME stable value preview used, so
     # the committed numbers match what the user re-evaluated for this tree (see _stable_seed).
     final = await build_wbs_estimate(req, estimate_id=_stable_seed(req))
+    # Carry the planner-draft LLM cost onto the final estimate so it surfaces in the global
+    # observability view (the deterministic rollup spends no tokens of its own).
+    if req.llm_usage is not None:
+        final = final.model_copy(update={"llm_usage": req.llm_usage})
     env = EstimateEnvelope(
         estimate_id=estimate_id,
         project_name=req.project_name or "Untitled WBS estimate",
@@ -489,7 +559,9 @@ async def calculate_wbs(req: WbsCalculateRequest) -> EstimateEnvelope:
     # subgraph + calibration refresh, the SAME contract as the twin flow (no duplication). Run it
     # concurrently with retiring the source draft.
     persists: list = [
-        runtime.persist_completed_estimate(env, stage2=req.stage2, stage3=req.stage3, wbs_tree=req.tree),
+        runtime.persist_completed_estimate(
+            env, stage2=req.stage2, stage3=req.stage3, wbs_tree=req.tree, session_id=req.session_id
+        ),
     ]
     if req.draft_id:
         persists.append(delete_wbs_draft(req.draft_id))

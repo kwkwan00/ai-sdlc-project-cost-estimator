@@ -68,7 +68,7 @@ function mkEstimate(withPercentiles = false, low = 16, high = 24): DualScenarioE
     optimal_team_size: 8,
     total_cost_ai_assisted_usd: 0,
     total_cost_manual_only_usd: 0,
-    llm_usage: { call_count: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cost_usd: 0, by_model: [] },
+    llm_usage: { call_count: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cost_usd: 0, by_model: [], by_agent: [] },
   };
 }
 

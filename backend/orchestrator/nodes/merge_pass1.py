@@ -18,14 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from config import get_settings
 from models.estimation_state import EstimationState
 from models.twin_outputs import ClarifyingQuestion, Gap, Phase
-from observability.langfuse_wrapper import traced
 from orchestrator.llm import call_structured
 from orchestrator.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
 
 _MAX_QUESTIONS = 10
-_MIN_QUESTIONS = 0  # zero is OK if every twin had no gaps
 # Only worth an LLM round-trip when there are enough candidates to plausibly overlap.
 _MIN_CANDIDATES_FOR_LLM = 3
 
@@ -181,7 +179,6 @@ async def _consolidate_semantically(
     return merged
 
 
-@traced(name="merge_pass1")
 async def merge_pass1(state: EstimationState) -> dict:
     pass1 = state.get("pass1_estimates", [])
     grouped = _dedupe_gaps(pass1)

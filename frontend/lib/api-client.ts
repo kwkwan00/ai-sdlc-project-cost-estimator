@@ -9,10 +9,15 @@ import type {
 import type {
   DualScenarioEstimate,
   EstimateEnvelope,
+  LlmObservability,
+  LlmUsage,
   Phase,
   SowDocument,
   SowGenerateResponse,
   SowScenario,
+  WbsCompletenessResponse,
+  WbsLeafHoursSuggestion,
+  WbsReconciliation,
 } from "./types";
 import type {
   WbsDraft,
@@ -79,11 +84,12 @@ export async function createEstimate(
  *  only error case is a network failure — callers should treat that as
  *  "skip prefill, continue with blank Stage 2". */
 export async function prefillFromDescription(
-  rawInput: string
+  rawInput: string,
+  sessionId?: string
 ): Promise<Stage2Prefill> {
   return jsonFetch("/estimates/draft/prefill", {
     method: "POST",
-    body: JSON.stringify({ raw_input: rawInput }),
+    body: JSON.stringify({ raw_input: rawInput, session_id: sessionId }),
   });
 }
 
@@ -92,11 +98,12 @@ export async function prefillFromDescription(
  *  LLM/MCP failure), so the only error case is a network failure — callers should
  *  treat that as "continue with no AI tooling". */
 export async function classifyTooling(
-  description: string
+  description: string,
+  sessionId?: string
 ): Promise<ClassifyToolingResponse> {
   return jsonFetch("/estimates/draft/classify-tooling", {
     method: "POST",
-    body: JSON.stringify({ description }),
+    body: JSON.stringify({ description, session_id: sessionId }),
   });
 }
 
@@ -408,6 +415,11 @@ export interface WbsCalculateInput {
   stage3?: Stage3Input;
   // Explicit WBS contingency reserve %; omitted ⇒ backend applies the 30% WBS default.
   contingency_pct?: number;
+  // The planner-draft LLM cost, carried through commit so it lands on the estimate's observability.
+  llm_usage?: LlmUsage | null;
+  // The wizard-run UUID — associates this estimate with its pre-submission roster/tooling LLM calls
+  // (the WBS team page) in the Observability breakdown. Ignored by the preview endpoint.
+  session_id?: string;
 }
 
 export interface WbsDraftSaveInput {
@@ -477,13 +489,51 @@ export async function calculateWbs(body: WbsCalculateInput): Promise<EstimateEnv
   return jsonFetch("/estimates/wbs", { method: "POST", body: JSON.stringify(body) });
 }
 
+/** Triangulate the bottom-up tree against a parametric (twin) estimate of the same brief — surfaces
+ *  omitted-work / double-count signals. On-demand (runs the twins' Pass-1 ≈ 7 LLM calls), so call it
+ *  from an explicit button, not on every keystroke. Same body as preview/commit. */
+export async function reconcileWbs(body: WbsCalculateInput): Promise<WbsReconciliation> {
+  return jsonFetch("/estimates/wbs/reconcile", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Audit the tree for OMITTED work (within-phase tasks the WBS forgot) — the editor's "Check
+ *  completeness" button. One LLM call; degrades to an empty list without an API key. */
+export async function checkWbsCompleteness(body: {
+  raw_input?: string;
+  tree: WbsTaskInput[];
+  stage2?: Stage2Input;
+  stage3?: Stage3Input;
+  session_id?: string;
+}): Promise<WbsCompletenessResponse> {
+  return jsonFetch("/estimates/wbs/completeness", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Suggest a 3-point estimate for ONE leaf — the editor's per-task "Suggest hours" button (#5c).
+ *  `available` is false without an API key; the caller only applies the numbers when true. */
+export async function suggestWbsLeafHours(body: {
+  raw_input?: string;
+  tree: WbsTaskInput[];
+  leaf_id: string;
+  stage2?: Stage2Input;
+  stage3?: Stage3Input;
+  session_id?: string;
+}): Promise<WbsLeafHoursSuggestion> {
+  return jsonFetch("/estimates/wbs/suggest-hours", { method: "POST", body: JSON.stringify(body) });
+}
+
+/** Aggregate LLM cost/usage across all persisted estimates — backs the top-level Observability page. */
+export async function getLlmObservability(): Promise<LlmObservability> {
+  return jsonFetch("/observability/llm-usage");
+}
+
 /** Helper for the wizard: pack Stage 2/3 into the create payload. */
 export function buildCreatePayload(
   rawInput: string,
   projectName: string | undefined,
   stage2: Stage2Input | undefined,
   stage3: Stage3Input | undefined,
-  selectedPhases?: Phase[]
+  selectedPhases?: Phase[],
+  sessionId?: string
 ): CreateEstimateInput {
   return {
     raw_input: rawInput,
@@ -493,5 +543,6 @@ export function buildCreatePayload(
     // Omitted (undefined) ⇒ the backend estimates all six phases. Callers pass undefined when
     // every phase is selected so the request stays identical to the pre-feature shape.
     selected_phases: selectedPhases,
+    session_id: sessionId,
   };
 }

@@ -201,6 +201,9 @@ export const createEstimateSchema = z.object({
   // Subset of phases to estimate; omitted ⇒ all six. The wizard sends `undefined` when the user
   // leaves every phase selected, so existing estimate requests stay byte-identical.
   selected_phases: z.array(phaseEnum).optional(),
+  // The wizard-run UUID — associates this estimate with its pre-submission prefill/roster/tooling
+  // LLM calls in the Observability breakdown.
+  session_id: z.string().optional(),
 });
 
 export type Stage1Input = z.infer<typeof stage1Schema>;

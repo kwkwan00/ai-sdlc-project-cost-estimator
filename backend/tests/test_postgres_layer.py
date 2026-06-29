@@ -105,8 +105,10 @@ def _make_envelope(
     status: EstimateStatus = EstimateStatus.COMPLETED,
     include_final: bool = True,
     phase_pairs: list[tuple[Phase, float, float]] | None = None,
+    method: str = "twins",
 ) -> EstimateEnvelope:
-    """Build a minimal EstimateEnvelope suitable for save_estimate_history."""
+    """Build a minimal EstimateEnvelope suitable for save_estimate_history. `method="wbs"` attaches a
+    minimal tree so the envelope's method↔wbs_tree lockstep validator passes."""
     pairs = phase_pairs or [
         (Phase.DISCOVERY, 100.0, 150.0),
         (Phase.DEVELOPMENT, 1200.0, 1800.0),
@@ -163,13 +165,25 @@ def _make_envelope(
         if include_final
         else None
     )
+    extra: dict = {}
+    if method == "wbs":
+        from models.wbs_task import WbsTaskInput
+
+        extra["wbs_tree"] = [
+            WbsTaskInput(
+                id="l", name="l", phase=Phase.DEVELOPMENT, role_id="sr_engineer",
+                optimistic=1, most_likely=2, pessimistic=3,
+            )
+        ]
     return EstimateEnvelope(
         estimate_id=estimate_id,
         project_name="Test project",
         status=status,
+        method=method,
         created_at=datetime.utcnow(),
         pass2_estimates=phases,
         final_estimate=final,
+        **extra,
     )
 
 
@@ -255,6 +269,7 @@ async def test_history_list_and_envelope_roundtrip(in_memory_db) -> None:
     assert item["estimate_id"] == env.estimate_id
     assert item["status"] == EstimateStatus.COMPLETED.value
     assert item["total_ai_assisted_hours"] == pytest.approx(1300.0)
+    assert item["method"] == "twins"
     assert item["created_at"] is not None
 
     # The stored envelope JSON round-trips back to a full EstimateEnvelope for redisplay.
@@ -265,6 +280,352 @@ async def test_history_list_and_envelope_roundtrip(in_memory_db) -> None:
     assert restored.final_estimate is not None
     assert env.final_estimate is not None
     assert len(restored.final_estimate.phases) == len(env.final_estimate.phases)
+
+
+@pytest.mark.asyncio
+async def test_history_list_method_comes_from_column(in_memory_db) -> None:
+    # The dashboard list reads the authoritative estimate_history.method column (0017), same as
+    # Observability — not the envelope_json blob — so the two pages can't disagree on the flow badge.
+    await save_estimate_history(
+        _make_envelope(estimate_id="wbs-list", method="wbs"), stage2=None, stage3=None
+    )
+    items = await list_estimate_history()
+    assert {i["estimate_id"]: i["method"] for i in items}["wbs-list"] == "wbs"
+
+
+@pytest.mark.asyncio
+async def test_aggregate_llm_usage_from_call_rows(in_memory_db) -> None:
+    # Backs the Observability page: the grand total + by_model + by_agent are SUM/GROUP BY over the
+    # per-call `llm_call` table (DB-side), and the per-estimate breakdown is assembled from a
+    # per-(estimate, agent) GROUP BY. Estimates with no calls don't appear.
+    from db.repositories import aggregate_llm_usage, save_llm_calls
+
+    for est_id in ("agg-1", "agg-2", "agg-3"):
+        method = "wbs" if est_id == "agg-2" else "twins"
+        await save_estimate_history(
+            _make_envelope(estimate_id=est_id, method=method), stage2=None, stage3=None
+        )
+
+    await save_llm_calls("agg-1", [
+        {"agent": "submit_cocomo_assessment", "model": "claude-sonnet-4-6", "input_tokens": 1000,
+         "output_tokens": 400, "cache_read_tokens": 0, "cost_usd": 0.09, "called_at": "2026-06-26T12:00:00+00:00"},
+        {"agent": "submit_cocomo_assessment", "model": "claude-sonnet-4-6", "input_tokens": 500,
+         "output_tokens": 100, "cache_read_tokens": 0, "cost_usd": 0.03, "called_at": "2026-06-26T12:00:05+00:00"},
+        {"agent": "propose_team_roster", "model": "claude-sonnet-4-6", "input_tokens": 200,
+         "output_tokens": 50, "cache_read_tokens": 0, "cost_usd": 0.01, "called_at": "2026-06-26T11:59:00+00:00"},
+    ])
+    await save_llm_calls("agg-2", [
+        {"agent": "propose_wbs", "model": "claude-sonnet-4-6", "input_tokens": 300,
+         "output_tokens": 60, "cache_read_tokens": 0, "cost_usd": 0.02, "called_at": "2026-06-26T10:00:00+00:00"},
+    ])
+    # agg-3 has a history row but no calls → excluded from the breakdown.
+
+    agg = await aggregate_llm_usage()
+    total = agg["total"]
+    assert total["call_count"] == 4
+    assert total["input_tokens"] == 2000
+    assert total["cost_usd"] == pytest.approx(0.15)
+    by_agent = {a["agent"]: a for a in total["by_agent"]}
+    assert set(by_agent) == {"submit_cocomo_assessment", "propose_team_roster", "propose_wbs"}
+    assert by_agent["submit_cocomo_assessment"]["calls"] == 2  # GROUP BY agent folded its 2 calls
+    assert [m["model"] for m in total["by_model"]] == ["claude-sonnet-4-6"]
+    assert total["by_model"][0]["calls"] == 4
+
+    by_est = {e["estimate_id"]: e for e in agg["by_estimate"]}
+    assert set(by_est) == {"agg-1", "agg-2"}  # agg-3 (no calls) absent
+    e1 = by_est["agg-1"]
+    assert e1["method"] == "twins"
+    assert e1["created_at"]  # the estimate's own timestamp
+    e1_agents = {a["agent"]: a for a in e1["llm_usage"]["by_agent"]}
+    assert e1_agents["submit_cocomo_assessment"]["calls"] == 2
+    # The agent's call span (MIN/MAX of its call timestamps) is present + ordered.
+    dev = e1_agents["submit_cocomo_assessment"]
+    assert dev["started_at"] is not None and dev["finished_at"] is not None
+    assert dev["started_at"] <= dev["finished_at"]
+    # agg-2 was saved as a WBS estimate → flow read from the estimate_history.method column.
+    assert by_est["agg-2"]["method"] == "wbs"
+
+
+@pytest.mark.asyncio
+async def test_by_estimate_method_comes_from_column_not_agent_inference(in_memory_db) -> None:
+    # Regression: the flow label must come from estimate_history.method, NOT from whether a
+    # `propose_wbs` agent row was captured. A WBS estimate whose planner usage wasn't persisted (only
+    # a reparented roster call) must STILL show as "wbs", not fall back to "twins".
+    from db.repositories import aggregate_llm_usage, save_llm_calls
+
+    await save_estimate_history(
+        _make_envelope(estimate_id="wbs-no-planner", method="wbs"), stage2=None, stage3=None
+    )
+    await save_llm_calls("wbs-no-planner", [
+        {"agent": "propose_team_roster", "model": "claude-sonnet-4-6", "input_tokens": 200,
+         "output_tokens": 50, "cache_read_tokens": 0, "cost_usd": 0.01, "called_at": "2026-06-26T11:00:00+00:00"},
+    ])
+
+    by_est = {e["estimate_id"]: e for e in (await aggregate_llm_usage())["by_estimate"]}
+    assert by_est["wbs-no-planner"]["method"] == "wbs"  # no propose_wbs row, still labeled wbs
+
+
+@pytest.mark.asyncio
+async def test_by_estimate_folds_one_agent_across_two_models(in_memory_db) -> None:
+    # _by_estimate groups by (estimate_id, agent, model); the per-estimate by_agent must fold those
+    # back to ONE row per agent (else the Observability table renders duplicate React keys).
+    from db.repositories import aggregate_llm_usage, save_llm_calls
+
+    await save_estimate_history(_make_envelope(estimate_id="two-model"), stage2=None, stage3=None)
+    await save_llm_calls("two-model", [
+        {"agent": "submit_cocomo_assessment", "model": "claude-sonnet-4-6", "input_tokens": 100,
+         "output_tokens": 40, "cache_read_tokens": 0, "cost_usd": 0.05, "called_at": "2026-06-26T12:00:00+00:00"},
+        {"agent": "submit_cocomo_assessment", "model": "claude-opus-4-8", "input_tokens": 200,
+         "output_tokens": 80, "cache_read_tokens": 0, "cost_usd": 0.20, "called_at": "2026-06-26T12:05:00+00:00"},
+    ])
+
+    by_est = {e["estimate_id"]: e for e in (await aggregate_llm_usage())["by_estimate"]}
+    agents = by_est["two-model"]["llm_usage"]["by_agent"]
+    rows = [a for a in agents if a["agent"] == "submit_cocomo_assessment"]
+    assert len(rows) == 1  # folded, not two rows
+    assert rows[0]["calls"] == 2
+    assert rows[0]["cost_usd"] == pytest.approx(0.25)
+    # Span widened across both calls.
+    assert rows[0]["started_at"] <= rows[0]["finished_at"]
+
+
+@pytest.mark.asyncio
+async def test_aggregate_llm_usage_empty_when_postgres_off(monkeypatch) -> None:
+    # No in_memory_db fixture → session_scope yields None → empty case, never raises.
+    from db.repositories import aggregate_llm_usage
+
+    postgres_adapter._reset_for_tests()
+    # Force Postgres OFF regardless of the dev's root .env: _reset_for_tests only clears the cached
+    # engine, so get_sessionmaker() would otherwise lazily rebuild a LIVE engine from POSTGRES_PASSWORD
+    # and these "empty" assertions would hit real rows in a populated local/CI DB.
+    monkeypatch.setattr(postgres_adapter, "get_sessionmaker", lambda: None)
+    agg = await aggregate_llm_usage()
+    assert agg["by_estimate"] == []
+    assert agg["total"]["call_count"] == 0
+    assert agg["total"]["by_model"] == []
+    assert agg["total"]["by_agent"] == []
+
+
+@pytest.mark.asyncio
+async def test_save_llm_calls_replaces_rows_and_cascades(in_memory_db) -> None:
+    # save_llm_calls is replace-on-save (like phase rows); a re-save supersedes prior rows.
+    from db.repositories import aggregate_llm_usage, save_llm_calls
+
+    await save_estimate_history(_make_envelope(estimate_id="rep-1"), stage2=None, stage3=None)
+    await save_llm_calls("rep-1", [
+        {"agent": "a", "model": "m", "input_tokens": 10, "output_tokens": 5,
+         "cache_read_tokens": 0, "cost_usd": 0.01, "called_at": "2026-06-26T12:00:00+00:00"},
+    ])
+    await save_llm_calls("rep-1", [  # replaces the prior row
+        {"agent": "b", "model": "m", "input_tokens": 20, "output_tokens": 8,
+         "cache_read_tokens": 0, "cost_usd": 0.02, "called_at": "2026-06-26T12:01:00+00:00"},
+    ])
+    total = (await aggregate_llm_usage())["total"]
+    assert total["call_count"] == 1
+    assert {a["agent"] for a in total["by_agent"]} == {"b"}
+
+
+@pytest.mark.asyncio
+async def test_presubmission_calls_count_in_total_not_per_estimate(in_memory_db) -> None:
+    # Pre-submission agent calls (roster/prefill/tooling) run before an estimate exists → persisted
+    # with NO estimate id. They count toward the grand total + by_agent, but the per-estimate rollup
+    # (which inner-joins on estimate_id) excludes them.
+    from db.repositories import aggregate_llm_usage, insert_llm_calls, save_llm_calls
+
+    await save_estimate_history(_make_envelope(estimate_id="est-1"), stage2=None, stage3=None)
+    await save_llm_calls("est-1", [
+        {"agent": "submit_cocomo_assessment", "model": "m", "input_tokens": 100, "output_tokens": 50,
+         "cache_read_tokens": 0, "cost_usd": 0.05, "called_at": "2026-06-26T12:00:00+00:00"},
+    ])
+    await insert_llm_calls([  # a pre-submission roster call, no estimate id
+        {"agent": "propose_team_roster", "model": "m", "input_tokens": 200, "output_tokens": 80,
+         "cache_read_tokens": 0, "cost_usd": 0.03, "called_at": "2026-06-26T11:00:00+00:00"},
+    ])
+
+    agg = await aggregate_llm_usage()
+    assert agg["total"]["call_count"] == 2  # both counted in the grand total
+    assert "propose_team_roster" in {a["agent"] for a in agg["total"]["by_agent"]}
+    # Per-estimate rollup has only est-1; the orphan roster call isn't tied to an estimate.
+    by_est = {e["estimate_id"]: e for e in agg["by_estimate"]}
+    assert set(by_est) == {"est-1"}
+    assert "propose_team_roster" not in {
+        a["agent"] for a in by_est["est-1"]["llm_usage"]["by_agent"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_associate_llm_calls_reparents_session_rows_to_estimate(in_memory_db) -> None:
+    # A pre-submission call persisted with the wizard-run session id but no estimate id gets
+    # reparented to the estimate once it exists, so it shows in that estimate's per-agent rollup.
+    from db.repositories import (
+        aggregate_llm_usage,
+        associate_llm_calls,
+        insert_llm_calls,
+        save_llm_calls,
+    )
+
+    await save_estimate_history(_make_envelope(estimate_id="est-assoc"), stage2=None, stage3=None)
+    await save_llm_calls("est-assoc", [
+        {"agent": "submit_cocomo_assessment", "model": "m", "input_tokens": 100, "output_tokens": 50,
+         "cache_read_tokens": 0, "cost_usd": 0.05, "called_at": "2026-06-26T12:00:00+00:00"},
+    ])
+    # Roster call made during the wizard run, before the estimate id existed.
+    await insert_llm_calls(
+        [{"agent": "propose_team_roster", "model": "m", "input_tokens": 200, "output_tokens": 80,
+          "cache_read_tokens": 0, "cost_usd": 0.03, "called_at": "2026-06-26T11:00:00+00:00"}],
+        session_id="wiz-9",
+    )
+
+    # Before association the roster call is an orphan — not under est-assoc.
+    before = {e["estimate_id"]: e for e in (await aggregate_llm_usage())["by_estimate"]}
+    assert "propose_team_roster" not in {
+        a["agent"] for a in before["est-assoc"]["llm_usage"]["by_agent"]
+    }
+
+    await associate_llm_calls("wiz-9", "est-assoc")
+
+    # After association the roster call rolls up under est-assoc (and the grand total is unchanged).
+    agg = await aggregate_llm_usage()
+    assert agg["total"]["call_count"] == 2
+    after = {e["estimate_id"]: e for e in agg["by_estimate"]}
+    assert "propose_team_roster" in {
+        a["agent"] for a in after["est-assoc"]["llm_usage"]["by_agent"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_insert_llm_calls_appends_within_session_never_replaces(in_memory_db) -> None:
+    # Re-running a session-scoped agentic action (Reconcile / Completeness clicked more than once)
+    # APPENDS its calls so the cumulative cost is tracked — it must NOT replace the prior run's rows.
+    # insert_llm_calls is pure-append (unlike save_llm_calls' replace-on-save), so repeated same-session
+    # inserts accumulate, and reparenting on commit moves every accumulated row (drops/duplicates none).
+    from db.repositories import aggregate_llm_usage, associate_llm_calls, insert_llm_calls
+
+    await save_estimate_history(_make_envelope(estimate_id="est-cum"), stage2=None, stage3=None)
+
+    def _reconcile_call(cost: float) -> list[dict]:
+        return [{"agent": "development_architect", "model": "m", "input_tokens": 200,
+                 "output_tokens": 80, "cache_read_tokens": 0, "cost_usd": cost,
+                 "called_at": "2026-06-26T11:00:00+00:00"}]
+
+    await insert_llm_calls(_reconcile_call(0.03), session_id="wiz-cum")   # first Reconcile run
+    await insert_llm_calls(_reconcile_call(0.04), session_id="wiz-cum")   # second run, SAME session
+
+    agg = await aggregate_llm_usage()
+    assert agg["total"]["call_count"] == 2  # both runs counted (cumulative), not collapsed to 1
+    assert agg["total"]["cost_usd"] == pytest.approx(0.07)  # total = sum of both runs
+
+    # On commit the accumulated rows reparent onto the estimate — every row moves, none lost/duplicated.
+    await associate_llm_calls("wiz-cum", "est-cum")
+    agg2 = await aggregate_llm_usage()
+    assert agg2["total"]["call_count"] == 2
+    after = {e["estimate_id"]: e for e in agg2["by_estimate"]}
+    assert "development_architect" in {a["agent"] for a in after["est-cum"]["llm_usage"]["by_agent"]}
+
+
+@pytest.mark.asyncio
+async def test_associate_llm_calls_leaves_other_sessions_untouched(in_memory_db) -> None:
+    # associate_llm_calls only claims rows matching the session id (and only unparented ones) —
+    # a different wizard run's orphan call stays an orphan.
+    from db.repositories import (
+        aggregate_llm_usage,
+        associate_llm_calls,
+        insert_llm_calls,
+    )
+
+    await save_estimate_history(_make_envelope(estimate_id="est-mine"), stage2=None, stage3=None)
+    await insert_llm_calls(
+        [{"agent": "propose_team_roster", "model": "m", "input_tokens": 10, "output_tokens": 4,
+          "cache_read_tokens": 0, "cost_usd": 0.01, "called_at": "2026-06-26T11:00:00+00:00"}],
+        session_id="mine",
+    )
+    await insert_llm_calls(
+        [{"agent": "classify_ai_tooling", "model": "m", "input_tokens": 10, "output_tokens": 4,
+          "cache_read_tokens": 0, "cost_usd": 0.01, "called_at": "2026-06-26T11:05:00+00:00"}],
+        session_id="other",
+    )
+
+    await associate_llm_calls("mine", "est-mine")
+
+    by_est = {e["estimate_id"]: e for e in (await aggregate_llm_usage())["by_estimate"]}
+    agents = {a["agent"] for a in by_est["est-mine"]["llm_usage"]["by_agent"]}
+    assert "propose_team_roster" in agents  # my session's call was claimed
+    assert "classify_ai_tooling" not in agents  # the other session's call was not
+
+
+@pytest.mark.asyncio
+async def test_pass2_repersist_preserves_reparented_presubmission_rows(in_memory_db) -> None:
+    # The two-pass twin flow persists twice (Pass 1 → AWAITING_ANSWERS → Pass 2). Pass 1 saves the
+    # twin rows and reparents the wizard's pre-submission rows; Pass 2 re-persists. save_llm_calls'
+    # delete is scoped to its own (session_id IS NULL) rows, so the reparented prefill/roster/tooling
+    # rows MUST survive the Pass-2 re-persist (regression: a blanket delete-by-estimate_id wiped them).
+    from db.repositories import (
+        aggregate_llm_usage,
+        associate_llm_calls,
+        insert_llm_calls,
+        save_llm_calls,
+    )
+
+    await save_estimate_history(_make_envelope(estimate_id="two-pass"), stage2=None, stage3=None)
+    # Pre-submission roster call made during the wizard run (session id, no estimate yet).
+    await insert_llm_calls(
+        [{"agent": "propose_team_roster", "model": "sonnet", "input_tokens": 200, "output_tokens": 80,
+          "cache_read_tokens": 0, "cost_usd": 0.03, "called_at": "2026-06-26T11:00:00+00:00"}],
+        session_id="wiz-2p",
+    )
+    # Pass 1: save twin rows, then associate the wizard's pre-submission rows onto the estimate.
+    await save_llm_calls("two-pass", [
+        {"agent": "submit_cocomo_assessment", "model": "sonnet", "input_tokens": 100, "output_tokens": 50,
+         "cache_read_tokens": 0, "cost_usd": 0.05, "called_at": "2026-06-26T12:00:00+00:00"},
+    ])
+    await associate_llm_calls("wiz-2p", "two-pass")
+    # Pass 2: re-persist twin rows (supersedes Pass 1's), associate again (idempotent no-op).
+    await save_llm_calls("two-pass", [
+        {"agent": "submit_cocomo_assessment", "model": "sonnet", "input_tokens": 120, "output_tokens": 60,
+         "cache_read_tokens": 0, "cost_usd": 0.06, "called_at": "2026-06-26T13:00:00+00:00"},
+    ])
+    await associate_llm_calls("wiz-2p", "two-pass")
+
+    agg = await aggregate_llm_usage()
+    by_est = {e["estimate_id"]: e for e in agg["by_estimate"]}
+    by_agent = {a["agent"]: a for a in by_est["two-pass"]["llm_usage"]["by_agent"]}
+    # The reparented roster call survived Pass 2, AND the twin row is the single Pass-2 version.
+    assert set(by_agent) == {"submit_cocomo_assessment", "propose_team_roster"}
+    assert by_agent["submit_cocomo_assessment"]["calls"] == 1  # Pass-1 twin row replaced, not duplicated
+    # Grand total: 1 twin + 1 roster = 2 (no leftover Pass-1 twin row, no lost roster row).
+    assert agg["total"]["call_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_estimate_history_removes_llm_call_rows(in_memory_db) -> None:
+    # delete_estimate_history must drop the estimate's llm_call rows too (explicit delete, since SQLite
+    # doesn't enforce the FK cascade) — otherwise they orphan and keep inflating the grand total.
+    from db.repositories import (
+        aggregate_llm_usage,
+        associate_llm_calls,
+        delete_estimate_history,
+        insert_llm_calls,
+        save_llm_calls,
+    )
+
+    await save_estimate_history(_make_envelope(estimate_id="to-delete"), stage2=None, stage3=None)
+    await save_llm_calls("to-delete", [
+        {"agent": "submit_cocomo_assessment", "model": "sonnet", "input_tokens": 100, "output_tokens": 50,
+         "cache_read_tokens": 0, "cost_usd": 0.05, "called_at": "2026-06-26T12:00:00+00:00"},
+    ])
+    await insert_llm_calls(
+        [{"agent": "propose_team_roster", "model": "sonnet", "input_tokens": 200, "output_tokens": 80,
+          "cache_read_tokens": 0, "cost_usd": 0.03, "called_at": "2026-06-26T11:00:00+00:00"}],
+        session_id="wiz-del",
+    )
+    await associate_llm_calls("wiz-del", "to-delete")
+    assert (await aggregate_llm_usage())["total"]["call_count"] == 2
+
+    assert await delete_estimate_history("to-delete") is True
+
+    # No orphan llm_call rows remain — the grand total is back to zero (both the twin row and the
+    # reparented pre-submission row were removed).
+    assert (await aggregate_llm_usage())["total"]["call_count"] == 0
 
 
 @pytest.mark.asyncio

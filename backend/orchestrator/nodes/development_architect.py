@@ -340,5 +340,4 @@ development_pass1, development_pass2 = make_twin_nodes(
     ensemble_aggregate_fn=_aggregate_dev,
     sizing_method_key="development_sizing_method",
     sizing_method_default=DEFAULT_DEV_SIZING_METHOD,
-    trace_name="twin.development",
 )

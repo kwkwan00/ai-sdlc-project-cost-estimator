@@ -6,12 +6,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   calculateWbs,
+  checkWbsCompleteness,
   getWbsDraft,
   previewWbs,
+  reconcileWbs,
   saveWbsDraft,
+  suggestWbsLeafHours,
 } from "@/lib/api-client";
-import { LlmUsageModal } from "@/components/LlmUsageModal";
 import { Modal } from "@/components/Modal";
+import { CompletenessPanel } from "@/components/CompletenessPanel";
+import { ReconciliationPanel } from "@/components/ReconciliationPanel";
 import {
   CODEBASE_CONTEXT_LABELS,
   DEFAULT_ROSTER,
@@ -20,11 +24,25 @@ import {
   type Stage2Input,
   type Stage3Input,
 } from "@/lib/schemas";
-import { formatHours, formatUSD, formatUSDPrecise } from "@/lib/format";
-import type { DualScenarioEstimate, LlmUsage } from "@/lib/types";
+import { formatHours, formatUSD } from "@/lib/format";
+import type {
+  DualScenarioEstimate,
+  LlmUsage,
+  MissingTask,
+  WbsCompletenessResponse,
+  WbsReconciliation,
+} from "@/lib/types";
 import { designateTeamMembers } from "@/lib/team-roster";
 import { clearWbsCache, loadWbsCache, saveWbsCache } from "@/lib/wbs-store";
-import { countLeaves, rollupRange, type WbsTaskInput } from "@/lib/wbs";
+import { clearWizardSession, currentWizardSession } from "@/lib/wizard-store";
+import { phaseCalibration } from "@/lib/reconcile";
+import {
+  addMissingTask,
+  countLeaves,
+  rollupRange,
+  scaleLeafHoursByPhase,
+  type WbsTaskInput,
+} from "@/lib/wbs";
 
 // Client-only (MUI X Tree View + emotion) — dynamic import avoids MUI SSR setup / hydration flash.
 const WbsTreeViewEditor = dynamic(
@@ -56,9 +74,15 @@ export default function WbsEditorPage() {
   const [previewing, setPreviewing] = useState(false);
   const [committing, setCommitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reconciliation, setReconciliation] = useState<WbsReconciliation | null>(null);
+  const [reconciling, setReconciling] = useState(false);
+  const [calibrationNote, setCalibrationNote] = useState<string | null>(null);
+  const [completeness, setCompleteness] = useState<WbsCompletenessResponse | null>(null);
+  const [checkingCompleteness, setCheckingCompleteness] = useState(false);
   const [inputsOpen, setInputsOpen] = useState(false);
   const [teamOpen, setTeamOpen] = useState(false);
-  const [llmOpen, setLlmOpen] = useState(false);
+  // The planner-draft LLM cost — no longer shown here (moved to the top-level Observability page);
+  // retained so it's carried through commit to land on the estimate's observability.
   const [llmUsage, setLlmUsage] = useState<LlmUsage | null>(null);
 
   const roster = stage2?.roster?.roles ?? DEFAULT_ROSTER;
@@ -138,6 +162,7 @@ export default function WbsEditorPage() {
   const handleReevaluate = useCallback(async () => {
     setPreviewing(true);
     setError(null);
+    setCalibrationNote(null);
     try {
       setPreview(
         // Thread draft_id so the backend keys its Monte Carlo RNG on the SAME seed as Submit
@@ -159,6 +184,103 @@ export default function WbsEditorPage() {
     }
   }, [draftId, projectName, rawInput, tree, stage2, stage3, contingency]);
 
+  // Triangulate the bottom-up tree against the parametric (twin) model — surfaces omitted-work /
+  // double-count signals BEFORE commit (the user can still add the missing tasks). On-demand: it
+  // runs the twins' Pass-1 (≈ 7 LLM calls), so it's its own button, not part of Re-evaluate.
+  const handleReconcile = useCallback(async () => {
+    setReconciling(true);
+    setError(null);
+    try {
+      setReconciliation(
+        await reconcileWbs({
+          project_name: projectName,
+          raw_input: rawInput,
+          draft_id: draftId,
+          tree,
+          stage2,
+          stage3,
+          contingency_pct: contingency,
+          session_id: currentWizardSession(),
+        }),
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setReconciling(false);
+    }
+  }, [draftId, projectName, rawInput, tree, stage2, stage3, contingency]);
+
+  // Anchor the tree toward the parametric estimate: rescale each diverging phase's task hours by its
+  // parametric/bottom-up ratio. Keeps the full breakdown (tasks, deps, roles, within-phase ratios) —
+  // only the magnitudes move. Reuses the reconcile result already on screen (no new LLM call).
+  const handleApplyCalibration = useCallback(() => {
+    if (!reconciliation) return;
+    const scaled = scaleLeafHoursByPhase(tree, phaseCalibration(reconciliation));
+    setTree(scaled);
+    setReconciliation(null); // stale now that the tree changed
+    setPreview(null);
+    setCalibrationNote(
+      "Scaled the diverging phases' tasks toward the parametric model — Re-evaluate to update the estimate.",
+    );
+  }, [reconciliation, tree]);
+
+  // Audit the tree for OMITTED work (within-phase tasks the WBS forgot) — the content-level check the
+  // totals-only reconciliation can't do. One LLM call; explicit button.
+  const handleCheckCompleteness = useCallback(async () => {
+    setCheckingCompleteness(true);
+    setError(null);
+    try {
+      setCompleteness(
+        await checkWbsCompleteness({
+          raw_input: rawInput,
+          tree,
+          stage2,
+          stage3,
+          session_id: currentWizardSession(),
+        }),
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setCheckingCompleteness(false);
+    }
+  }, [rawInput, tree, stage2, stage3]);
+
+  // #5c: suggest a 3-point estimate for one leaf, grounded in the brief + its place in the tree. The
+  // editor's per-task button calls this and applies the numbers when `available`. Returns null on a
+  // failure so the editor can surface its own inline message.
+  const handleSuggestHours = useCallback(
+    async (leafId: string) => {
+      const res = await suggestWbsLeafHours({
+        raw_input: rawInput,
+        tree,
+        leaf_id: leafId,
+        stage2,
+        stage3,
+        session_id: currentWizardSession(),
+      });
+      return res.available ? res : null;
+    },
+    [rawInput, tree, stage2, stage3],
+  );
+
+  // Accept a suggestion → insert it as a leaf (grouped under "Recommended additions") and drop it
+  // from the list. Clears the stale preview; Re-evaluate picks up the new task.
+  const handleAddMissing = useCallback(
+    (m: MissingTask) => {
+      setTree((t) => addMissingTask(t, m, roster[0]?.role_id ?? "sr_engineer"));
+      // Filter by item REFERENCE, not a render-time index — rapid clicks would otherwise drop the
+      // wrong suggestion as the array shifts under stale indices.
+      setCompleteness((c) => (c ? { ...c, missing: c.missing.filter((x) => x !== m) } : c));
+      setPreview(null);
+    },
+    [roster],
+  );
+
+  const handleDismissMissing = useCallback((m: MissingTask) => {
+    setCompleteness((c) => (c ? { ...c, missing: c.missing.filter((x) => x !== m) } : c));
+  }, []);
+
   async function handleSave() {
     // Cancel any pending debounced autosave: the commit supersedes the draft (the
     // server drops it on commit), so a late PUT firing after we navigate away would
@@ -178,8 +300,16 @@ export default function WbsEditorPage() {
         stage2,
         stage3,
         contingency_pct: contingency,
+        // Carry the planner-draft cost onto the committed estimate for the Observability page.
+        llm_usage: llmUsage,
+        // The wizard-run UUID minted on the team page (same browser session) — associates the
+        // pre-submission roster/tooling calls with this estimate. Undefined on a resumed-in-a-new-
+        // session draft, in which case those calls stay orphaned (still in the grand total).
+        session_id: currentWizardSession(),
       });
       clearWbsCache(draftId);
+      // The run is committed; retire the session id so the next WBS wizard starts fresh.
+      clearWizardSession();
       router.push(`/estimate/${env.estimate_id}/review`);
     } catch (e) {
       setError((e as Error).message);
@@ -235,30 +365,6 @@ export default function WbsEditorPage() {
           >
             Team
           </button>
-          {llmUsage && llmUsage.call_count > 0 && (
-            <button
-              type="button"
-              onClick={() => setLlmOpen(true)}
-              title="LLM token cost to draft this WBS"
-              className="btn-secondary inline-flex items-center gap-1.5"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                className="h-4 w-4"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="9" />
-                <path d="M12 7v10" />
-                <path d="M14.5 9.3A2.4 2 0 0 0 12 8c-1.4 0-2.5.8-2.5 1.9 0 1 .9 1.6 2.5 2s2.5 1 2.5 2.1-1.1 1.9-2.5 1.9a2.4 2 0 0 1-2.5-1.3" />
-              </svg>
-              {formatUSDPrecise(llmUsage.cost_usd)}
-            </button>
-          )}
           <button
             type="button"
             onClick={handleReevaluate}
@@ -266,6 +372,24 @@ export default function WbsEditorPage() {
             className="btn-secondary disabled:opacity-50"
           >
             {previewing ? "Re-evaluating…" : "Re-evaluate"}
+          </button>
+          <button
+            type="button"
+            onClick={handleReconcile}
+            disabled={reconciling || leafCount === 0}
+            title="Cross-check the bottom-up total against the parametric (twin) model to catch omitted or double-counted work (runs the twins — a few LLM calls)"
+            className="btn-secondary disabled:opacity-50"
+          >
+            {reconciling ? "Reconciling…" : "Reconcile"}
+          </button>
+          <button
+            type="button"
+            onClick={handleCheckCompleteness}
+            disabled={checkingCompleteness || leafCount === 0}
+            title="Audit the tree for tasks this kind of project usually needs but the WBS may have forgotten (one LLM call)"
+            className="btn-secondary disabled:opacity-50"
+          >
+            {checkingCompleteness ? "Checking…" : "Check completeness"}
           </button>
           <button
             type="button"
@@ -338,8 +462,32 @@ export default function WbsEditorPage() {
         </section>
       )}
 
+      {reconciliation && (
+        <ReconciliationPanel rec={reconciliation} onApplyCalibration={handleApplyCalibration} />
+      )}
+
+      {completeness && (
+        <CompletenessPanel
+          missing={completeness.missing}
+          notes={completeness.notes}
+          onAdd={handleAddMissing}
+          onDismiss={handleDismissMissing}
+        />
+      )}
+
+      {calibrationNote && (
+        <p className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-3 py-2">
+          {calibrationNote}
+        </p>
+      )}
+
       <section className="card">
-        <WbsTreeViewEditor tree={tree} roster={roster} onChange={setTree} />
+        <WbsTreeViewEditor
+          tree={tree}
+          roster={roster}
+          onChange={setTree}
+          onSuggestHours={handleSuggestHours}
+        />
       </section>
 
       <Modal
@@ -441,15 +589,6 @@ export default function WbsEditorPage() {
         )}
       </Modal>
 
-      {llmUsage && (
-        <LlmUsageModal
-          open={llmOpen}
-          onClose={() => setLlmOpen(false)}
-          usage={llmUsage}
-          title="WBS draft — LLM cost & usage"
-          subtitle="What it cost to draft this Work Breakdown Structure via the Anthropic API — the planner's token cost, separate from the project labor cost."
-        />
-      )}
     </div>
   );
 }

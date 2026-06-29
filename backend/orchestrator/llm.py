@@ -16,10 +16,10 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from config import get_settings
-from observability.langfuse_wrapper import traced
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,9 @@ def _record_call_usage_and_log(
         input_tokens=getattr(usage, "input_tokens", 0) or 0,
         output_tokens=getattr(usage, "output_tokens", 0) or 0,
         cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        # The forced-tool name identifies the agent (submit_cocomo_assessment → Development twin,
+        # propose_team_roster → roster agent, propose_wbs → WBS planner, …).
+        agent=tool_name,
     )
     logger.info(
         "llm call ✓ model=%s tool=%s latency=%dms stop=%s "
@@ -93,6 +96,79 @@ def _get_client() -> AsyncAnthropic:
     return _client
 
 
+# --- OpenAI provider path (e.g. the WBS planner + completeness critic on GPT-5.5) ----------------
+# Agents pinned to an OpenAI reasoning model (config.wbs_model) route here from `call_structured` by
+# model-name prefix. They use the SDK's strict structured-output `chat.completions.parse` (the OpenAI
+# analogue of Anthropic forced tool-use) with an optional `reasoning_effort` (e.g. "xhigh" for
+# GPT-5.5). Usage is recorded into the SAME accumulator so the cost lands in Observability identically.
+# (The eval judge has its own no-usage copy — see evals/judge.py.)
+_OPENAI_PREFIXES: tuple[str, ...] = ("gpt", "o1", "o3", "o4", "chatgpt")
+_openai_client: AsyncOpenAI | None = None
+
+
+def _is_openai_model(model: str) -> bool:
+    return model.lower().startswith(_OPENAI_PREFIXES)
+
+
+def _get_openai_client() -> AsyncOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        settings = get_settings()
+        if not settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        _openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+    return _openai_client
+
+
+def _record_openai_usage_and_log(
+    completion: Any, *, use_model: str, tool_name: str, started: float
+) -> None:
+    """Record an OpenAI call's token usage (prompt/completion/cached → input/output/cache_read) so
+    GPT-5.5 spend appears in Observability like every Anthropic call. Defensive reads (mocked/partial
+    responses)."""
+    from orchestrator.usage import record_usage
+
+    usage = getattr(completion, "usage", None)
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
+    inp = getattr(usage, "prompt_tokens", 0) or 0
+    out = getattr(usage, "completion_tokens", 0) or 0
+    record_usage(model=use_model, input_tokens=inp, output_tokens=out, cache_read_tokens=cached, agent=tool_name)
+    logger.info(
+        "openai call ✓ model=%s tool=%s latency=%dms tokens(in/out/cache_read)=%d/%d/%d",
+        use_model, tool_name, int((time.perf_counter() - started) * 1000), inp, out, cached,
+    )
+
+
+async def _call_structured_openai(
+    *, system: str, user: str, response_model: type[T], tool_name: str, model: str, effort: str | None
+) -> T:
+    """OpenAI structured output via `chat.completions.parse` (strict json_schema). Records usage;
+    raises on a refusal / no parsed output so the caller's try/except degrades (e.g. the planner to
+    its skeleton). `reasoning_effort` is sent only when provided. (No corrective retry — strict
+    structured output already enforces the schema, unlike free-form tool-use.)"""
+    client = _get_openai_client()
+    parse_kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": response_model,
+    }
+    if effort:
+        parse_kwargs["reasoning_effort"] = effort
+    started = time.perf_counter()
+    completion = await client.chat.completions.parse(**parse_kwargs)
+    _record_openai_usage_and_log(completion, use_model=model, tool_name=tool_name, started=started)
+    message = completion.choices[0].message
+    if message.parsed is None:
+        raise RuntimeError(
+            f"OpenAI model={model} returned no parsed output (refusal={getattr(message, 'refusal', None)!r})"
+        )
+    return message.parsed
+
+
 @functools.cache
 def _pydantic_to_tool_schema(model: type[BaseModel], name: str) -> dict[str, Any]:
     """Convert a Pydantic model to an Anthropic tool definition.
@@ -110,7 +186,6 @@ def _pydantic_to_tool_schema(model: type[BaseModel], name: str) -> dict[str, Any
     }
 
 
-@traced(name="claude-structured-output", as_type="generation")
 async def call_structured(
     *,
     system: str,
@@ -132,10 +207,24 @@ async def call_structured(
     behavior is unchanged; opt in (e.g. the roster agent uses "low") to trade a
     little depth for latency. Only supported on the newer families (Sonnet 4.6,
     Opus 4.6+, Fable 5) — the create call retries once without it if rejected.
+
+    OpenAI reasoning models (e.g. the WBS planner/completeness on GPT-5.5, by model-name prefix) take a
+    different path — strict structured output + `reasoning_effort` — and don't support
+    `extra_user_blocks` (no OpenAI caller passes them).
     """
     settings = get_settings()
-    client = _get_client()
     use_model = model or settings.anthropic_model
+    if _is_openai_model(use_model):
+        return await _call_structured_openai(
+            system=system,
+            user=user,
+            response_model=response_model,
+            tool_name=tool_name,
+            model=use_model,
+            effort=effort,
+        )
+
+    client = _get_client()
     tool = _pydantic_to_tool_schema(response_model, tool_name)
 
     user_blocks: list[dict[str, Any]] = [{"type": "text", "text": user}]
@@ -203,7 +292,7 @@ async def call_structured(
                 raise
 
         # Every LLM / forced-tool call is logged at INFO with cost + latency so the
-        # operational narrative shows model usage without needing Langfuse enabled.
+        # operational narrative shows model usage in the plain stdout logs.
         # Both attempts cost tokens, so usage is recorded on each.
         _record_call_usage_and_log(
             response, use_model=use_model, tool_name=tool_name, started=started
@@ -233,7 +322,6 @@ async def call_structured(
         return await _attempt(corrective=True)
 
 
-@traced(name="claude-structured-stream", as_type="generation")
 async def stream_structured(
     *,
     system: str,
@@ -242,6 +330,7 @@ async def stream_structured(
     tool_name: str = "submit",
     model: str | None = None,
     max_tokens: int = 4096,
+    effort: str | None = None,
     on_input_delta: Callable[[str], None] | None = None,
 ) -> T:
     """Streaming sibling of `call_structured`: same forced-tool-use contract, but the tool input is
@@ -272,6 +361,11 @@ async def stream_structured(
     # Same sampling-param gate as call_structured: the frontier families 400 on temperature.
     if _model_accepts_sampling_params(use_model):
         create_kwargs["temperature"] = 0.0
+    # `output_config.effort` for parity with call_structured (the WBS planner streams at the same
+    # effort it would non-streaming). No drop-on-reject retry here — if a model rejects it the stream
+    # errors and the caller degrades to the non-streaming draft (which has that retry).
+    if effort is not None:
+        create_kwargs["output_config"] = {"effort": effort}
 
     logger.debug(
         "llm stream → model=%s tool=%s max_tokens=%s response_model=%s",
@@ -397,7 +491,6 @@ class _GuardedMcpSession:
         return result
 
 
-@traced(name="claude-mcp-research", as_type="generation")
 async def research_with_local_mcp(
     *,
     system: str,

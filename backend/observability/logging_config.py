@@ -6,8 +6,8 @@ each module guessing. The level is driven by the ``LOG_LEVEL`` setting (env
 ``LOG_LEVEL``, default ``INFO``); a handful of chatty third-party loggers are
 pinned to WARNING so the estimator's own logs stay legible.
 
-This complements Langfuse tracing — Langfuse captures structured spans for LLM
-calls; these logs are the plain-text operational narrative on stdout.
+These logs are the plain-text operational narrative on stdout; per-call LLM cost is
+tracked separately in the `llm_call` table and surfaced on the Observability page.
 """
 
 from __future__ import annotations

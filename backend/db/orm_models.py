@@ -41,6 +41,10 @@ class EstimateHistory(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_name: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(32), index=True)
+    # Estimation flow: "twins" (parametric) or "wbs" (bottom-up). Authoritative source for the
+    # Observability per-estimate flow label (DB-side aggregation reads this column instead of
+    # inferring the flow from which agents happened to be captured).
+    method: Mapped[str] = mapped_column(String(16), server_default="twins")
     # Superseded by envelope_json; kept (nullable) for non-destructive back-compat.
     raw_input: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -112,6 +116,35 @@ class PhaseHistory(Base):
     )
 
     estimate: Mapped[EstimateHistory] = relationship("EstimateHistory", back_populates="phases")
+
+
+class LlmCall(Base):
+    """One persisted LLM call — the per-call grain behind the Observability page (model, agent, the
+    tokens + cost, and the wall-clock timestamp). Storing each call relationally lets usage be
+    aggregated in SQL (SUM / GROUP BY agent|model|estimate) instead of parsed out of every estimate's
+    envelope_json blob."""
+
+    __tablename__ = "llm_call"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Nullable: pre-submission agents (prefill / roster / tooling classifier) run before an estimate
+    # exists, so their calls are persisted with no estimate. They still count toward the grand total
+    # + per-agent breakdown; they're just absent from the per-estimate (joined) rollup.
+    estimate_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("estimate_history.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    # The wizard-run UUID, set on pre-submission calls so they can be associated with the eventual
+    # estimate once it's created (UPDATE estimate_id WHERE session_id). Null for graph/WBS calls.
+    session_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    agent: Mapped[str] = mapped_column(String(64), index=True)
+    model: Mapped[str] = mapped_column(String(64), index=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    called_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True, nullable=True
+    )
 
 
 class CalibrationAggregate(Base):

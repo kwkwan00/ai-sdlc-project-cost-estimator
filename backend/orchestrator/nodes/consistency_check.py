@@ -10,7 +10,6 @@ import logging
 
 from models.estimation_state import EstimationState
 from models.twin_outputs import Phase, PhaseEstimate
-from observability.langfuse_wrapper import traced
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +98,6 @@ def _capers_jones_qa_ratio_warning(pass2: list[PhaseEstimate]) -> str | None:
     return None
 
 
-@traced(name="consistency_check")
 async def consistency_check(state: EstimationState) -> dict:
     pass2 = state.get("pass2_estimates", [])
     warnings: list[str] = []

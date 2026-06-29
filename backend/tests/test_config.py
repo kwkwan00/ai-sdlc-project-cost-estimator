@@ -3,21 +3,6 @@ from __future__ import annotations
 from config import Settings
 
 
-def test_langfuse_disabled_when_keys_missing() -> None:
-    s = Settings(LANGFUSE_PUBLIC_KEY="", LANGFUSE_SECRET_KEY="")
-    assert s.langfuse_enabled is False
-
-
-def test_langfuse_disabled_when_only_one_key_set() -> None:
-    s = Settings(LANGFUSE_PUBLIC_KEY="pk-lf-x", LANGFUSE_SECRET_KEY="")
-    assert s.langfuse_enabled is False
-
-
-def test_langfuse_enabled_when_both_keys_set() -> None:
-    s = Settings(LANGFUSE_PUBLIC_KEY="pk-lf-x", LANGFUSE_SECRET_KEY="sk-lf-y")
-    assert s.langfuse_enabled is True
-
-
 def test_cors_origin_list_splits_and_strips() -> None:
     s = Settings(BACKEND_CORS_ORIGINS="http://localhost:3000,  http://127.0.0.1:3000 ,")
     assert s.cors_origin_list == ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -57,3 +42,15 @@ def test_postgres_dsn_explicit_overrides_discrete_vars() -> None:
         POSTGRES_DSN=explicit,
     )
     assert s.resolved_postgres_dsn == explicit
+
+
+def test_wbs_model_accepts_legacy_anthropic_model_wbs_alias() -> None:
+    # The setting was renamed ANTHROPIC_MODEL_WBS -> WBS_MODEL; the legacy env var must still bind so
+    # an existing deployment's override isn't silently dropped, with WBS_MODEL winning when both are
+    # set. (model_validate so we exercise the alias mapping directly, free of any ambient .env.)
+    assert Settings.model_validate({"ANTHROPIC_MODEL_WBS": "claude-sonnet-4-6"}).wbs_model == (
+        "claude-sonnet-4-6"
+    )
+    assert Settings.model_validate(
+        {"WBS_MODEL": "gpt-5.5", "ANTHROPIC_MODEL_WBS": "claude-sonnet-4-6"}
+    ).wbs_model == "gpt-5.5"

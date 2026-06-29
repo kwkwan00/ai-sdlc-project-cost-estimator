@@ -27,7 +27,6 @@ from models.twin_outputs import (
     PhaseEstimate,
     Risk,
 )
-from observability.langfuse_wrapper import traced
 from orchestrator.ai_acceleration import ReductionContext, band_for, effective_ai_reduction
 from orchestrator.llm import call_structured, render_context_block
 from orchestrator.montecarlo import (
@@ -562,14 +561,13 @@ def make_twin_nodes[T: BaseModel](
     ensemble_aggregate_fn: EnsembleAggregateFn | None = None,
     sizing_method_key: str | None = None,
     sizing_method_default: str = "",
-    trace_name: str,
 ) -> tuple[
     Callable[[EstimationState], Awaitable[dict]],
     Callable[[EstimationState], Awaitable[dict]],
 ]:
     """Build a twin's two LangGraph node functions (pass 1 / pass 2).
 
-    Returns ``(pass1_node, pass2_node)``. Each is ``@traced`` and returns
+    Returns ``(pass1_node, pass2_node)``, which return
     ``{"pass1_estimates": [...]}`` / ``{"pass2_estimates": [...]}`` respectively —
     the only structural difference between the two passes. ``ensemble_k`` /
     ``ensemble_aggregate_fn`` opt a twin into Pass-2 self-consistency (default off).
@@ -594,7 +592,6 @@ def make_twin_nodes[T: BaseModel](
             sizing_method_default=sizing_method_default,
         )
 
-    @traced(name=f"{trace_name}.p1")
     async def pass1(state: EstimationState) -> dict:
         # Skipped phases return {} — a clean no-op on the operator.add reducer (and no LLM call,
         # since the guard precedes _run). The node still executes, so the static join at
@@ -603,7 +600,6 @@ def make_twin_nodes[T: BaseModel](
             return {}
         return {"pass1_estimates": [await _run(state, pass_num=1)]}
 
-    @traced(name=f"{trace_name}.p2")
     async def pass2(state: EstimationState) -> dict:
         if not _phase_selected(state, phase):
             return {}

@@ -15,7 +15,7 @@ import {
 import { ALL_PHASES, PhaseScopePicker } from "@/components/PhaseScopePicker";
 import { stage1Schema, type Stage1Input } from "@/lib/schemas";
 import { type Phase } from "@/lib/types";
-import { loadDraft, saveDraft } from "@/lib/wizard-store";
+import { loadDraft, saveDraft, startWizardSession } from "@/lib/wizard-store";
 
 function Stage1Inner() {
   const router = useRouter();
@@ -46,8 +46,12 @@ function Stage1Inner() {
   const onSubmit = async (values: Stage1Input) => {
     setAnalyzing(true);
     setPrefillNote(null);
+    // Start a fresh wizard-run UUID up front so every pre-submission LLM call
+    // (this prefill, the Stage 2 roster, the Stage 3 tooling classifier) and the
+    // final create all share one id — the backend associates them in Observability.
+    const sessionId = startWizardSession();
     try {
-      const prefill = await prefillFromDescription(values.raw_input);
+      const prefill = await prefillFromDescription(values.raw_input, sessionId);
       saveDraft({
         raw_input: values.raw_input,
         project_name: values.project_name,

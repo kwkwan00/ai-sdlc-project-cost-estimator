@@ -240,6 +240,9 @@ class CreateEstimateRequest(BaseModel):
         default=None,
         description="Subset of SDLC phases to estimate; null ⇒ all six.",
     )
+    # The wizard-run UUID. Lets the pre-submission agents' LLM calls (prefill/roster/tooling), which
+    # ran before this estimate existed, be associated with it for the Observability breakdown.
+    session_id: str | None = Field(default=None, max_length=36)
 
     @model_validator(mode="after")
     def _normalize_selected_phases(self) -> CreateEstimateRequest:

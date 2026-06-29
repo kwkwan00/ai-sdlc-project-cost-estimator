@@ -125,4 +125,22 @@ describe("proposeRoster", () => {
     ).rejects.toThrow();
     expect(agui.lastRunInput?.forwardedProps?.selected_phases).toEqual([]);
   });
+
+  it("forwards the wizard-run session id so the roster call associates with the estimate", async () => {
+    await expect(
+      proposeRoster({
+        stage2: {} as unknown as Stage2Input,
+        rawInput: "x",
+        sessionId: "sess-123",
+      })
+    ).rejects.toThrow();
+    expect(agui.lastRunInput?.forwardedProps?.session_id).toBe("sess-123");
+  });
+
+  it("forwards an undefined session id when none is given", async () => {
+    await expect(
+      proposeRoster({ stage2: {} as unknown as Stage2Input, rawInput: "x" })
+    ).rejects.toThrow();
+    expect(agui.lastRunInput?.forwardedProps?.session_id).toBeUndefined();
+  });
 });

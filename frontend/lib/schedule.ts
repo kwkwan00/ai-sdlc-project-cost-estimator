@@ -116,6 +116,18 @@ export interface ScheduleResult {
 
 const CRIT_EPS = 1e-9;
 
+/** Cumulative probability of each emitted percentile key — the inversion ladder used by
+ *  `sampleHours`. Hoisted to module scope so it isn't rebuilt on every draw. */
+const PERCENTILE_PROBS: Record<PercentileKey, number> = {
+  p5: 0.05,
+  p10: 0.1,
+  p25: 0.25,
+  p50: 0.5,
+  p75: 0.75,
+  p90: 0.9,
+  p95: 0.95,
+};
+
 function rangeFor(p: PhaseEstimate, mode: ScenarioMode): HourRange {
   return mode === "ai_assisted" ? p.ai_assisted_hours : p.manual_only_hours;
 }
@@ -199,15 +211,7 @@ function slackAndCritical(
  *  range (scaling is applied by the caller). */
 function sampleHours(range: HourRange, rnd: () => number): number {
   if (hasPercentiles(range)) {
-    const probs: Record<PercentileKey, number> = {
-      p5: 0.05,
-      p10: 0.1,
-      p25: 0.25,
-      p50: 0.5,
-      p75: 0.75,
-      p90: 0.9,
-      p95: 0.95,
-    };
+    const probs = PERCENTILE_PROBS;
     const u = rnd();
     const keys = PERCENTILE_KEYS;
     // Flat-extrapolate outside [p5, p95].

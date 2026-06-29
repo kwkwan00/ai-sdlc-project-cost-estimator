@@ -10,12 +10,10 @@ from langgraph.types import interrupt
 
 from models.estimation_state import EstimationState
 from models.twin_outputs import ClarifyingQuestion
-from observability.langfuse_wrapper import traced
 
 logger = logging.getLogger(__name__)
 
 
-@traced(name="await_user_answers")
 async def await_user_answers(state: EstimationState) -> dict:
     questions: list[ClarifyingQuestion] = state.get("clarifying_questions", [])
 
@@ -35,13 +33,11 @@ async def await_user_answers(state: EstimationState) -> dict:
     answers: dict[str, str] = (resume_payload or {}).get("answers", {})
     logger.info("await_user_answers: resumed with %d answer(s)", len(answers))
 
-    annotated: list[ClarifyingQuestion] = []
-    for q in questions:
-        if q.id in answers:
-            annotated.append(q.model_copy(update={"answered": True, "answer": answers[q.id]}))
-        else:
-            annotated.append(
-                q.model_copy(update={"answered": True, "answer": q.suggested_default})
-            )
+    annotated: list[ClarifyingQuestion] = [
+        q.model_copy(
+            update={"answered": True, "answer": answers.get(q.id, q.suggested_default)}
+        )
+        for q in questions
+    ]
 
     return {"user_answers": answers, "clarifying_questions": annotated}

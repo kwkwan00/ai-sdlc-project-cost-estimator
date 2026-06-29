@@ -4,7 +4,13 @@ import { useRouter } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 
 import { createEstimate, buildCreatePayload } from "@/lib/api-client";
-import { clearDraft, loadDraft, saveSession } from "@/lib/wizard-store";
+import {
+  clearDraft,
+  clearWizardSession,
+  currentWizardSession,
+  loadDraft,
+  saveSession,
+} from "@/lib/wizard-store";
 
 function CreateInner() {
   const router = useRouter();
@@ -23,12 +29,15 @@ function CreateInner() {
           draft.raw_input,
           draft.project_name,
           draft.stage2,
-          draft.stage3
+          draft.stage3,
+          undefined,
+          currentWizardSession()
         );
         const envelope = await createEstimate(payload);
         if (cancelled) return;
         saveSession(envelope.estimate_id, draft);
         clearDraft();
+        clearWizardSession();
         router.push(`/estimate/${envelope.estimate_id}/questions`);
       } catch (e) {
         if (!cancelled) setError((e as Error).message);

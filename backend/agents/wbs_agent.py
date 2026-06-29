@@ -504,24 +504,41 @@ def _build_user_prompt(req: WbsDraftRequest, roster: RoleRoster, stage3: Stage3C
     )
 
 
+# `output_config.effort` reasoning tokens are billed as output tokens and share the `max_tokens`
+# envelope, so at `max` effort the budget must hold BOTH the model's internal reasoning AND the full
+# 50–150-leaf tree. Too low → the tool input truncates mid-`packages` (empty list, or no tool_use at
+# all → `stop_reason="max_tokens"`) → we fall back to the generic skeleton, i.e. pay for max-effort
+# reasoning and get the no-LLM output. Opus 4.8 allows up to 128k output tokens (Models API), so we
+# budget generously. The streaming path (default) takes the large cap; the non-streaming fallback
+# stays under the ~21k non-streaming request ceiling (above it the SDK requires streaming for the
+# potentially >10-minute call).
+_WBS_PLANNER_MAX_TOKENS_STREAMING = 64000
+_WBS_PLANNER_MAX_TOKENS = 20000
+
+
+def _roster_for_req(req: WbsDraftRequest) -> RoleRoster:
+    """The request's team roster, or the default roster when none was supplied."""
+    return req.stage2.roster if req.stage2 and req.stage2.roster.roles else RoleRoster.default()
+
+
 async def run_wbs_planner(req: WbsDraftRequest) -> WbsPlannerResponse:
     """One forced-tool-use call returning the planner's two-level WBS. Raises on LLM failure."""
-    roster = req.stage2.roster if req.stage2 and req.stage2.roster.roles else RoleRoster.default()
+    roster = _roster_for_req(req)
     stage3 = req.stage3 or Stage3Context()
     system = load_prompt("wbs_planner")
     user = _build_user_prompt(req, roster, stage3)
-    logger.debug("running WBS planner (model=%s)", get_settings().anthropic_model_wbs)
+    settings = get_settings()
+    logger.debug("running WBS planner (model=%s effort=%s)", settings.wbs_model, settings.wbs_reasoning_effort)
     return await call_structured(
         system=system,
         user=user,
         response_model=WbsPlannerResponse,
         tool_name="propose_wbs",
-        model=get_settings().anthropic_model_wbs,
-        # A realistic WBS runs to 50–150+ leaf tasks; too low a cap truncates mid-`packages` (the
-        # tool input then arrives with an empty list → we fall back to the generic skeleton). 16384
-        # fits ~200 minimal-description leaves and stays under the non-streaming request ceiling
-        # (above ~21k the SDK requires streaming for the potentially >10-minute call).
-        max_tokens=16384,
+        model=settings.wbs_model,
+        effort=settings.wbs_reasoning_effort,
+        # Non-streaming fallback path: capped under the ~21k streaming-required ceiling (see the
+        # constant's comment). The default draft path is streaming, with a larger budget below.
+        max_tokens=_WBS_PLANNER_MAX_TOKENS,
     )
 
 
@@ -531,7 +548,7 @@ async def run_wbs_planner_streamed(
     """Streaming variant of `run_wbs_planner`: invokes ``on_node(kind, name)`` — ``kind`` is
     ``"package"`` or ``"task"`` — as each is drafted, then returns the same validated two-level WBS.
     Raises on LLM failure (the caller degrades to the deterministic skeleton)."""
-    roster = req.stage2.roster if req.stage2 and req.stage2.roster.roles else RoleRoster.default()
+    roster = _roster_for_req(req)
     stage3 = req.stage3 or Stage3Context()
     system = load_prompt("wbs_planner")
     user = _build_user_prompt(req, roster, stage3)
@@ -541,14 +558,20 @@ async def run_wbs_planner_streamed(
         for kind, name in parser.feed(partial_json):
             on_node(kind, name)
 
-    logger.debug("streaming WBS planner (model=%s)", get_settings().anthropic_model_wbs)
+    # Only reached for a non-OpenAI wbs_model — `generate_wbs_tree_streamed` degrades to the
+    # non-streaming draft for OpenAI (its streaming + the AG-UI delta parser are Anthropic-shaped).
+    settings = get_settings()
+    logger.debug("streaming WBS planner (model=%s effort=%s)", settings.wbs_model, settings.wbs_reasoning_effort)
     return await stream_structured(
         system=system,
         user=user,
         response_model=WbsPlannerResponse,
         tool_name="propose_wbs",
-        model=get_settings().anthropic_model_wbs,
-        max_tokens=16384,
+        model=settings.wbs_model,
+        effort=settings.wbs_reasoning_effort,
+        # Streaming (default) path: a generous cap so `max`-effort reasoning + the full tree both fit
+        # without truncating to the skeleton. Streaming avoids the non-streaming >10-min ceiling.
+        max_tokens=_WBS_PLANNER_MAX_TOKENS_STREAMING,
         on_input_delta=_on_delta,
     )
 
@@ -559,7 +582,7 @@ async def generate_wbs_tree(req: WbsDraftRequest) -> tuple[list[WbsTaskInput], s
     Always returns a valid, leaf-complete `WbsTaskInput` tree — on any LLM failure (no API key,
     network, parse) it falls back to `_fallback_tree` so the editor always has something to edit.
     """
-    roster = req.stage2.roster if req.stage2 and req.stage2.roster.roles else RoleRoster.default()
+    roster = _roster_for_req(req)
     try:
         # Draft the tree AND extract complexity signals from the description concurrently — the
         # WBS wizard collects neither industry/integrations/screens/regulatory, so the realism
@@ -595,7 +618,16 @@ async def generate_wbs_tree_streamed(
     planner runs in streaming mode and ``on_node(kind, name)`` fires for each work package / task as
     it is drafted. Always returns a valid tree — any LLM failure degrades to the non-streaming draft
     (and simply emits no node events)."""
-    roster = req.stage2.roster if req.stage2 and req.stage2.roster.roles else RoleRoster.default()
+    # OpenAI reasoning models (the GPT-5.5 default) don't share the Anthropic streaming + tool-input
+    # delta shape the per-node parser reads, so fall back to the non-streaming draft — which routes to
+    # OpenAI via call_structured. The tree is identical; only the per-node narration is skipped (the
+    # AG-UI endpoint still sends its opening/closing milestone messages).
+    from orchestrator.llm import _is_openai_model
+
+    if _is_openai_model(get_settings().wbs_model):
+        return await generate_wbs_tree(req)
+
+    roster = _roster_for_req(req)
     try:
         # Same concurrent draft + complexity-signal extraction as generate_wbs_tree, but the planner
         # streams its packages + tasks through on_node as they arrive.

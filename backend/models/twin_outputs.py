@@ -41,6 +41,18 @@ class Phase(str, Enum):
     QA_TESTING = "qa_testing"
 
 
+# Canonical human-friendly phase labels — the single source for prose/UI phase names (SOW doc,
+# reconciliation note, …) so they never drift. Keyed by the enum *value* string.
+PHASE_LABELS: dict[str, str] = {
+    Phase.DISCOVERY.value: "Discovery & Analysis",
+    Phase.UX_DESIGN.value: "UX & Design",
+    Phase.DEVELOPMENT.value: "Development",
+    Phase.CODE_REVIEW.value: "Code Review",
+    Phase.DEPLOYMENT.value: "Deployment & DevOps",
+    Phase.QA_TESTING.value: "QA & Testing",
+}
+
+
 class RoleCategory(str, Enum):
     """Functional category each user-defined role belongs to.
 
@@ -103,6 +115,12 @@ class RoleHeadcount(BaseModel):
     manual_only_cost_usd: float = Field(default=0.0, ge=0)
 
 
+def pert_mean(optimistic: float, most_likely: float, pessimistic: float) -> float:
+    """Beta-PERT expected value ``(o + 4·m + p)/6`` — the single source of truth for the backend's
+    three-point mean (``HourRange.pert_mean`` + the WBS rollup; the frontend mirrors it in `wbs.ts`)."""
+    return (optimistic + 4.0 * most_likely + pessimistic) / 6.0
+
+
 class HourRange(BaseModel):
     """Three-point PERT estimate."""
 
@@ -156,7 +174,7 @@ class HourRange(BaseModel):
 
     @property
     def pert_mean(self) -> float:
-        return (self.optimistic + 4 * self.most_likely + self.pessimistic) / 6
+        return pert_mean(self.optimistic, self.most_likely, self.pessimistic)
 
 
 class Assumption(BaseModel):
@@ -268,6 +286,23 @@ class LlmModelUsage(BaseModel):
     cost_usd: float = Field(default=0.0, ge=0)
 
 
+class LlmAgentUsage(BaseModel):
+    """Token usage + cost for a single agent (keyed on its forced-tool name — twin, prefill, roster,
+    WBS planner, …) across the run, with the wall-clock span of its calls. Powers the per-estimate
+    agent breakdown on the Observability page."""
+
+    model_config = ConfigDict(extra="forbid")
+    agent: str
+    model: str = ""  # the model this agent calls (uniform per agent within a run)
+    calls: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_read_tokens: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0.0, ge=0)
+    started_at: str | None = None  # ISO-8601 (UTC) of the agent's first recorded call
+    finished_at: str | None = None  # ISO-8601 (UTC) of the agent's last recorded call
+
+
 class LlmUsage(BaseModel):
     """Anthropic token usage + estimated $ cost of producing THIS estimate.
 
@@ -282,6 +317,9 @@ class LlmUsage(BaseModel):
     cache_read_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0)
     by_model: list[LlmModelUsage] = Field(default_factory=list)
+    # Per-agent breakdown (with call timestamps). Defaulted so envelopes persisted before this
+    # existed deserialize cleanly (their agent breakdown is simply empty).
+    by_agent: list[LlmAgentUsage] = Field(default_factory=list)
 
 
 class DualScenarioEstimate(BaseModel):
@@ -298,6 +336,11 @@ class DualScenarioEstimate(BaseModel):
     confidence: float = Field(ge=0, le=1)
     duration_weeks_low: float
     duration_weeks_high: float
+    # WBS only: the critical-path length (longest dependency chain, AI-assisted, contingency-applied)
+    # that the duration band was floored to. 0 when no task graph constrains the schedule (every twin
+    # estimate, and a WBS with no dependencies). > duration_weeks_low ⇒ the timeline is sequencing-
+    # bound, not resource-bound. Defaulted → back-compatible; the twin eval rubrics are unaffected.
+    critical_path_weeks: float = 0.0
 
     # Human-readable warnings surfaced by the consistency_check / synthesize_estimate
     # step (e.g. cross-phase hour anomalies). Populated by the orchestrator; default

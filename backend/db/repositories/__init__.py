@@ -31,11 +31,16 @@ from db.repositories.calibration import (
     refresh_calibration_for_phase,
 )
 from db.repositories.history import (
+    aggregate_llm_usage,
+    associate_llm_calls,
+    calls_from_summary,
     count_estimate_history,
     delete_estimate_history,
     get_estimate_envelope,
+    insert_llm_calls,
     list_estimate_history,
     save_estimate_history,
+    save_llm_calls,
 )
 from db.repositories.rates import (
     CustomRoleRecord,
@@ -55,6 +60,11 @@ __all__ = [
     "count_estimate_history",
     "delete_estimate_history",
     "get_estimate_envelope",
+    "aggregate_llm_usage",
+    "save_llm_calls",
+    "insert_llm_calls",
+    "associate_llm_calls",
+    "calls_from_summary",
     # calibration
     "refresh_calibration_for_phase",
     "get_calibration",

@@ -26,6 +26,8 @@ from orchestrator.montecarlo import (
     MCResult,
     Range3,
     _confidence_cov,
+    _leaf_corr_sigma_from_env,
+    combine_pert_leaves,
     make_rng,
     propagate_phase,
     resolve_size_band,
@@ -34,6 +36,44 @@ from orchestrator.montecarlo import (
     sample_risks,
 )
 from orchestrator.nodes._twin_base import make_reduction_sampler
+
+
+def test_leaf_corr_sigma_env_rejects_non_finite(monkeypatch) -> None:
+    # 'inf'/'1e400' pass `>= 0` but blow every draw to inf → NaN estimates; they must fall back.
+    monkeypatch.setenv("MC_LEAF_CORR_SIGMA", "inf")
+    assert _leaf_corr_sigma_from_env(default=0.15) == 0.15
+    monkeypatch.setenv("MC_LEAF_CORR_SIGMA", "1e400")  # overflows to inf
+    assert _leaf_corr_sigma_from_env(default=0.15) == 0.15
+    monkeypatch.setenv("MC_LEAF_CORR_SIGMA", "nan")
+    assert _leaf_corr_sigma_from_env(default=0.15) == 0.15
+    monkeypatch.setenv("MC_LEAF_CORR_SIGMA", "0.2")  # a real value still works
+    assert _leaf_corr_sigma_from_env(default=0.15) == 0.2
+
+
+def test_combine_pert_leaves_reads_mc_draws_at_call_time(monkeypatch) -> None:
+    # MC_DRAWS resolves at CALL time now, so a monkeypatch set AFTER import takes effect (the
+    # default n_draws=None path), not the import-time DEFAULT_DRAWS.
+    monkeypatch.setenv("MC_DRAWS", "37")
+    manual, _ = combine_pert_leaves(
+        [(8.0, 10.0, 16.0)], reduction_sampler=lambda r: 0.0, eff_point=0.0, rng=make_rng("x"),
+    )
+    assert manual.n == 37
+
+
+def test_combine_pert_leaves_reads_corr_sigma_at_call_time(monkeypatch) -> None:
+    # MC_LEAF_CORR_SIGMA now also resolves at CALL time (leaf_corr_sigma=None path), so a monkeypatch
+    # set AFTER import takes effect — not the import-time DEFAULT_LEAF_CORR_SIGMA. Higher correlation
+    # widens the combined band, so the std must grow with the env value.
+    leaves = [(8.0, 16.0, 32.0)] * 10
+    monkeypatch.setenv("MC_LEAF_CORR_SIGMA", "0")
+    indep, _ = combine_pert_leaves(
+        leaves, reduction_sampler=lambda r: 0.0, eff_point=0.0, rng=make_rng("seed"), n_draws=3000
+    )
+    monkeypatch.setenv("MC_LEAF_CORR_SIGMA", "0.5")
+    correlated, _ = combine_pert_leaves(
+        leaves, reduction_sampler=lambda r: 0.0, eff_point=0.0, rng=make_rng("seed"), n_draws=3000
+    )
+    assert correlated.std > indep.std  # if it were import-bound, both would use 0.15 and match
 
 
 def _pert_mean(low: float, mode: float, high: float) -> float:

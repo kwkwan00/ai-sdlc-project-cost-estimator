@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,11 +36,21 @@ class Settings(BaseSettings):
     anthropic_model_tooling: str = Field(
         default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_TOOLING"
     )
-    # Drafts the bottom-up WBS task tree (the Work Breakdown Structure flow). A knowledge-heavy
-    # decomposition task, so it defaults to Sonnet rather than Haiku.
-    anthropic_model_wbs: str = Field(
-        default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL_WBS"
+    # The WBS planner (draft) + completeness critic. A deep-reasoning task (decompose a project / spot
+    # omitted work) → **Claude Opus 4.8 at `max` effort** by default: drafting a 50–150-leaf WBS with a
+    # dependency graph and full-lifecycle coverage is effectively a whole-project brainstorm, so it runs
+    # at the top reasoning tier. `wbs_reasoning_effort` is sent as `output_config.effort` on the
+    # Anthropic path (`low`/`medium`/`high`/`xhigh`*/`max`; *`xhigh` is model-dependent — `max` is the
+    # universally-supported top tier) and as `reasoning_effort` on the OpenAI path (adds `minimal`/
+    # `xhigh`); call_structured + stream_structured route by model-name prefix, so switching `WBS_MODEL`
+    # to a `gpt-*` id transparently uses OpenAI. Drop to `high`/`medium` to trade depth for latency/cost.
+    # Accept the legacy `ANTHROPIC_MODEL_WBS` env var too (renamed → `WBS_MODEL`), so an existing
+    # deployment's override isn't silently dropped; `WBS_MODEL` wins when both are set.
+    wbs_model: str = Field(
+        default="claude-opus-4-8",
+        validation_alias=AliasChoices("WBS_MODEL", "ANTHROPIC_MODEL_WBS"),
     )
+    wbs_reasoning_effort: str = Field(default="max", alias="WBS_REASONING_EFFORT")
     # Writes the project-specific prose of an exported Statement of Work (the SOW "feature
     # agent") and extracts client facts. A knowledge/writing task → defaults to Sonnet, like
     # the roster/tooling/wbs agents, independent of the twins' ANTHROPIC_MODEL.
@@ -109,6 +119,11 @@ class Settings(BaseSettings):
 
     qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
     qdrant_api_key: str = Field(default="", alias="QDRANT_API_KEY")
+    # OpenAI embedding model used to vectorize completed estimates into Qdrant (reference-class
+    # calibration). Reuses the same provider as the eval judge / docs-mcp embedder; the vector size is
+    # pinned to 1536 via the `dimensions` param so switching models doesn't require recreating
+    # collections. Embedding (hence Qdrant indexing) is skipped when `OPENAI_API_KEY` is unset.
+    embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
 
     postgres_user: str = Field(default="estimator", alias="POSTGRES_USER")
     postgres_password: str = Field(default="", alias="POSTGRES_PASSWORD")
@@ -122,10 +137,6 @@ class Settings(BaseSettings):
     postgres_pool_size: int = Field(default=5, alias="POSTGRES_POOL_SIZE")
     postgres_max_overflow: int = Field(default=5, alias="POSTGRES_MAX_OVERFLOW")
 
-    langfuse_public_key: str = Field(default="", alias="LANGFUSE_PUBLIC_KEY")
-    langfuse_secret_key: str = Field(default="", alias="LANGFUSE_SECRET_KEY")
-    langfuse_host: str = Field(default="https://cloud.langfuse.com", alias="LANGFUSE_HOST")
-
     backend_host: str = Field(default="0.0.0.0", alias="BACKEND_HOST")
     backend_port: int = Field(default=8000, alias="BACKEND_PORT")
     cors_origins: str = Field(default="http://localhost:3000", alias="BACKEND_CORS_ORIGINS")
@@ -137,10 +148,6 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
-
-    @property
-    def langfuse_enabled(self) -> bool:
-        return bool(self.langfuse_public_key and self.langfuse_secret_key)
 
     @property
     def resolved_postgres_dsn(self) -> str:

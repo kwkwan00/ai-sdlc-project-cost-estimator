@@ -131,6 +131,16 @@ def compute_plan_hours(total_tp: float, supplementary: float) -> dict[QAPlan, fl
     }
 
 
+def _plan_breakdown(plans: dict[QAPlan, float]) -> dict[str, float]:
+    """The three plan totals (rounded) for the transparency breakdown — shared verbatim by all
+    three QA sizing adapters (TPA / TCPA / Capers-Jones)."""
+    return {
+        "plan_a_hours": round(plans[QAPlan.PLAN_A], 1),
+        "plan_b_hours": round(plans[QAPlan.PLAN_B], 1),
+        "plan_c_hours": round(plans[QAPlan.PLAN_C], 1),
+    }
+
+
 def compute_qa_hours(inputs: QATPAInputs) -> tuple[float, dict]:
     """Single-callable adapter for ``propagate_phase``: run TPA → plan hours and return
     ``(hours_for_recommended_plan, breakdown)``.
@@ -142,12 +152,7 @@ def compute_qa_hours(inputs: QATPAInputs) -> tuple[float, dict]:
     plan totals for transparency."""
     total_tp, tp_breakdown = compute_test_points(inputs)
     plans = compute_plan_hours(total_tp, inputs.supplementary_hours)
-    return plans[inputs.recommended_plan], {
-        **tp_breakdown,
-        "plan_a_hours": round(plans[QAPlan.PLAN_A], 1),
-        "plan_b_hours": round(plans[QAPlan.PLAN_B], 1),
-        "plan_c_hours": round(plans[QAPlan.PLAN_C], 1),
-    }
+    return plans[inputs.recommended_plan], {**tp_breakdown, **_plan_breakdown(plans)}
 
 
 def resolve_test_cases(inputs: QATPAInputs) -> float:
@@ -177,12 +182,7 @@ def compute_qa_hours_tcpa(inputs: QATPAInputs) -> tuple[float, dict]:
     and re-runs this per draw."""
     total_tcp, tcp_breakdown = compute_test_case_points(inputs)
     plans = compute_plan_hours(total_tcp, inputs.supplementary_hours)
-    return plans[inputs.recommended_plan], {
-        **tcp_breakdown,
-        "plan_a_hours": round(plans[QAPlan.PLAN_A], 1),
-        "plan_b_hours": round(plans[QAPlan.PLAN_B], 1),
-        "plan_c_hours": round(plans[QAPlan.PLAN_C], 1),
-    }
+    return plans[inputs.recommended_plan], {**tcp_breakdown, **_plan_breakdown(plans)}
 
 
 def resolve_defect_density(inputs: QATPAInputs) -> float:
@@ -216,12 +216,7 @@ def compute_qa_hours_defect(inputs: QATPAInputs) -> tuple[float, dict]:
     ``total_function_points`` (the defect-potential driver) and re-runs this per draw."""
     total_drp, drp_breakdown = compute_defect_removal_points(inputs)
     plans = compute_plan_hours(total_drp, inputs.supplementary_hours)
-    return plans[inputs.recommended_plan], {
-        **drp_breakdown,
-        "plan_a_hours": round(plans[QAPlan.PLAN_A], 1),
-        "plan_b_hours": round(plans[QAPlan.PLAN_B], 1),
-        "plan_c_hours": round(plans[QAPlan.PLAN_C], 1),
-    }
+    return plans[inputs.recommended_plan], {**drp_breakdown, **_plan_breakdown(plans)}
 
 
 # Maps the selected QA sizing method → (per-draw compute adapter, algorithm-label prefix). The
@@ -335,5 +330,4 @@ qa_testing_pass1, qa_testing_pass2 = make_twin_nodes(
     proposed_reduction_fn=_proposed_reduction,
     sizing_method_key="qa_sizing_method",
     sizing_method_default=DEFAULT_QA_SIZING_METHOD,
-    trace_name="twin.qa_testing",
 )

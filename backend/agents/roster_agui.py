@@ -33,6 +33,7 @@ from agents.roster_agent import CatalogRole, proposal_to_roster, run_roster_agen
 from db.repositories import get_custom_roles, get_default_rates
 from models.project_schema import Stage2Context
 from models.twin_outputs import Phase
+from orchestrator.usage import capture_usage_to_db
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +91,23 @@ async def roster_agui_endpoint(
         )
         try:
             stage2, raw_input, selected_phases = _extract_inputs(input_data)
+            props = input_data.forwarded_props if isinstance(input_data.forwarded_props, dict) else {}
+            # Only accept an actual string id — never str()-coerce a stray non-string (e.g. True →
+            # "True"), which would persist a bogus session_id that associate_llm_calls can't match.
+            _sid = props.get("session_id")
+            session_id = _sid[:36] if isinstance(_sid, str) and _sid else None
             # Fetch the rate card up front so the agent can be TOLD about the org's custom roles
             # (and SELECT one by id), then price the selection deterministically afterward.
             overrides, custom = await asyncio.gather(get_default_rates(), get_custom_roles())
             catalog = [
                 CatalogRole(c.role_id, c.label, c.category, c.seniority, c.rate) for c in custom
             ]
-            proposal = await run_roster_agent(
-                stage2, raw_input, custom_roles=catalog, selected_phases=selected_phases
-            )
+            # Capture the roster agent's call into the llm_call table (pre-submission → no estimate id
+            # yet); the wizard session id lets it be associated with the estimate on submit.
+            async with capture_usage_to_db(session_id=session_id):
+                proposal = await run_roster_agent(
+                    stage2, raw_input, custom_roles=catalog, selected_phases=selected_phases
+                )
             # A proposed role whose catalog_role_id is a valid catalog id is priced at that role's
             # exact rate and carries its id; otherwise it's grid-priced (no fuzzy label matching).
             roster = proposal_to_roster(proposal, overrides, catalog)

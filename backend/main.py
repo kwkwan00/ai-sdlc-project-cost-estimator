@@ -48,7 +48,7 @@ from db.neo4j_adapter import close_driver
 from db.postgres_adapter import dispose_engine as dispose_pg_engine
 from db.postgres_adapter import get_engine as get_pg_engine
 from db.qdrant_adapter import close_client as close_qdrant
-from observability.langfuse_wrapper import shutdown as langfuse_shutdown
+from db.qdrant_adapter import ensure_collections as ensure_qdrant_collections
 from observability.logging_config import configure_logging
 from observability.request_logging import RequestLoggingMiddleware
 from orchestrator.graph import build_graph
@@ -56,6 +56,7 @@ from routers import admin as admin_router
 from routers import catalog as catalog_router
 from routers import drafts as drafts_router
 from routers import estimates as estimates_router
+from routers import observability as observability_router
 from routers import sow as sow_router
 from routers import wbs as wbs_router
 from runtime import set_graph
@@ -76,6 +77,9 @@ async def lifespan(_app: FastAPI):
         await asyncio.to_thread(upgrade_to_head)
         get_pg_engine()
 
+    # Bootstrap the Qdrant calibration collections (best-effort; no-ops when Qdrant is unreachable).
+    await ensure_qdrant_collections()
+
     set_graph(build_graph())
     logger.info("Orchestrator graph compiled.")
     logger.info(
@@ -84,11 +88,10 @@ async def lifespan(_app: FastAPI):
         settings.backend_port,
     )
     yield
-    logger.info("Backend shutting down — closing drivers + flushing traces")
+    logger.info("Backend shutting down — closing drivers")
     await close_driver()
     close_qdrant()
     await dispose_pg_engine()
-    langfuse_shutdown()
 
 
 app = FastAPI(title="AI SDLC Cost Estimator", version="0.1.0", lifespan=lifespan)
@@ -112,6 +115,7 @@ app.include_router(drafts_router.router)
 app.include_router(admin_router.router)
 app.include_router(catalog_router.router)
 app.include_router(estimates_router.router)
+app.include_router(observability_router.router)
 # WBS bottom-up flow (separate from the twin orchestrator). Mounted after estimates so its
 # literal /estimates/wbs* routes coexist with /estimates/{id} (distinct methods/paths).
 app.include_router(wbs_router.router)

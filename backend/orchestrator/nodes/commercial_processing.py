@@ -16,7 +16,6 @@ import logging
 from models.estimation_state import EstimationState
 from models.project_schema import RoleRoster
 from models.twin_outputs import PhaseEstimate, RoleHours
-from observability.langfuse_wrapper import traced
 from orchestrator.nodes._twin_base import rate_by_role, roster_for
 
 logger = logging.getLogger(__name__)
@@ -40,7 +39,6 @@ def compute_total_costs(
     return total_ai_cost, total_manual_cost
 
 
-@traced(name="commercial_processing")
 async def commercial_processing(state: EstimationState) -> dict:
     roster = roster_for(state)
     total_ai_cost, total_manual_cost = compute_total_costs(

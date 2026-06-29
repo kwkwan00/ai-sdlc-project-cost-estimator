@@ -262,5 +262,4 @@ discovery_analyst_pass1, discovery_analyst_pass2 = make_twin_nodes(
     stub_manual_mid=240,
     sizing_method_key="discovery_sizing_method",
     sizing_method_default=DEFAULT_DISCOVERY_SIZING_METHOD,
-    trace_name="twin.discovery_analyst",
 )

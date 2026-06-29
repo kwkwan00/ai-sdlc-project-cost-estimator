@@ -64,6 +64,8 @@ export async function proposeRoster(args: {
   /** SDLC phases in scope. A strict subset scopes the proposed roster to those phases; the backend
    *  ignores a full / empty set. Forwarded to the agent so it doesn't staff out-of-scope roles. */
   selectedPhases?: Phase[];
+  /** The wizard-run UUID, forwarded so the roster agent's LLM call is associated with the estimate. */
+  sessionId?: string;
 }): Promise<RosterProposalResult> {
   const url = `${API_BASE}/estimates/draft/roster/agui`;
   const agent = new HttpAgent({
@@ -98,6 +100,7 @@ export async function proposeRoster(args: {
           stage2: args.stage2,
           raw_input: args.rawInput,
           selected_phases: args.selectedPhases ?? [],
+          session_id: args.sessionId,
         },
       },
       subscriber

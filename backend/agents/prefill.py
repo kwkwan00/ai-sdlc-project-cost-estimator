@@ -163,6 +163,9 @@ class DraftPrefillRequest(BaseModel):
         min_length=10,
         description="The Stage 1 project description to analyze.",
     )
+    # The wizard-run UUID, so this pre-submission call's LLM cost can be associated with the
+    # estimate the wizard eventually produces (Observability). Optional.
+    session_id: str | None = Field(default=None, max_length=36)
 
 
 class Stage2Fields(BaseModel):
